@@ -121,7 +121,9 @@ class LighterReader:
         if len(accounts) != 1:
             raise AccountError("Аккаунт Lighter не найден или ответ содержит несколько аккаунтов.")
         info = object_value(accounts[0])
-        if info.get("code") != 200 or account_index(info.get("index", "")) != index:
+        # The live Robinhood API uses code=0 inside an account, with code=200
+        # on the enclosing response. Its OpenAPI example uses 200 in both places.
+        if info.get("code") not in (0, 200) or account_index(info.get("index", "")) != index:
             raise AccountError("Lighter вернул данные другого аккаунта или неполный ответ.")
         address = wallet_address(info.get("l1_address", ""))
         if expected and address != expected:

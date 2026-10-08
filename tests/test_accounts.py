@@ -120,6 +120,11 @@ class AccountTests(unittest.TestCase):
             with self.assertRaises(AccountError):
                 LighterReader(FakeTransport({"code": 200, "accounts": [info]})).balance(7, ADDRESS)
 
+    def test_lighter_live_nested_success_code_is_zero(self):
+        info = lighter_data() | {"code": 0}
+        result = LighterReader(FakeTransport({"code": 200, "accounts": [info]})).balance(7, ADDRESS)
+        self.assertEqual(result.metrics[0][1], Decimal("1234.56789123"))
+
     def test_lighter_no_silent_partial_response(self):
         for raw in ({"code": 200, "accounts": [], "total": 0},
                     {"code": 400, "message": "private server detail"},
