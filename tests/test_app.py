@@ -71,6 +71,27 @@ class DesktopTests(unittest.TestCase):
         self.app.nado.complete(self.app.nado.generation, None, "failed")
         self.assertTrue(self.app.lighter.snapshot.demo)
 
+    def test_demo_available_during_a_discarded_live_request(self):
+        self.app.mode.set("live")
+        self.app.change_mode()
+        self.app.nado.busy = True
+        generation = self.app.nado.generation
+        self.app.mode.set("demo")
+        self.app.change_mode()
+        self.assertTrue(self.app.nado.snapshot.demo)
+        self.app.nado.complete(generation, None, "late error")
+        self.assertTrue(self.app.nado.snapshot.demo)
+
+    def test_balances_fit_small_window(self):
+        self.root.geometry("980x760")
+        self.root.deiconify()
+        self.root.update()
+        self.root.update_idletasks()
+        for panel in (self.app.nado, self.app.lighter):
+            self.assertGreater(panel.table.winfo_height(), 100)
+            self.assertLessEqual(panel.buttons.winfo_y() + panel.buttons.winfo_height(), panel.frame.winfo_height())
+        self.root.withdraw()
+
 
 if __name__ == "__main__":
     unittest.main()

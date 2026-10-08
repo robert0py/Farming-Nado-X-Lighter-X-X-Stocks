@@ -45,7 +45,7 @@ class AccountPanel:
         header.grid(row=0, column=0, sticky="ew")
         label(header, "Nado" if venue == "nado" else "Lighter", size=23, bold=True, color=color).pack(anchor="w", padx=22, pady=(16, 0))
         label(header, "Spot · xStocks" if venue == "nado" else "Robinhood Chain", color=MUTED).pack(anchor="w", padx=22, pady=(2, 16))
-        inputs = tk.Frame(self.frame, bg=PAPER)
+        inputs = self.inputs = tk.Frame(self.frame, bg=PAPER)
         inputs.grid(row=1, column=0, sticky="ew", padx=22, pady=16)
         inputs.columnconfigure(0, weight=1)
         label(inputs, "Публичный адрес кошелька" if venue == "nado" else "Публичный адрес кошелька или индекс аккаунта", color=MUTED).grid(row=0, column=0, sticky="w", pady=(0, 6))
@@ -65,14 +65,14 @@ class AccountPanel:
         self.address.trace_add("write", self.input_changed)
         if venue == "nado":
             self.subaccount.trace_add("write", self.input_changed)
-        buttons = tk.Frame(inputs, bg=PAPER)
-        buttons.grid(row=4, column=0, sticky="ew", pady=(14, 0))
+        buttons = self.buttons = tk.Frame(self.frame, bg=PAPER)
+        buttons.grid(row=7, column=0, sticky="ew", padx=22, pady=(4, 16))
         self.connect_button = ttk.Button(buttons, text="Подключить для просмотра", command=self.connect, style="Primary.TButton")
         self.connect_button.pack(side="left")
         self.disconnect_button = ttk.Button(buttons, text="Отключить", command=self.disconnect)
         self.disconnect_button.pack(side="left", padx=(8, 0))
         link = label(inputs, "Открыть Nado ↗" if venue == "nado" else "Открыть Lighter ↗", color=color, cursor="hand2")
-        link.grid(row=5, column=0, sticky="w", pady=(14, 0))
+        link.grid(row=4, column=0, sticky="w", pady=(14, 0))
         url = "https://app.nado.xyz/perpetuals" if venue == "nado" else "https://robinhoodchain.lighter.xyz/trade/SPY"
         link.bind("<Button-1>", lambda event: webbrowser.open(url))
         link.bind("<Return>", lambda event: webbrowser.open(url))
@@ -98,7 +98,7 @@ class AccountPanel:
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.table.configure(yscrollcommand=scrollbar.set)
         self.note = label(self.frame, "", color=MUTED, size=9, anchor="w", justify="left", wraplength=450)
-        self.note.grid(row=6, column=0, sticky="ew", padx=22, pady=(4, 16))
+        self.note.grid(row=6, column=0, sticky="ew", padx=22, pady=(4, 6))
         self.frame.bind("<Configure>", self.resize)
 
     def resize(self, event):
@@ -133,6 +133,10 @@ class AccountPanel:
         self.identity.configure(text="")
         self.note.configure(text="")
         self.connect_button.configure(text="Подключить для просмотра")
+        if self.app.mode.get() == "live":
+            self.inputs.grid()
+        else:
+            self.inputs.grid_remove()
 
     def render_controls(self):
         live = self.app.mode.get() == "live"
@@ -226,6 +230,7 @@ class AccountPanel:
 
     def show(self, snapshot: Snapshot):
         self.clear_snapshot()
+        self.inputs.grid_remove()
         self.snapshot = snapshot
         stamp = snapshot.fetched_at.astimezone().strftime("%H:%M:%S · %d.%m.%Y")
         self.set_status("ДЕМО · пример данных" if snapshot.demo else f"Подключено для просмотра · обновлено {stamp}")
@@ -295,7 +300,7 @@ class Application:
         for panel in (self.nado, self.lighter):
             panel.reset()
             if self.mode.get() == "demo":
-                panel.connect()
+                panel.show(demo_nado() if panel.venue == "nado" else demo_lighter())
 
     def poll(self):
         while True:
