@@ -1,0 +1,50 @@
+name: Windows desktop
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'run.py'
+      - 'pyproject.toml'
+      - 'requirements-build.txt'
+      - 'scripts/build-windows.ps1'
+      - '.github/workflows/windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-desktop-main
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Install build tools
+        run: python -m pip install -r requirements-build.txt
+      - name: Test and build desktop application
+        shell: pwsh
+        run: ./scripts/build-windows.ps1
+      - name: Publish private desktop release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          $releaseTag = 'desktop-' + $env:GITHUB_SHA.Substring(0, 12)
+          gh release view $releaseTag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $releaseTag --target $env:GITHUB_SHA --title "Desktop $releaseTag" --notes-file docs/RELEASE_NOTES.md --latest dist/Farming-Accounts.exe dist/SHA256SUMS.txt
+          } else {
+            gh release upload $releaseTag dist/Farming-Accounts.exe dist/SHA256SUMS.txt --clobber
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Private desktop release failed' }
