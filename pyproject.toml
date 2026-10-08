@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "farming-accounts"
+version = "0.1.0"
+description = "Read-only desktop account viewer for Nado and Lighter on Robinhood Chain"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.gui-scripts]
+farming-accounts = "farming_accounts.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
