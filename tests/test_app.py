@@ -33,7 +33,7 @@ class DesktopTests(unittest.TestCase):
         for panel in (self.app.nado, self.app.lighter):
             self.assertIsNone(panel.snapshot)
             self.assertFalse(panel.table.get_children())
-            self.assertEqual(panel.address_entry.cget("state"), "normal")
+            self.assertEqual(str(panel.address_entry.cget("state")), "normal")
 
     def test_edit_or_failure_does_not_show_stale_balance(self):
         panel = self.app.nado
@@ -64,7 +64,7 @@ class DesktopTests(unittest.TestCase):
         self.assertEqual(panel.subaccount.get(), "")
         self.assertEqual(panel.account_ids, (7, 8))
         self.assertIsNone(panel.snapshot)
-        self.assertEqual(panel.selector.cget("state"), "readonly")
+        self.assertEqual(str(panel.selector.cget("state")), "readonly")
 
     def test_one_platform_failure_does_not_clear_other(self):
         self.app.nado.clear_snapshot()
