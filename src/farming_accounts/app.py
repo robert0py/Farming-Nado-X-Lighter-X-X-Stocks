@@ -106,6 +106,7 @@ class AccountPanel:
         dialog = self.dialog = tk.Toplevel(self.app.root)
         dialog.title('Подключить ' + self.title)
         dialog.configure(bg=PANEL)
+        set_dark_titlebar(dialog)
         dialog.transient(self.app.root)
         dialog.geometry('570x390')
         dialog.minsize(520, 380)
@@ -524,10 +525,18 @@ def set_dark_titlebar(window):
     if sys.platform != 'win32':
         return
     try:
+        from ctypes import wintypes
         window.update_idletasks()
-        handle = ctypes.windll.user32.GetParent(window.winfo_id())
-        enabled = ctypes.c_int(1)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(handle, 20, ctypes.byref(enabled), ctypes.sizeof(enabled))
+        get_parent = ctypes.windll.user32.GetParent
+        get_parent.argtypes = [wintypes.HWND]
+        get_parent.restype = wintypes.HWND
+        handle = get_parent(window.winfo_id())
+        set_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
+        set_attribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        # DWM colors use COLORREF (0x00BBGGRR). These affect this window only.
+        for attribute, value in ((20, 1), (35, 0x13110F), (36, 0xF5F3F2), (34, 0x322E2A)):
+            setting = ctypes.c_uint(value)
+            set_attribute(handle, attribute, ctypes.byref(setting), ctypes.sizeof(setting))
     except (AttributeError, OSError):
         pass
 

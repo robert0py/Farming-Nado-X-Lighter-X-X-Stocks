@@ -1,6 +1,7 @@
 # Project instructions
 
 - Current release scope: desktop account connections and balance viewing only.
+- Product direction: a working application built incrementally, not an MVP. Use the user's dark dashboard reference, with Balance and Trading navigation. Never ship sample financial values, simulated trades/history, or runtime demo modes. Synthetic fixtures belong only in isolated tests.
 - Do not implement trading, signing, deposits, withdrawals, or secret-key collection without a new task.
 - Research API changes using official Nado and Lighter Robinhood Chain documentation. Do not substitute Lighter Core.
 - Use `find-skills` from vercel-labs/skills and skills.sh to find appropriate skills as work evolves.
