@@ -310,6 +310,50 @@ class EngineTests(unittest.TestCase):
         self.engine.tick()
         self.assertEqual(len(self.lighter.requests), 2)
 
+    def test_stop_after_cycle_creation_before_first_intent_sends_nothing(self):
+        self.engine.start()
+        cycle = self.engine._new_cycle()
+        self.assertIsNotNone(cycle)
+        self.engine.stop_new_cycles()
+        self.engine.tick()
+        self.assertEqual(self.engine.status()["state"], "CLOSED")
+        self.assertEqual(self.nado.requests + self.lighter.requests, [])
+
+    def test_next_cycle_waits_when_only_previous_asset_is_tradable(self):
+        self.hedge()
+        self.clock.value += self.strategy.hold_seconds
+        for _ in range(3):
+            self.engine.tick()
+        self.nado.items = tuple(replace(i, tradable=False) if i.underlying == "SPY" else i for i in self.nado.items)
+        count = len(self.nado.requests)
+        self.engine.tick()
+        self.assertEqual(self.engine.status()["state"], "WAITING")
+        self.assertEqual(len(self.nado.requests), count)
+
+    def test_partial_hedge_checks_margin_only_for_remaining_quantity(self):
+        self.lighter.responses.append(D(5))
+        self.engine.start()
+        self.engine.tick()
+        self.engine.tick()
+        self.lighter.money = D(1600)
+        self.engine.tick()
+        self.engine.tick()
+        self.assertEqual(self.engine.status()["state"], "HEDGED")
+        self.assertEqual(self.lighter.requests[-1].quantity, D(15))
+
+    def test_insufficient_remaining_margin_unwinds_instead_of_halting_unhedged(self):
+        self.lighter.responses.append(D(5))
+        self.engine.start()
+        self.engine.tick()
+        self.engine.tick()
+        self.lighter.money = D(500)
+        self.engine.tick()
+        self.assertEqual(self.engine.status()["state"], "CLOSING")
+        for _ in range(3):
+            self.engine.tick()
+        self.assertEqual(self.engine.status()["state"], "CLOSED")
+        self.assertFalse(self.engine.status()["running"])
+
 
 if __name__ == "__main__":
     unittest.main()

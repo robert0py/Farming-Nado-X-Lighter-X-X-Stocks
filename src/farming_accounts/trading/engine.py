@@ -147,6 +147,7 @@ class Engine:
         if last in assets:
             index = (assets.index(last) + 1) % len(assets)
             assets = assets[index:] + assets[:index]
+            assets = [asset for asset in assets if asset != last]
         reason = "Ожидание доступной пары."
         for asset in assets:
             pair = pairs.get(asset)
@@ -225,6 +226,8 @@ class Engine:
     def _write(self, cycle: dict, instrument: Instrument, book: Book, side: str,
                quantity: Decimal, action: str, *, reduce_only: bool) -> None:
         strategy = self._strategy(cycle)
+        if not 0 <= self.clock() - book.timestamp <= strategy.quote_max_age_seconds:
+            raise TradingError("Котировка устарела перед отправкой ордера.")
         quantity = quantize(quantity, instrument.quantity_step)
         factor = strategy.max_slippage_bps / 10000
         limit = quantize(book.ask * (1 + factor), instrument.price_tick) if side == "buy" else quantize(
@@ -238,7 +241,7 @@ class Engine:
             raise TradingError("Площадка сейчас запрещает исполнение этого инструмента.")
         if self._gateway(instrument.venue).open_orders(instrument):
             raise TradingError("На инструменте обнаружен активный ордер; повторное исполнение запрещено.")
-        if not reduce_only and self._gateway(instrument.venue).available() < strategy.notional_per_leg + strategy.margin_reserve:
+        if not reduce_only and self._gateway(instrument.venue).available() < quantity * limit + strategy.margin_reserve:
             raise TradingError("Недостаточно средств с установленным резервом.")
         sequence = len(self.journal.orders(cycle["id"])) + 1
         expiry = int(self.clock()) + 90
@@ -324,6 +327,9 @@ class Engine:
                 closing = (self.journal.get("close_requested", False) or cycle["closing_requested"] or
                            cycle["deadline"] is not None and self.clock() >= cycle["deadline"] or
                            risk_close)
+                if cycle["attempts"] == 0 and not self.journal.get("running", False):
+                    self._transition(cycle, "CLOSED", "Открытие остановлено до отправки ордеров.")
+                    return self.status()
                 if cycle["state"] == "OPENING_SPOT" and cycle["attempts"] == 0 and not closing:
                     self._write(cycle, spot, spot_book, "buy", Decimal(cycle["target_spot"]), "open_spot", reduce_only=False)
                     if cycle["state"] != "RECOVERY":
@@ -362,7 +368,12 @@ class Engine:
                         self.journal.set("running", False)
                         self._transition(cycle, "CLOSING", "Частичное исполнение нельзя безопасно хеджировать; закрытие.")
                     else:
-                        self._write(cycle, perp, perp_book, "sell", hedge_quantity, "open_perp", reduce_only=False)
+                        try:
+                            self._write(cycle, perp, perp_book, "sell", hedge_quantity, "open_perp", reduce_only=False)
+                        except TradingError:
+                            self.journal.set("running", False)
+                            self._transition(cycle, "CLOSING", "Встречную позицию нельзя открыть в пределах лимитов; закрытие подтверждённого остатка.")
+                            return self.status()
                         if cycle["state"] != "RECOVERY":
                             self._transition(cycle, "OPENING_HEDGE", "Подтверждение встречного исполнения.")
                 elif residual < 0:
