@@ -131,6 +131,7 @@ class Engine:
             self.journal.set("close_requested", True)
             cycle = self.journal.active_cycle()
             if cycle and cycle["state"] == "HALTED":
+                cycle["retry_budget_start"] = len(self.journal.orders(cycle["id"]))
                 self._transition(cycle, "RECOVERY", "Запрошена повторная сверка для контролируемого закрытия.")
             return self.status()
 
@@ -347,7 +348,7 @@ class Engine:
                 cycle.update(spot_quantity=str(spot_quantity), perp_quantity=str(perp_quantity),
                              residual_notional=str(residual_quote), pnl_quote=str(pnl))
                 self.journal.save_cycle(cycle)
-                if cycle["attempts"] > 16:
+                if cycle["attempts"] - cycle.get("retry_budget_start", 0) > 16:
                     raise TradingError("Превышен предел корректирующих ордеров; автоматическое исполнение остановлено.")
                 hedged = spot_quantity > 0 and perp_quantity < 0 and residual_quote <= strategy.residual_notional
                 if hedged and cycle["deadline"] is None:

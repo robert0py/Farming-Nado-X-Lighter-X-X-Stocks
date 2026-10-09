@@ -431,6 +431,29 @@ class EngineTests(unittest.TestCase):
         self.assertTrue(all(not market["ready"] for market in result["markets"]))
         self.assertEqual(self.nado.requests + self.lighter.requests, [])
 
+    def test_explicit_close_grants_bounded_recovery_budget_without_erasing_history(self):
+        self.hedge()
+        cycle = self.journal.active_cycle()
+        original = self.lighter.requests[0]
+        for sequence in range(3, 18):
+            item = replace(original, client_id=f"{sequence:032x}", nonce=original.nonce + sequence)
+            self.journal.put_intent(item, "fixture_rejected_before_post")
+            self.journal.observe(OrderObservation(item.client_id, "REJECTED", D(0)), observed_at=self.clock())
+        self.engine.tick()
+        self.assertEqual(self.engine.status()["state"], "HALTED")
+        self.assertEqual(len(self.journal.orders(cycle["id"])), 17)
+        self.engine.tick()
+        self.assertEqual(len(self.lighter.requests), 1)
+        self.engine.close_and_stop()
+        self.assertEqual(self.engine.status()["cycle"]["retry_budget_start"], 17)
+        for _ in range(3):
+            self.engine.tick()
+        self.assertEqual(self.engine.status()["state"], "CLOSED")
+        self.assertEqual(len(self.journal.orders(cycle["id"])), 19)
+        self.assertEqual(self.engine.status()["cycle"]["attempts"], 19)
+        self.assertEqual(self.nado.positions[1], D(0))
+        self.assertEqual(self.lighter.positions[101], D(0))
+
 
 if __name__ == "__main__":
     unittest.main()
