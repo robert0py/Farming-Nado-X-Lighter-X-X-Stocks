@@ -247,6 +247,13 @@ class LighterAdapterTests(unittest.TestCase):
         self.assertEqual(observation.fee, Decimal("0.01749825"))
         self.assertEqual(observation.average_price, Decimal("99.99"))
 
+    def test_latest_fill_timestamp_survives_restart_observation(self):
+        self.sdk.now = 1791520000.0
+        self.sdk.orders = [self.order()]
+        self.sdk.trade_rows = [self.trade() | {"timestamp": 1791519999000}]
+        observation = self.adapter.lookup(self.intent)
+        self.assertEqual(observation.filled_at, 1791519999.0)
+
     def test_incomplete_fill_history_stays_unknown(self):
         self.sdk.orders = [self.order()]
         self.sdk.trade_rows = []

@@ -428,19 +428,22 @@ the durable engine must only call lookup(), including after a process restart.
         else:
             return None
         fee = Decimal(0)
+        filled_at = None
         if filled:
-            fee = await self._fees(order, filled, intent)
-            if fee is None:
+            execution = await self._fees(order, filled, intent)
+            if execution is None:
                 return None
+            fee, filled_at = execution
         # Require readable account state as well; the engine compares aggregate
         # positions against the persisted cumulative fills on both venues.
         self._position_from(await self._account(), intent.instrument)
         return OrderObservation(intent.client_id, normalized, filled,
                                 quote / filled if filled else None, fee,
-                                str(order.get("order_index")))
+                                str(order.get("order_index")), filled_at=filled_at)
 
     async def _fees(self, order, filled, intent):
         total, quote_total, fee, cursor, seen = Decimal(0), Decimal(0), Decimal(0), None, set()
+        fill_times = []
         for _ in range(20):
             kwargs = dict(sort_by="timestamp", limit=100, authorization=await self._token(),
                           account_index=self.credentials.account_index, market_id=intent.instrument.id,
@@ -472,12 +475,24 @@ the durable engine must only call lookup(), including after a process restart.
                 total += size
                 quote_total += usd
                 fee += usd * Decimal(fee_ticks) / Decimal(1000000)
+                timestamp = trade.get("timestamp")
+                if timestamp is not None:
+                    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp <= 0:
+                        raise TradingError("Lighter не подтвердил время исполнения.")
+                    # Official RH trade timestamps are milliseconds. Accept an
+                    # explicitly supplied seconds timestamp only for older data.
+                    seconds = timestamp / 1000 if timestamp >= 100000000000 else float(timestamp)
+                    if seconds > self._clock() + 60:
+                        raise TradingError("Время исполнения Lighter находится в будущем.")
+                    fill_times.append(seconds)
             cursor = data.get("next_cursor")
             if not cursor:
                 break
         else:
             return None
-        return fee if total == filled and quote_total == _number(order.get("filled_quote_amount")) else None
+        if total != filled or quote_total != _number(order.get("filled_quote_amount")):
+            return None
+        return fee, max(fill_times) if fill_times and len(fill_times) == len(seen) else None
 
     def close(self):
         with self._lock:
