@@ -257,8 +257,10 @@ class Runtime:
                                       'Аккаунт': data['account_index'], 'API key index': data['api_key_index'], 'Публичный ключ': public_key}}
             # Generated key survives process failure; never activate it before confirmed registration.
             self.vault.update(lambda v: v.update(pending_registration={'venue': venue, 'credentials': data}))
+            expires = time.time() + 300
+            public['expires_at'] = expires
             self.challenges = {token: {'venue': venue, 'helper': helper, 'challenge': challenge, 'public': public,
-                                       'credentials': data, 'expires': time.time() + 300, 'used': False}}
+                                       'credentials': data, 'expires': expires, 'used': False}}
             return {'ok': True, 'wallet_url': self.origin + '/wallet#' + token,
                     'message': 'Подтвердите привязку отдельного ключа в браузере. Основной приватный ключ не передаётся боту.'}
         raise TradingError('Неизвестная команда worker.')
