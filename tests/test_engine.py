@@ -6,7 +6,7 @@ from decimal import Decimal as D
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from farming_accounts.trading.domain import Book, Instrument, OrderObservation, Strategy, TradingError, UnknownExecution
+from farming_accounts.trading.domain import Book, Instrument, OrderObservation, PreSubmissionError, Strategy, TradingError, UnknownExecution
 from farming_accounts.trading.engine import Engine
 from farming_accounts.trading.journal import Journal
 
@@ -353,6 +353,43 @@ class EngineTests(unittest.TestCase):
             self.engine.tick()
         self.assertEqual(self.engine.status()["state"], "CLOSED")
         self.assertFalse(self.engine.status()["running"])
+
+    def test_restart_verifies_fresh_gateway_and_primes_markets_before_lookup(self):
+        self.engine.start()
+        self.engine.tick()
+        self.lighter.responses.append(UnknownExecution("fixture timeout"))
+        self.engine.tick()
+        intent = self.lighter.requests[-1]
+        self.lighter.lookup_results[intent.client_id] = OrderObservation(intent.client_id, "FILLED", D(20), D(100))
+        self.lighter.positions[intent.instrument.id] = D(-20)
+        fresh = GatewayFixture("Lighter", self.clock, self.journal)
+        fresh.positions = self.lighter.positions
+        fresh.lookup_results = self.lighter.lookup_results
+        ready = {"verified": False, "markets": False}
+        original_instruments, original_lookup = fresh.instruments, fresh.lookup
+        def verified():
+            ready["verified"] = True
+        def instruments():
+            self.assertTrue(ready["verified"])
+            ready["markets"] = True
+            return original_instruments()
+        def lookup(value):
+            self.assertTrue(ready["verified"] and ready["markets"])
+            return original_lookup(value)
+        fresh.verify, fresh.instruments, fresh.lookup = verified, instruments, lookup
+        self.engine = Engine(self.journal, self.nado, fresh, self.strategy, clock=self.clock)
+        self.engine.tick()
+        self.assertEqual(self.engine.status()["state"], "HEDGED")
+        self.assertEqual(fresh.requests, [])
+
+    def test_proven_pre_submit_failure_is_terminal_not_unknown(self):
+        self.nado.responses.append(PreSubmissionError("fixture preflight rejected before POST"))
+        self.engine.start()
+        self.engine.tick()
+        item = self.journal.orders(self.journal.active_cycle()["id"])[0]
+        self.assertEqual(item[2].status, "REJECTED")
+        self.engine.tick()
+        self.assertEqual(self.engine.status()["cycle"]["state"], "CLOSED")
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 
-from .domain import (Book, Instrument, OrderIntent, Strategy, TradingError,
+from .domain import (Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, Strategy, TradingError,
                      TradingGateway, UnknownExecution, quantize)
 from .journal import Journal, encoded
 
@@ -18,6 +18,13 @@ class Engine:
         self.journal, self.nado, self.lighter = journal, nado, lighter
         self.strategy, self.clock = strategy, clock
         self._mutex = threading.RLock()
+        self._verified = False
+
+    def _verify(self) -> None:
+        if not self._verified:
+            self.nado.verify()
+            self.lighter.verify()
+            self._verified = True
 
     def _gateway(self, venue: str) -> TradingGateway:
         if venue.casefold() == "nado":
@@ -63,6 +70,7 @@ class Engine:
             self.strategy.validate()
             self.nado.verify()
             self.lighter.verify()
+            self._verified = True
             pairs = self._pairs()
             result = []
             for asset in self.strategy.assets:
@@ -261,6 +269,11 @@ class Engine:
             elif reduce_only and result.filled_quantity == 0:
                 self.journal.set("running", False)
                 self._transition(cycle, "HALTED", "Площадка не исполнила закрытие в пределах цены. Требуется проверка остатка; повторов нет.")
+        except PreSubmissionError:
+            self.journal.observe(OrderObservation(intent.client_id, "REJECTED", Decimal(0)), observed_at=self.clock())
+            if reduce_only:
+                self.journal.set("running", False)
+                self._transition(cycle, "HALTED", "Закрытие отклонено до отправки. Остаток сохранён; проверьте доступ и ограничения.")
         except Exception:
             self.journal.mark_uncertain(intent.client_id)
             self._transition(cycle, "RECOVERY", "Результат отправки не подтверждён. Требуется сверка площадки.")
@@ -284,6 +297,7 @@ class Engine:
                     return self.status()
                 try:
                     self.strategy.validate()
+                    self._verify()
                     cycle = self._new_cycle()
                 except TradingError as error:
                     self.journal.set("waiting_reason", str(error))
@@ -294,11 +308,13 @@ class Engine:
                 return self.status()
             try:
                 strategy = self._strategy(cycle)
+                self._verify()
+                # Fresh adapter instances need their validated market cache before lookup.
+                spot, perp = self._refresh_pair(cycle)
                 if not self._reconcile(cycle):
                     return self.status()
                 # A crash may occur between intent insertion and updating the cycle cache.
                 cycle["attempts"] = len(self.journal.orders(cycle["id"]))
-                spot, perp = self._refresh_pair(cycle)
                 spot_quantity, perp_quantity = self._quantities(cycle)
                 if spot_quantity < 0 or perp_quantity > 0:
                     raise TradingError("Нарушено направление позиций хеджа.")

@@ -13,6 +13,10 @@ class UnknownExecution(TradingError):
     """A write may have reached the exchange; only reconciliation is allowed."""
 
 
+class PreSubmissionError(TradingError):
+    """The adapter proves it failed before any trading POST was attempted."""
+
+
 @dataclass(frozen=True)
 class Instrument:
     venue: str
