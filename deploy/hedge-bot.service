@@ -1,0 +1,42 @@
+[Unit]
+Description=Nado and Robinhood Lighter hedge worker
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=hedge-bot
+Group=hedge-bot
+WorkingDirectory=/opt/hedge-bot/app
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HEDGE_STATE_DIR=/var/lib/hedge-bot
+Environment=HEDGE_MASTER_KEY_FILE=/etc/hedge-bot/master.key
+EnvironmentFile=/etc/hedge-bot/worker.env
+ExecStart=/opt/hedge-bot/.venv/bin/python /opt/hedge-bot/app/run.py --worker --state-dir /var/lib/hedge-bot --host ${HEDGE_HOST} --port ${HEDGE_PORT} --certificate ${HEDGE_CERTIFICATE} --certificate-key ${HEDGE_CERTIFICATE_KEY} --public-url ${HEDGE_PUBLIC_URL}
+Restart=on-failure
+RestartSec=10s
+KillSignal=SIGINT
+TimeoutStopSec=100s
+UMask=0077
+StateDirectory=hedge-bot
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/hedge-bot
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target
