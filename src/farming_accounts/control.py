@@ -14,6 +14,7 @@ from urllib.request import Request, ProxyHandler, build_opener
 
 from .transport import NoRedirects
 from .vault import Vault, state_directory
+from . import __version__
 
 
 class ControlError(Exception):
@@ -81,10 +82,30 @@ def local_client() -> ControlClient:
 
 def ensure_local_worker(client: ControlClient) -> None:
     try:
-        client.request('/status')
-        return
+        status = client.request('/status')
     except ControlError:
-        pass
+        status = None
+    if status:
+        if status.get('version') == __version__:
+            return
+        execution = status.get('execution', {})
+        cycle = execution.get('cycle') or {}
+        if execution.get('running') or (cycle and cycle.get('state') != 'CLOSED') or execution.get('state') in (
+                'OPENING_SPOT', 'OPENING_HEDGE', 'HEDGED', 'CLOSING', 'HALTED', 'RECOVERY'):
+            raise ControlError('Работает другая версия процесса торговли с активной стратегией или незавершённым хеджем. '
+                               'Остановите и завершите хедж в предыдущей версии перед обновлением процесса.')
+        # The worker independently checks the durable journal and rejects shutdown with exposure.
+        # Never kill the process or retry shutdown if its response is uncertain.
+        client.request('/shutdown', {})
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline:
+            try:
+                client.request('/status')
+            except ControlError:
+                break
+            time.sleep(0.25)
+        else:
+            raise ControlError('Предыдущий процесс ещё не остановился. Повторите подключение после его завершения.')
     args = [sys.executable]
     if not getattr(sys, 'frozen', False):
         args.append(str(Path(__file__).resolve().parents[2] / 'run.py'))
@@ -100,8 +121,9 @@ def ensure_local_worker(client: ControlClient) -> None:
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
         try:
-            client.request('/status')
-            return
+            status = client.request('/status')
+            if status.get('version') == __version__:
+                return
         except ControlError:
             time.sleep(0.25)
     raise ControlError('Не удалось запустить local worker. Проверьте, свободен ли порт 8765.')

@@ -135,7 +135,7 @@ class TradingPanel:
             return client, client.request('/status')
         def connected(result):
             self.client, self.data = result
-            self.worker_label.configure(text='Торговля: этот компьютер')
+            self.worker_label.configure(text='Торговля: этот компьютер · ' + self.data.get('version', ''))
             self.message.configure(text='Worker продолжит работу после закрытия окна. Для работы при выключенном ПК подключите VPS.')
             self.render()
         self.work(connect, connected)
