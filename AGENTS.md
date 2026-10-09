@@ -1,8 +1,10 @@
 # Project instructions
 
-- Current release scope: desktop account connections and balance viewing only.
+- Current task: delegated trading authorization and hedge execution, preserving the working balance viewer.
 - Product direction: a working application built incrementally, not an MVP. Use the user's dark dashboard reference, with Balance and Trading navigation. Never ship sample financial values, simulated trades/history, or runtime demo modes. Synthetic fixtures belong only in isolated tests.
-- Do not implement trading, signing, deposits, withdrawals, or secret-key collection without a new task.
+- The user authorized the trading stage. Use separate delegated/API signing keys; never request the main wallet private key. No deposits, transfers, or withdrawal methods are in scope.
+- Persist order intent before submission, reconcile uncertain executions without blind write retries, and prevent new cycles while exposure is unresolved. No automatic trading until explicit strategy start in the app.
+- No server exists yet. Deliver an independently running local worker and Linux deployment package; do not claim VPS deployment before it exists.
 - Research API changes using official Nado and Lighter Robinhood Chain documentation. Do not substitute Lighter Core.
 - Use `find-skills` from vercel-labs/skills and skills.sh to find appropriate skills as work evolves.
 - After every coherent code change, immediately commit and push it to this private repository. Never commit credentials, wallet private keys, account configuration, real balance snapshots, or logs.
