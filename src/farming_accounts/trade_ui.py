@@ -306,7 +306,13 @@ class TradingPanel:
                     try:
                         callback(result)
                     except Exception:
-                        self.message.configure(text='Ответ получен. Обновляю состояние после закрытия или изменения окна.')
+                        message = 'Не удалось обработать ответ. Проверьте состояние подключения перед повторной командой.'
+                        self.message.configure(text=message)
+                        if on_error:
+                            try:
+                                on_error(message)
+                            except tk.TclError:
+                                pass
                 elif isinstance(result, dict) and 'execution' in result:
                     self.data = result
                 if isinstance(result, dict) and result.get('message'):
@@ -325,5 +331,5 @@ class TradingPanel:
         self.app.root.after_cancel(self.refresh_id)
         for dialog in self.dialogs:
             if dialog.winfo_exists():
-                dialog.destroy()
+                getattr(dialog, 'close_handler', dialog.destroy)()
         self.executor.shutdown(wait=False, cancel_futures=True)

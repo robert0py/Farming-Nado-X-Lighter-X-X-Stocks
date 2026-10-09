@@ -71,6 +71,43 @@ class ControlTests(unittest.TestCase):
         with self.assertRaises(TradingError):
             self.runtime.wallet('unrecognized', '0x' + '11' * 65)
 
+    def test_lighter_discovery_then_registration_returns_working_browser_payload_without_writes(self):
+        import json
+        from urllib.parse import urlsplit
+        from farming_accounts.trading.lighter import GeneratedLighterKey, RegistrationChallenge
+        owner = '0x' + '22' * 20
+        options = {'ok': True, 'accounts': [7], 'account_index': 7, 'api_key_index': 5, 'free_key_indices': [5, 6]}
+        helper = Mock()
+        helper.prepare.return_value = RegistrationChallenge('Authorize separate key', 'local-hash', 7, 5, '0x' + '33' * 40, int(time.time()) + 300)
+        generated = GeneratedLighterKey('11' * 40, '0x' + '33' * 40)
+        with patch('farming_accounts.trading.lighter_setup.registration_options', return_value=options) as discovery, \
+             patch('farming_accounts.trading.lighter.generate_api_key', return_value=generated), \
+             patch('farming_accounts.trading.lighter.LighterRegistration', return_value=helper):
+            found = self.client.request('/registration-options/lighter', {'credentials': {'wallet_address': owner}})
+            result = self.client.request('/register/lighter', {'revision': 0, 'credentials': {
+                'wallet_address': owner, 'account_index': found['account_index'], 'api_key_index': found['api_key_index']}})
+        self.assertEqual(discovery.call_count, 2)
+        url = urlsplit(result['wallet_url'])
+        token = url.fragment
+        request = Request(self.url + '/wallet/payload', headers={'Authorization': 'Bearer ' + token})
+        with build_opener(ProxyHandler({})).open(request) as response:
+            payload = json.load(response)['challenge']
+        self.assertEqual(payload['method'], 'personal_sign')
+        self.assertEqual(payload['owner'], owner)
+        self.assertGreater(payload['expires_at'], time.time())
+        self.assertNotIn(generated.private_key, str(payload) + str(result))
+        helper.complete.assert_not_called()
+        self.assertNotIn('lighter', self.runtime.config())
+
+    def test_occupied_lighter_slot_is_rejected_before_key_generation(self):
+        with patch('farming_accounts.trading.lighter_setup.registration_options', side_effect=TradingError('Индекс уже занят')), \
+             patch('farming_accounts.trading.lighter.generate_api_key') as generate:
+            with self.assertRaisesRegex(ControlError, 'уже занят'):
+                self.client.request('/register/lighter', {'revision': 0, 'credentials': {
+                    'wallet_address': '0x' + '22' * 20, 'account_index': 7, 'api_key_index': 4}})
+        generate.assert_not_called()
+        self.assertEqual(self.runtime.challenges, {})
+
     def test_missing_eligibility_and_reserved_key_indexes_rejected(self):
         settings = {'assets': ['SPY', 'QQQ'], 'notional_per_leg': '100', 'max_slippage_bps': '10',
                     'residual_notional': '1', 'margin_reserve': '10', 'max_loss_quote': '5',

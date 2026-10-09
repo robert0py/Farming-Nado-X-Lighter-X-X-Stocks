@@ -114,13 +114,23 @@ class TradingDesktopTests(unittest.TestCase):
         self.assertFalse(form.pending)
         self.assertTrue(form.window.winfo_exists())
 
-    def test_busy_worker_does_not_silently_drop_key_submission(self):
+    def test_busy_status_read_defers_key_request_and_sends_it_once(self):
         form = self.key_form()
         self.panel.busy = True
-        form.submit()
-        self.assertIn('Дождитесь', form.status.cget('text'))
-        self.assertFalse(form.pending)
-        self.assertEqual(self.panel.executor.tasks, [])
+        self.panel.client.request.return_value = {'ok': True, 'wallet_url': 'http://127.0.0.1:8765/wallet#test'}
+        with patch.object(form.window, 'after', return_value='scheduled') as schedule:
+            form.submit()
+            form.submit()
+            self.assertIn('автоматически', form.status.cget('text'))
+            self.assertTrue(form.pending)
+            self.assertEqual(self.panel.executor.tasks, [])
+            schedule.assert_called_once()
+            self.panel.busy = False
+            schedule.call_args.args[1]()
+        self.panel.executor.run_one()
+        with patch('farming_accounts.credentials_ui.webbrowser.open', return_value=True):
+            self.panel.poll()
+        self.panel.client.request.assert_called_once()
 
     def test_browser_failure_preserves_registration_link_without_exporting_key(self):
         form = self.key_form()
@@ -136,3 +146,57 @@ class TradingDesktopTests(unittest.TestCase):
         self.assertEqual(form.link_value.get(), url)
         self.assertIn('Скопируйте ссылку', form.status.cget('text'))
         self.assertTrue(form.window.winfo_exists())
+
+    def test_lighter_wallet_only_creates_key_and_opens_browser_after_discovery(self):
+        form = self.key_form('lighter')
+        url = 'http://127.0.0.1:8765/wallet#isolated-lighter'
+        self.panel.client.request.side_effect = [
+            {'ok': True, 'accounts': [17], 'account_index': 17, 'api_key_index': 5, 'free_key_indices': [5, 6]},
+            {'ok': True, 'wallet_url': url}]
+        form.submit()
+        self.assertTrue(form.pending)
+        self.panel.executor.run_one()
+        self.panel.poll()
+        self.panel.executor.run_one()
+        with patch('farming_accounts.credentials_ui.webbrowser.open', return_value=True) as browser:
+            self.root.after_cancel(self.panel.refresh_id)
+            self.panel.poll()
+        calls = self.panel.client.request.call_args_list
+        self.assertEqual([call.args[0] for call in calls], ['/registration-options/lighter', '/register/lighter'])
+        self.assertIsNone(calls[0].args[1]['credentials']['account_index'])
+        self.assertEqual(calls[1].args[1]['credentials']['account_index'], 17)
+        self.assertEqual(calls[1].args[1]['credentials']['api_key_index'], 5)
+        self.assertNotIn('api_private_key', calls[1].args[1]['credentials'])
+        browser.assert_called_once_with(url)
+        self.assertEqual(form.link_value.get(), url)
+        self.assertFalse(form.pending)
+
+    def test_multiple_lighter_accounts_require_explicit_selection_before_generation(self):
+        form = self.key_form('lighter')
+        self.panel.client.request.return_value = {'ok': True, 'accounts': [17, 18], 'account_index': None, 'free_key_indices': []}
+        form.submit()
+        self.panel.executor.run_one()
+        self.panel.poll()
+        self.panel.client.request.assert_called_once()
+        self.assertIn('несколько аккаунтов', form.status.cget('text'))
+        self.assertEqual(form.entries['account_index'].cget('values'), ('17', '18'))
+        self.assertFalse(form.pending)
+
+    def test_lighter_prefills_account_identity_from_verified_balance(self):
+        from farming_accounts.accounts import parse_lighter
+        from test_accounts import lighter_data, ADDRESS
+        self.app.lighter.address.set('7')
+        self.app.lighter.snapshot = parse_lighter(lighter_data(), '#7 · ' + ADDRESS)
+        form = self.panel.credentials_dialog('lighter')
+        self.assertEqual(form.entries['wallet_address'].get(), ADDRESS)
+        self.assertEqual(form.entries['account_index'].get(), '7')
+        self.assertEqual(form.entries['api_key_index'].get(), '')
+
+    def test_incomplete_setup_response_is_reported_in_form_and_unlocks_action(self):
+        form = self.key_form('lighter')
+        self.panel.client.request.return_value = {'ok': True}
+        form.submit()
+        self.panel.executor.run_one()
+        self.panel.poll()
+        self.assertIn('Не удалось обработать ответ', form.status.cget('text'))
+        self.assertFalse(form.pending)

@@ -3,8 +3,9 @@
 import tkinter as tk
 from tkinter import ttk
 import webbrowser
+import re
 
-from .trade_config import credentials
+from .trade_config import credentials, lighter_registration_inputs
 from .trading.domain import TradingError
 
 
@@ -13,10 +14,13 @@ class CredentialsDialog:
         from .app import PANEL, MUTED, INK, FIELD, label, set_dark_titlebar
         self.panel, self.venue = panel, venue
         self.pending = False
+        self.wait_timer = None
         self.wallet_url = None
         self.entries = {}
+        self.labels = {}
         root = panel.app.root
         self.window = dialog = tk.Toplevel(root)
+        dialog.close_handler = self.close
         dialog.title('Торговый доступ · ' + ('Nado · spot xStocks' if venue == 'nado' else 'Lighter · Robinhood Chain'))
         dialog.configure(bg=PANEL)
         dialog.transient(root)
@@ -35,6 +39,7 @@ class CredentialsDialog:
         self.status = label(footer, 'Выберите способ подключения. Основной ключ кошелька и seed-фраза не нужны.',
                             color=MUTED, size=10, wraplength=660, justify='left', anchor='w')
         self.status.pack(fill='x', pady=(0, 12))
+        self.progress = ttk.Progressbar(footer, mode='indeterminate')
         footer.bind('<Configure>', lambda event: self.status.configure(wraplength=max(200, event.width - 4)))
         actions = tk.Frame(footer, bg=PANEL)
         actions.pack(fill='x')
@@ -67,23 +72,36 @@ class CredentialsDialog:
 
         label(body, 'Как подключить торговый доступ?', bold=True, size=16).pack(anchor='w', pady=(0, 12))
         self.mode = tk.StringVar(value='wallet')
+        self.mode_buttons = []
         style = ttk.Style(dialog)
         style.configure('Key.TRadiobutton', background=PANEL, foreground=INK, font=('Segoe UI', 10))
         style.map('Key.TRadiobutton', background=[('active', FIELD)], foreground=[('active', INK)])
         for value, title in (('wallet', 'Создать отдельный ключ через кошелёк'), ('existing', 'У меня уже есть зарегистрированный ключ')):
-            ttk.Radiobutton(body, text=title, value=value, variable=self.mode, command=self.change_mode, style='Key.TRadiobutton').pack(anchor='w', pady=4)
+            button = ttk.Radiobutton(body, text=title, value=value, variable=self.mode, command=self.change_mode, style='Key.TRadiobutton')
+            button.pack(anchor='w', pady=4)
+            self.mode_buttons.append(button)
         self.instructions = label(body, '', color=MUTED, size=10, wraplength=640, justify='left', anchor='w')
         self.instructions.pack(fill='x', pady=(12, 16))
-        saved = panel.data.get('credentials', {}).get(venue, {})
+        self.saved = saved = panel.data.get('credentials', {}).get(venue, {})
         definitions = [('owner', 'Адрес кошелька аккаунта Nado (0x…)'), ('subaccount', 'Субаккаунт Nado')] if venue == 'nado' else [
             ('wallet_address', 'Адрес кошелька аккаунта Lighter (0x…)'), ('account_index', 'Индекс аккаунта на Robinhood Chain'),
             ('api_key_index', 'Свободный индекс API-ключа: 4–156 или 158–254')]
         balance_panel = panel.app.nado if venue == 'nado' else panel.app.lighter
+        balance_identity = {}
+        if venue == 'lighter' and balance_panel.snapshot:
+            match = re.fullmatch(r'#([0-9]+) · (0x[0-9a-fA-F]{40})', balance_panel.snapshot.identity)
+            if match:
+                balance_identity = {'account_index': match[1], 'wallet_address': match[2]}
         for key, title in definitions:
-            label(body, title, size=10).pack(anchor='w')
-            entry = self.entries[key] = ttk.Entry(body)
+            self.labels[key] = label(body, title, size=10)
+            self.labels[key].pack(anchor='w')
+            entry = self.entries[key] = ttk.Combobox(body) if key in ('account_index', 'api_key_index') else ttk.Entry(body)
             entry.pack(fill='x', pady=(5, 12))
             value = saved.get(key)
+            if key == 'api_key_index':
+                value = None  # A new key must use a free slot, not replace the saved one.
+            if value is None:
+                value = balance_identity.get(key)
             if value is None and key in ('owner', 'wallet_address'):
                 value = balance_panel.address.get()
             if value is None and key == 'subaccount':
@@ -116,17 +134,56 @@ class CredentialsDialog:
             self.instructions.configure(text='Вставьте отдельный ключ, уже привязанный к этому аккаунту. Сохраните его, затем нажмите «Проверить доступ» в приложении.')
             self.secret_frame.pack(fill='x', before=self.notice)
             title = 'Сохранить ключ'
+            if self.venue == 'lighter' and not self.entries['api_key_index'].get() and self.saved.get('api_key_index') is not None:
+                self.entries['api_key_index'].insert(0, str(self.saved['api_key_index']))
         else:
-            self.instructions.configure(text='1. Проверьте адрес аккаунта ниже.\n2. Создайте ключ и откройте браузер с кошельком.\n3. Подключите этот адрес и отдельно подпишите привязку.')
+            self.instructions.configure(text='1. Проверьте адрес аккаунта ниже.\n2. Создайте ключ и откройте браузер с кошельком.\n3. Подключите этот адрес и отдельно подпишите привязку.' if self.venue == 'nado' else
+                                        'Достаточно публичного адреса кошелька. Индексы можно оставить пустыми: приложение найдёт аккаунт и свободный API key index на Robinhood Chain. При нескольких аккаунтах предложит выбрать нужный.')
             self.secret_frame.pack_forget()
             title = 'Создать ключ и открыть браузер'
+        if self.venue == 'lighter':
+            self.labels['account_index'].configure(text='Индекс аккаунта (пусто — найти по кошельку)' if self.mode.get() == 'wallet' else 'Индекс аккаунта на Robinhood Chain')
+            self.labels['api_key_index'].configure(text='API key index (пусто — выбрать свободный)' if self.mode.get() == 'wallet' else 'Индекс зарегистрированного API-ключа')
         self.submit_button.configure(text=title, state='disabled' if self.pending else 'normal')
 
+    def set_pending(self, value):
+        self.pending = value
+        for entry in self.entries.values():
+            entry.configure(state='disabled' if value else 'normal')
+        for button in self.mode_buttons:
+            button.configure(state='disabled' if value else 'normal')
+        if value:
+            self.progress.pack(fill='x', before=self.submit_button.master, pady=(0, 12))
+            self.progress.start(15)
+        else:
+            self.progress.stop()
+            self.progress.pack_forget()
+        self.change_mode()
+
+    def status_text(self, message, *, error=False):
+        from .app import MUTED, RED
+        self.status.configure(text=message, fg=RED if error else MUTED)
+
+    def send_when_ready(self, path, data, callback):
+        """Wait for an in-flight status read; send the user command exactly once."""
+        self.wait_timer = None
+        if not self.window.winfo_exists():
+            return
+        if self.panel.closed:
+            self.fail('Процесс управления закрыт. Подключите его снова.')
+            return
+        if self.panel.busy:
+            self.status_text('Дожидаюсь текущего запроса. Подготовка подключения продолжится автоматически…')
+            self.wait_timer = self.window.after(150, lambda: self.send_when_ready(path, data, callback))
+            return
+        if 'revision' in data:
+            data['revision'] = self.panel.data.get('revision', 0)
+        self.panel.request(path, data, callback, self.fail)
+
     def fail(self, message):
-        self.pending = False
         if self.window.winfo_exists():
-            self.status.configure(text=message)
-            self.change_mode()
+            self.set_pending(False)
+            self.status_text(message, error=True)
 
     def submit(self):
         if self.pending or not self.window.winfo_exists():
@@ -134,20 +191,39 @@ class CredentialsDialog:
         existing = self.mode.get() == 'existing'
         raw = {key: entry.get().strip() for key, entry in self.entries.items() if existing or 'private_key' not in key}
         try:
-            value = credentials(self.venue, raw, require_key=existing)
+            value = lighter_registration_inputs(raw) if self.venue == 'lighter' and not existing else credentials(self.venue, raw, require_key=existing)
         except TradingError as error:
             self.fail(str(error))
             return
-        if self.panel.busy:
-            self.fail('Сейчас обновляется состояние. Дождитесь завершения запроса и нажмите кнопку ещё раз.')
+        self.set_pending(True)
+        if self.venue == 'lighter' and not existing:
+            self.status_text('Ищу аккаунт и свободный индекс ключа на Lighter Robinhood Chain…')
+            self.send_when_ready('/registration-options/lighter', {'credentials': value}, self.options_ready)
             return
-        self.pending = True
-        self.submit_button.configure(state='disabled')
-        self.status.configure(text='Сохраняю ключ…' if existing else 'Создаю отдельный ключ. Дождитесь открытия страницы привязки…')
+        self.register(value, existing)
+
+    def options_ready(self, result):
+        if not self.window.winfo_exists():
+            return
+        self.set_pending(False)
+        self.entries['account_index'].configure(values=tuple(str(index) for index in result['accounts']))
+        if result['account_index'] is None:
+            self.status_text('Найдено несколько аккаунтов этого кошелька. Выберите индекс аккаунта в списке и нажмите «Создать ключ» снова.')
+            self.entries['account_index'].focus_set()
+            return
+        for field in ('account_index', 'api_key_index'):
+            self.entries[field].delete(0, 'end')
+            self.entries[field].insert(0, str(result[field]))
+        self.entries['api_key_index'].configure(values=tuple(str(index) for index in result['free_key_indices']))
+        self.register(credentials('lighter', {key: entry.get().strip() for key, entry in self.entries.items()}, require_key=False), False)
+
+    def register(self, value, existing):
+        self.set_pending(True)
+        self.status_text('Сохраняю ключ…' if existing else 'Аккаунт проверен. Создаю отдельный ключ и готовлю страницу для кошелька…')
         def finished(result):
-            self.pending = False
             if not self.window.winfo_exists():
                 return
+            self.set_pending(False)
             for key, entry in self.entries.items():
                 if 'private_key' in key:
                     entry.delete(0, 'end')
@@ -163,14 +239,14 @@ class CredentialsDialog:
         data = {'revision': self.panel.data.get('revision', 0), 'credentials': value}
         if existing:
             data['venue'] = self.venue
-        self.panel.request('/credentials' if existing else '/register/' + self.venue, data, finished, self.fail)
+        self.send_when_ready('/credentials' if existing else '/register/' + self.venue, data, finished)
 
     def open_browser(self):
         try:
             opened = self.wallet_url and webbrowser.open(self.wallet_url)
         except Exception:
             opened = False
-        self.status.configure(text='Страница открыта. Подключите кошелёк и подпишите привязку, затем вернитесь и нажмите «Проверить доступ».' if opened else
+        self.status_text('Страница открыта. Подключите кошелёк и подпишите привязку, затем вернитесь и нажмите «Проверить доступ».' if opened else
                               'Браузер не открылся. Скопируйте ссылку ниже и вставьте её в браузер с расширением кошелька.')
 
     def copy_link(self):
@@ -181,6 +257,10 @@ class CredentialsDialog:
 
     def close(self):
         if self.window.winfo_exists():
+            if self.wait_timer is not None:
+                self.window.after_cancel(self.wait_timer)
+                self.wait_timer = None
+            self.set_pending(False)
             for key, entry in self.entries.items():
                 if 'private_key' in key:
                     entry.delete(0, 'end')

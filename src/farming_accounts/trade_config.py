@@ -12,6 +12,23 @@ DECIMAL_FIELDS = ('notional_per_leg', 'max_slippage_bps', 'residual_notional', '
 INTEGER_FIELDS = ('max_unhedged_seconds', 'quote_max_age_seconds', 'hold_seconds')
 
 
+def lighter_registration_inputs(value: dict) -> dict:
+    """Public setup fields. Empty indices request discovery, never a guessed account."""
+    try:
+        address = wallet_address(value.get('wallet_address', ''))
+    except (AccountError, TypeError, AttributeError):
+        raise TradingError('Введите публичный адрес кошелька Lighter: 0x и 40 hex-символов.') from None
+    raw_account = str(value.get('account_index') if value.get('account_index') is not None else '').strip()
+    try:
+        index = account_index(raw_account) if raw_account else None
+    except AccountError:
+        raise TradingError('Индекс аккаунта Lighter должен быть целым числом. Оставьте поле пустым для автоматического поиска.') from None
+    raw_key = str(value.get('api_key_index') if value.get('api_key_index') is not None else '').strip()
+    if raw_key and (len(raw_key) > 3 or not raw_key.isascii() or not raw_key.isdecimal() or int(raw_key) not in (*range(4, 157), *range(158, 255))):
+        raise TradingError('API key index: 4–156 или 158–254. Оставьте поле пустым для выбора свободного индекса.')
+    return {'wallet_address': address, 'account_index': index, 'api_key_index': int(raw_key) if raw_key else None}
+
+
 def credentials(venue: str, value: dict, *, require_key=True) -> dict:
     try:
         if venue == 'nado':

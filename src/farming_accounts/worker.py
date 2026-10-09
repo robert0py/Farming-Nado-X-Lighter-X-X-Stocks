@@ -132,6 +132,9 @@ class Runtime:
             return response
 
     def _command(self, route, value):
+        if route == '/registration-options/lighter':
+            from .trading.lighter_setup import registration_options
+            return registration_options(value.get('credentials', {}))
         if route in ('/credentials', '/strategy', '/register/nado', '/register/lighter'):
             if route != '/credentials':
                 self.mutable()
@@ -246,12 +249,19 @@ class Runtime:
                           'display': {'Площадка': 'Nado', 'Кошелёк': data['owner'], 'Субаккаунт': data['subaccount'],
                                       'Отдельный signer': challenge['signer_address'], 'Права': 'Полные права субаккаунта'}}
             else:
+                from .trading.lighter_setup import registration_options
+                # Re-check ownership and the slot immediately before key generation.
+                registration_options(data)
                 from .trading.lighter import LighterCredentials, LighterRegistration, generate_api_key
                 generated = generate_api_key()
                 public_key = generated.public_key
                 data['api_private_key'] = '0x' + generated.private_key.removeprefix('0x')
                 helper = LighterRegistration(LighterCredentials(**data), public_key)
-                challenge = helper.prepare()
+                try:
+                    challenge = helper.prepare()
+                except Exception:
+                    helper.close()
+                    raise
                 public = {'method': 'personal_sign', 'owner': data['wallet_address'], 'message_utf8': challenge.message,
                           'display': {'Площадка': 'Lighter Robinhood Chain', 'Кошелёк': data['wallet_address'],
                                       'Аккаунт': data['account_index'], 'API key index': data['api_key_index'], 'Публичный ключ': public_key}}

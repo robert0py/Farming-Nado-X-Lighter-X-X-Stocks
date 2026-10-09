@@ -18,12 +18,14 @@ NADO_ACCOUNT = "https://api.prod.nado.xyz/gateway/v1/query"
 NADO_SYMBOLS = "https://api.prod.nado.xyz/archive/v2/symbols"
 LIGHTER_ACCOUNT = "https://api.rh.lighter.xyz/api/v1/account"
 LIGHTER_ACCOUNTS = "https://api.rh.lighter.xyz/api/v1/accountsByL1Address"
+LIGHTER_APIKEYS = "https://api.rh.lighter.xyz/api/v1/apikeys"
 
 ROUTES = {
     NADO_ACCOUNT: {"type", "subaccount"},
     NADO_SYMBOLS: {"product_type"},
     LIGHTER_ACCOUNT: {"by", "value", "active_only", "cursor"},
     LIGHTER_ACCOUNTS: {"l1_address", "cursor"},
+    LIGHTER_APIKEYS: {"account_index", "api_key_index"},
 }
 MAX_RESPONSE = 8 * 1024 * 1024
 
