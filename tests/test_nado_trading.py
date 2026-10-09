@@ -146,6 +146,7 @@ class NadoTradingTests(unittest.TestCase):
         return {"digest": digest, "subaccount": SENDER, "product_id": 117,
                 "nonce": str(self.intent.nonce), "amount": raw(1), "base_filled": raw(filled),
                 "quote_filled": raw(-D(filled) * 105), "fee": raw("0.0315"),
+                "last_fill_timestamp": str(NOW),
                 "post_balance": {"base": {"spot": {"product_id": 117, "balance": {"amount": raw(post)}}}}}
 
     def test_requires_registered_delegated_signer(self):
@@ -266,6 +267,7 @@ class NadoTradingTests(unittest.TestCase):
         result = self.gateway.lookup(self.intent)
         self.assertEqual((result.status, result.filled_quantity), ("CANCELLED", D("0.6")))
         self.assertEqual(result.average_price, D(105))
+        self.assertEqual(result.filled_at, NOW)
 
     def test_lagging_archive_is_pending_not_terminal(self):
         self.transport.rows = [self.row("0.6", "0.6")]
@@ -367,6 +369,7 @@ class NadoLifecycleTests(unittest.TestCase):
         result = self.collect([self.fill(1, 0), self.update(1, 0)])
         self.assertEqual((result.status, result.filled_quantity, result.average_price), ("FILLED", D(1), D(105)))
         self.assertEqual(result.fee, D("0.01"))
+        self.assertEqual(result.filled_at, NOW)
 
     def test_partial_ioc_then_cancel_preserves_fill(self):
         result = self.collect([self.fill("0.6", "0.4"), self.update("0.6", "0.4"),

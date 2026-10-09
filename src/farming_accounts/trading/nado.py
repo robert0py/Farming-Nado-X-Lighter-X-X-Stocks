@@ -309,6 +309,7 @@ class NadoLifecycle:
     def collect(self, intent, digest):
         filled, quote, fees, remaining = Decimal(0), Decimal(0), Decimal(0), intent.quantity
         update_filled, terminal = Decimal(0), None
+        filled_at = None
         seen = set()
         until = time.monotonic() + 10
         try:
@@ -339,6 +340,10 @@ class NadoLifecycle:
                     quote += qty * price
                     fees += _x18(item.get("fee"))
                     remaining = rest
+                    timestamp = _integer(item.get("timestamp"), minimum=1) / 1_000_000_000
+                    if timestamp > self.clock() + 5:
+                        return None
+                    filled_at = max(filled_at or timestamp, timestamp)
                 elif item.get("reason") == "filled":
                     qty, rest = _x18(item.get("filled_qty")), abs(_x18(item.get("amount")))
                     if qty <= 0 or intent.quantity - update_filled - qty != rest:
@@ -352,7 +357,7 @@ class NadoLifecycle:
                     terminal = "CANCELLED"
                 if terminal and filled == update_filled and (terminal != "FILLED" or filled == intent.quantity):
                     return OrderObservation(intent.client_id, terminal, filled,
-                                            quote / filled if filled else None, fees, digest)
+                                            quote / filled if filled else None, fees, digest, filled_at)
         except Exception:
             return None
         return None
@@ -585,6 +590,10 @@ class NadoGateway:
         signed_filled = _x18(item.get("base_filled"))
         filled = abs(signed_filled)
         quote, fee = _x18(item.get("quote_filled")), _x18(item.get("fee"))
+        timestamp_raw = item.get("last_fill_timestamp")
+        filled_at = None if timestamp_raw is None else _integer(timestamp_raw, minimum=1)
+        if filled_at is not None and filled_at > self.clock() + 5:
+            raise UnknownExecution("Nado вернул недостоверное время исполнения.")
         if (filled <= 0 or filled > intent.quantity or (signed_filled > 0) != (intent.side == "buy")
                 or (quote < 0) != (intent.side == "buy")):
             raise UnknownExecution("Nado не подтвердил достоверное исполнение ордера.")
@@ -592,13 +601,13 @@ class NadoGateway:
         # Partial history is terminal only if its archived balance has caught up
         # to the current account and the IOC is no longer on the matching engine.
         if self.open_orders(intent.instrument):
-            return OrderObservation(intent.client_id, "PENDING", filled, abs(quote) / filled, fee, digest)
+            return OrderObservation(intent.client_id, "PENDING", filled, abs(quote) / filled, fee, digest, filled_at)
         post = _obj(_obj(item.get("post_balance")).get("base"))
         spot = _obj(post.get("spot"))
         if _integer(spot.get("product_id")) != intent.instrument.id:
             raise UnknownExecution("История Nado не подтверждает spot-продукт.")
         post_amount = _x18(_obj(spot.get("balance")).get("amount"))
         if self.position(intent.instrument) != post_amount:
-            return OrderObservation(intent.client_id, "PENDING", filled, abs(quote) / filled, fee, digest)
+            return OrderObservation(intent.client_id, "PENDING", filled, abs(quote) / filled, fee, digest, filled_at)
         return OrderObservation(intent.client_id, "FILLED" if filled == intent.quantity else "CANCELLED",
-                                filled, abs(quote) / filled, fee, digest)
+                                filled, abs(quote) / filled, fee, digest, filled_at)
