@@ -35,6 +35,7 @@ class Runtime:
         self.challenges = {}
         self.origin = ''
         self.stopped = threading.Event()
+        self.shutdown = None
 
     def config(self):
         return self.vault.load().get('trading', {})
@@ -91,6 +92,7 @@ class Runtime:
             state = self.engine.status() if self.engine else {'state': 'NOT_CONFIGURED', 'running': False}
             return {'ok': True, 'version': __version__, 'worker': 'running', 'revision': config.get('revision', 0),
                     'credentials': public_credentials(config), 'verified': self.verified,
+                    'pending_registration': self.vault.load().get('pending_registration', {}).get('venue'),
                     'strategy': config.get('strategy'), 'execution': state, 'error': self.error,
                     'history': self.journal.history(50), 'events': self.journal.events(50)}
 
@@ -156,6 +158,30 @@ class Runtime:
                 close = getattr(gateway, 'close', None)
                 if close:
                     close()
+        if route == '/recover-registration':
+            self.mutable()
+            pending = self.vault.load().get('pending_registration')
+            if not pending:
+                raise TradingError('Незавершённой привязки ключа нет.')
+            venue = pending['venue']
+            config = self.config()
+            config[venue] = pending['credentials']
+            gateway = self.gateway(venue, config)
+            try:
+                gateway.verify()
+                self.save_config(config)
+                self.vault.update(lambda v: v.pop('pending_registration', None))
+                self.verified[venue] = True
+                return {'ok': True, 'message': 'Площадка подтвердила сохранённый ключ. Доступ восстановлен без повторной регистрации.'}
+            finally:
+                closer = getattr(gateway, 'close', None)
+                if closer:
+                    closer()
+        if route == '/shutdown':
+            self.mutable()
+            if self.shutdown:
+                threading.Thread(target=self.shutdown, daemon=True).start()
+            return {'ok': True, 'message': 'Worker остановлен. Открытых циклов нет.'}
         if route == '/preflight':
             self.check_points()
             result = self.build_engine().preflight()
@@ -381,6 +407,7 @@ def main(argv=None):
     if scheme == 'https' and not runtime.origin.startswith('https://'):
         parser.error('--public-url must use HTTPS')
     server = Server((args.host, args.port), handler_for(runtime))
+    runtime.shutdown = server.shutdown
     if args.certificate:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2

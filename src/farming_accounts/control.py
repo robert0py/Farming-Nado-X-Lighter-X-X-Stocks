@@ -1,6 +1,7 @@
 """Authenticated desktop control client. HTTPS required outside loopback."""
 
 import json
+import os
 from pathlib import Path
 import secrets
 import re
@@ -39,7 +40,8 @@ class ControlClient:
 
     def request(self, path: str, data: dict | None = None) -> dict:
         if path not in ('/status', '/markets', '/preflight', '/credentials', '/strategy', '/start',
-                        '/stop', '/close', '/verify', '/register/nado', '/register/lighter'):
+                        '/stop', '/close', '/verify', '/register/nado', '/register/lighter',
+                        '/recover-registration', '/shutdown'):
             raise ControlError('Неизвестная команда worker.')
         body = None if data is None else json.dumps(data | {'command_id': secrets.token_hex(16)}, allow_nan=False).encode()
         req = Request(self.url + path, body, method='GET' if body is None else 'POST',
@@ -92,6 +94,8 @@ def ensure_local_worker(client: ControlClient) -> None:
         options['creationflags'] = subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS
     else:
         options['start_new_session'] = True
+    # Independent onefile instance: parent GUI cleanup must not remove worker resources.
+    options['env'] = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT='1')
     subprocess.Popen(args, **options)
     deadline = time.monotonic() + 12
     while time.monotonic() < deadline:
