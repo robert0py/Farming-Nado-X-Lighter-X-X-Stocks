@@ -72,6 +72,7 @@ class Engine:
             self.lighter.verify()
             self._verified = True
             pairs = self._pairs()
+            cash, margin = self.nado.available(), self.lighter.available()
             result = []
             for asset in self.strategy.assets:
                 pair = pairs.get(asset)
@@ -84,12 +85,27 @@ class Engine:
                         raise TradingError("Новое открытие сейчас запрещено площадкой.")
                     if any(self._gateway(i.venue).position(i) != 0 or self._gateway(i.venue).open_orders(i) for i in pair):
                         raise TradingError("На выбранном рынке есть существующие позиции или ордера.")
-                    self._opening_size(pair[0], books[0], self.strategy)
+                    target = self._opening_size(pair[0], books[0], self.strategy)
+                    underlying = target * pair[0].multiplier
+                    hedge = quantize(underlying / pair[1].multiplier, pair[1].quantity_step)
+                    if hedge < pair[1].min_qty or hedge * books[1].bid < pair[1].min_notional:
+                        raise TradingError("Размер встречного ордера ниже минимума Lighter.")
+                    residual = (underlying - hedge * pair[1].multiplier) * books[0].ask / pair[0].multiplier
+                    if residual > self.strategy.residual_notional:
+                        raise TradingError("Точность рынков не позволяет выполнить допустимый хедж.")
+                    if cash < self.strategy.notional_per_leg + self.strategy.margin_reserve:
+                        raise TradingError("Недостаточно USDT0 для spot-покупки с заданным резервом.")
+                    required_margin = max(self.strategy.notional_per_leg, hedge * books[1].ask)
+                    if margin < required_margin + self.strategy.margin_reserve:
+                        raise TradingError("Недостаточно обеспечения Lighter для встречной экспозиции с резервом.")
+                    for instrument in pair:
+                        checker = getattr(self._gateway(instrument.venue), "execution_ready", None)
+                        if checker is not None:
+                            checker(instrument)
                     result.append({"asset": asset, "ready": True, "reason": "Пара и единицы подтверждены."})
                 except TradingError as error:
                     result.append({"asset": asset, "ready": False, "reason": str(error)})
-            return {"markets": result, "nado_available": str(self.nado.available()),
-                    "lighter_available": str(self.lighter.available())}
+            return {"markets": result, "nado_available": str(cash), "lighter_available": str(margin)}
 
     def start(self) -> dict:
         with self._mutex:
@@ -166,8 +182,6 @@ class Engine:
                 if any(self._gateway(i.venue).position(i) != 0 or self._gateway(i.venue).open_orders(i) for i in pair):
                     raise TradingError("На рынке есть позиции или ордера вне журнала бота.")
                 target = self._opening_size(pair[0], books[0], self.strategy)
-                if min(self.nado.available(), self.lighter.available()) < self.strategy.notional_per_leg + self.strategy.margin_reserve:
-                    raise TradingError("Недостаточно свободных средств с заданным резервом.")
                 underlying = target * pair[0].multiplier
                 hedge_size = quantize(underlying / pair[1].multiplier, pair[1].quantity_step)
                 if hedge_size < pair[1].min_qty or hedge_size * books[1].bid < pair[1].min_notional:
@@ -175,6 +189,10 @@ class Engine:
                 residual = (underlying - hedge_size * pair[1].multiplier) * books[0].ask / pair[0].multiplier
                 if residual > self.strategy.residual_notional:
                     raise TradingError("Точность рынков не позволяет выполнить допустимый хедж.")
+                required_margin = max(self.strategy.notional_per_leg, hedge_size * books[1].ask)
+                if (self.nado.available() < self.strategy.notional_per_leg + self.strategy.margin_reserve or
+                        self.lighter.available() < required_margin + self.strategy.margin_reserve):
+                    raise TradingError("Недостаточно свободных средств для обеих экспозиций с заданным резервом.")
                 cycle = {"id": uuid.uuid4().hex, "asset": asset, "state": "OPENING_SPOT",
                          "spot_id": pair[0].id, "perp_id": pair[1].id, "target_spot": str(target),
                          "strategy": json.loads(encoded(asdict(self.strategy))),

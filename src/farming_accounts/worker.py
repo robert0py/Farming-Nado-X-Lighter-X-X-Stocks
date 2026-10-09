@@ -127,13 +127,32 @@ class Runtime:
 
     def _command(self, route, value):
         if route in ('/credentials', '/strategy', '/register/nado', '/register/lighter'):
-            self.mutable()
+            if route != '/credentials':
+                self.mutable()
             config = self.config()
             if value.get('revision') != config.get('revision', 0):
                 raise TradingError('Настройки изменились. Обновите состояние перед сохранением.')
         if route == '/credentials':
             venue = value['venue']
-            config[venue] = credentials(venue, value['credentials'])
+            replacement = credentials(venue, value['credentials'])
+            cycle = self.journal.active_cycle()
+            needs_recovery = self.journal.get('running', False) or (cycle and cycle['state'] != 'CLOSED')
+            if needs_recovery:
+                if not cycle or cycle['state'] not in ('HALTED', 'RECOVERY'):
+                    self.mutable()
+                names = ('owner', 'subaccount') if venue == 'nado' else ('wallet_address', 'account_index')
+                previous = config.get(venue, {})
+                if any(str(previous.get(name)).lower() != str(replacement.get(name)).lower() for name in names):
+                    raise TradingError('При восстановлении можно заменить только ключ того же аккаунта. Закройте экспозицию перед сменой аккаунта.')
+                candidate = config | {venue: replacement}
+                gateway = self.gateway(venue, candidate)
+                try:
+                    gateway.verify()
+                finally:
+                    close = getattr(gateway, 'close', None)
+                    if close:
+                        close()
+            config[venue] = replacement
             self.save_config(config)
             self.verified.pop(venue, None)
             return {'ok': True, 'message': 'Ключ сохранён зашифрованно. Выполните проверку доступа.'}
@@ -259,6 +278,7 @@ class Runtime:
             config[session['venue']] = session['credentials']
             self.save_config(config)
             self.vault.update(lambda v: v.pop('pending_registration', None))
+            self.verified.pop(session['venue'], None)
             return {'ok': True, 'message': 'Привязка отправлена. Вернитесь в приложение и нажмите «Проверить доступ».'}
 
     def tick_loop(self):

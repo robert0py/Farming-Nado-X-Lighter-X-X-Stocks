@@ -14,6 +14,15 @@ class VaultError(Exception):
     pass
 
 
+def sync_directory(path: Path) -> None:
+    if sys.platform != 'win32':
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 def state_directory() -> Path:
     override = os.environ.get('HEDGE_STATE_DIR')
     if override:
@@ -51,6 +60,8 @@ class Vault:
     def __init__(self, directory: Path):
         self.directory = Path(directory)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if sys.platform != 'win32':
+            self.directory.chmod(0o700)
         self.path = self.directory / 'vault.bin'
         self.lock = threading.RLock()
 
@@ -67,6 +78,7 @@ class Vault:
                 stream.write(secrets.token_bytes(32))
                 stream.flush()
                 os.fsync(stream.fileno())
+            sync_directory(path.parent)
         if path.stat().st_mode & 0o077:
             raise VaultError('Ограничьте права файла master.key до 0600 или 0400.')
         key = path.read_bytes()
@@ -115,6 +127,7 @@ class Vault:
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(temporary, self.path)
+                sync_directory(self.directory)
             finally:
                 temporary.unlink(missing_ok=True)
 

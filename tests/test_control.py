@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import Mock, patch
 from urllib.request import Request, build_opener, ProxyHandler
 from urllib.error import HTTPError
 
@@ -85,3 +86,56 @@ class ControlTests(unittest.TestCase):
         from farming_accounts.worker import main
         with self.assertRaises(SystemExit):
             main(['--host', '0.0.0.0'])
+
+    def test_main_wallet_private_key_is_rejected_before_storage(self):
+        from eth_account import Account
+        key = '0x' + '11' * 32
+        value = {'command_id': 'c' * 32, 'revision': 0, 'venue': 'nado',
+                 'credentials': {'owner': Account.from_key(key).address, 'subaccount': 'default', 'private_key': key}}
+        response = self.runtime.command('/credentials', value)
+        self.assertFalse(response['ok'])
+        self.assertNotIn('nado', self.runtime.config())
+        self.assertNotIn(key, str(response))
+
+    def recovery_configuration(self):
+        self.runtime.vault.update(lambda value: value.update(trading={'revision': 1, 'nado': {
+            'owner': '0x' + '22' * 20, 'subaccount': 'default', 'private_key': '0x' + '11' * 32}}))
+        self.runtime.journal.save_cycle({'id': 'recovery-fixture', 'state': 'HALTED'})
+        return {'command_id': 'd' * 32, 'revision': 1, 'venue': 'nado', 'credentials': {
+            'owner': '0x' + '22' * 20, 'subaccount': 'default', 'private_key': '0x' + '33' * 32}}
+
+    def test_revoked_key_can_be_replaced_only_for_same_account_after_verification(self):
+        value = self.recovery_configuration()
+        gateway = Mock()
+        with patch.object(self.runtime, 'gateway', return_value=gateway):
+            response = self.runtime.command('/credentials', value)
+        self.assertTrue(response['ok'])
+        gateway.verify.assert_called_once()
+        gateway.close.assert_called_once()
+        self.assertEqual(self.runtime.config()['nado']['private_key'], value['credentials']['private_key'])
+        self.assertEqual(self.runtime.journal.active_cycle()['state'], 'HALTED')
+
+    def test_recovery_cannot_switch_account_or_store_an_unverified_replacement(self):
+        value = self.recovery_configuration()
+        before = self.runtime.config()
+        changed = value | {'credentials': value['credentials'] | {'subaccount': 'different'}}
+        with patch.object(self.runtime, 'gateway') as factory:
+            self.assertFalse(self.runtime.command('/credentials', changed)['ok'])
+            factory.assert_not_called()
+        gateway = Mock()
+        gateway.verify.side_effect = TradingError('Registered key differs')
+        with patch.object(self.runtime, 'gateway', return_value=gateway):
+            self.assertFalse(self.runtime.command('/credentials', value | {'command_id': 'e' * 32})['ok'])
+        self.assertEqual(self.runtime.config(), before)
+
+    def test_wallet_registration_invalidates_previously_verified_key(self):
+        helper = Mock()
+        self.runtime.verified['nado'] = True
+        data = {'owner': '0x' + '22' * 20, 'subaccount': 'default', 'private_key': '0x' + '11' * 32}
+        self.runtime.challenges['isolated'] = {'venue': 'nado', 'helper': helper, 'challenge': {},
+            'credentials': data, 'expires': time.time() + 60, 'used': False}
+        self.assertTrue(self.runtime.wallet('isolated', '0x' + '11' * 65)['ok'])
+        self.assertNotIn('nado', self.runtime.verified)
+        helper.submit_link.assert_called_once()
+        with self.assertRaises(TradingError):
+            self.runtime.wallet('isolated', '0x' + '11' * 65)

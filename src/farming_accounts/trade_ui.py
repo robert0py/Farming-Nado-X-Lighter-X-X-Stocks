@@ -221,9 +221,10 @@ class TradingPanel:
             return {key: entry.get().strip() for key, entry in entries.items()}
         def finished(result):
             for key, entry in entries.items():
-                if 'private_key' in key:
+                if 'private_key' in key and entry.winfo_exists():
                     entry.delete(0, 'end')
-            dialog.destroy()
+            if dialog.winfo_exists():
+                dialog.destroy()
             if result.get('wallet_url'):
                 webbrowser.open(result['wallet_url'])
         def existing():
@@ -336,7 +337,8 @@ class TradingPanel:
                     self.message.configure(text=result['message'])
                     self.app.log('Торговля', result['message'])
             self.render()
-            self.next_refresh = time.monotonic() + (5 if error or self.client is None else 0)
+            is_status = isinstance(result, dict) and 'execution' in result
+            self.next_refresh = time.monotonic() + (5 if error or self.client is None or is_status else 0)
         if self.client is not None and not self.busy and time.monotonic() >= self.next_refresh:
             self.next_refresh = time.monotonic() + 5
             self.work(lambda: self.client.request('/status'))

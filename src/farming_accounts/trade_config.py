@@ -1,6 +1,5 @@
 """Validated control configuration; secret fields never enter public status/journal."""
 
-from dataclasses import asdict
 from decimal import Decimal, InvalidOperation
 import re
 import time
@@ -21,6 +20,10 @@ def credentials(venue: str, value: dict, *, require_key=True) -> dict:
             key = value.get('private_key', '').strip()
             if require_key and not re.fullmatch(r'(0x)?[a-fA-F0-9]{64}', key):
                 raise TradingError('Ключ отдельного signer Nado должен содержать 32 байта в hex.')
+            if require_key:
+                from eth_account import Account
+                if Account.from_key(key).address.lower() == result['owner'].lower():
+                    raise TradingError('Основной приватный ключ кошелька нельзя сохранять. Создайте отдельный signer Nado.')
         elif venue == 'lighter':
             result = {'wallet_address': wallet_address(value['wallet_address']),
                       'account_index': account_index(str(value['account_index']))}
@@ -45,12 +48,14 @@ def strategy(value: dict, *, clock=time.time) -> Strategy:
         values = {name: Decimal(str(value[name])) for name in DECIMAL_FIELDS}
         values.update({name: int(str(value.get(name, 43200 if name == 'hold_seconds' else '')))
                        for name in INTEGER_FIELDS})
+        if not isinstance(value['assets'], list):
+            raise TradingError('Разрешённые активы должны быть списком базовых символов.')
         assets = tuple(str(asset).strip().upper() for asset in value['assets'])
         if len(assets) < 2 or any(not re.fullmatch(r'[A-Z]{1,8}', asset) for asset in assets):
             raise TradingError('Для смены актива между циклами выберите минимум два базовых актива.')
         proof = value.get('points_evidence', {})
         confirmed = float(proof.get('confirmed_at', 0))
-        if (not proof.get('account_enrolled') or not 0 <= clock() - confirmed < 86400 or
+        if (proof.get('account_enrolled') is not True or not isinstance(proof.get('assets'), list) or not 0 <= clock() - confirmed < 86400 or
                 proof.get('url') != 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado'):
             raise TradingError('Проверьте текущую программу xPoints и участие аккаунта/активов; подтверждение действует 24 часа.')
         result = Strategy(assets=assets, points_verified_assets=tuple(proof.get('assets', ())), **values)

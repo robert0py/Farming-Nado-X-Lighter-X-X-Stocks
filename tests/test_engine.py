@@ -391,6 +391,46 @@ class EngineTests(unittest.TestCase):
         self.engine.tick()
         self.assertEqual(self.engine.status()["cycle"]["state"], "CLOSED")
 
+    def test_optional_execution_readiness_runs_for_both_venues_without_orders(self):
+        checked = []
+        self.nado.execution_ready = lambda instrument: checked.append(("nado", instrument.underlying))
+        self.lighter.execution_ready = lambda instrument: checked.append(("lighter", instrument.underlying))
+        result = self.engine.preflight()
+        self.assertTrue(all(market["ready"] for market in result["markets"]))
+        self.assertEqual(checked, [("nado", "AAPL"), ("lighter", "AAPL"), ("nado", "SPY"), ("lighter", "SPY")])
+        self.assertEqual(self.nado.requests + self.lighter.requests, [])
+        self.assertEqual(self.journal.history(), [])
+
+    def test_stream_authentication_rejection_prevents_start_without_order_intents(self):
+        def rejected(instrument):
+            raise TradingError("fixture websocket authentication rejected")
+        self.nado.execution_ready = rejected
+        result = self.engine.preflight()
+        self.assertTrue(all(not market["ready"] for market in result["markets"]))
+        with self.assertRaises(TradingError):
+            self.engine.start()
+        self.assertEqual(self.nado.requests + self.lighter.requests, [])
+        self.assertEqual(self.journal.history(), [])
+
+    def test_insufficient_cash_or_margin_preflight_is_not_ready(self):
+        for venue in (self.nado, self.lighter):
+            with self.subTest(venue=venue.venue):
+                venue.money = D(2099)
+                result = self.engine.preflight()
+                self.assertTrue(all(not market["ready"] for market in result["markets"]))
+                with self.assertRaises(TradingError):
+                    self.engine.start()
+                venue.money = D(10000)
+        self.assertEqual(self.nado.requests + self.lighter.requests, [])
+        self.assertEqual(self.journal.history(), [])
+
+    def test_margin_preflight_uses_actual_hedge_value_with_underlying_conversion(self):
+        self.lighter.money = D(2200)
+        self.lighter.book = lambda instrument: Book(D(120), D(120), self.clock())
+        result = self.engine.preflight()
+        self.assertTrue(all(not market["ready"] for market in result["markets"]))
+        self.assertEqual(self.nado.requests + self.lighter.requests, [])
+
 
 if __name__ == "__main__":
     unittest.main()
