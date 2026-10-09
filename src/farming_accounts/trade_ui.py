@@ -103,8 +103,10 @@ class TradingPanel:
         self.buttons.append(button)
         return button
 
-    def work(self, function, callback=None):
+    def work(self, function, callback=None, on_error=None):
         if self.busy or self.closed:
+            if on_error:
+                on_error('Дождитесь завершения текущего запроса и повторите действие.')
             return
         self.busy = True
         self.render_buttons()
@@ -115,14 +117,16 @@ class TradingPanel:
                 result, error = None, str(exc)
             except Exception:
                 result, error = None, 'Не удалось выполнить команду. Проверьте подключение к процессу торговли.'
-            self.results.put((result, error, callback))
+            self.results.put((result, error, callback, on_error))
         self.executor.submit(run)
 
-    def request(self, path, value, callback=None):
+    def request(self, path, value, callback=None, on_error=None):
         if self.client is None:
+            if on_error:
+                on_error('Сначала подключите процесс торговли кнопкой «Этот ПК».')
             return
         self.message.configure(text='Выполняю команду…')
-        self.work(lambda: self.client.request(path, value), callback)
+        self.work(lambda: self.client.request(path, value), callback, on_error)
 
     def connect_local(self):
         def connect():
@@ -193,49 +197,8 @@ class TradingPanel:
         return dialog, content
 
     def credentials_dialog(self, venue):
-        from .app import label, MUTED
-        dialog, content = self.dialog('Торговый доступ · ' + ('Nado' if venue == 'nado' else 'Lighter Robinhood Chain'), 700, 500)
-        saved = self.data.get('credentials', {}).get(venue, {})
-        definitions = [('owner', 'Адрес основного кошелька'), ('subaccount', 'Субаккаунт Nado'), ('private_key', 'Существующий отдельный signer key (не основной ключ кошелька)')] if venue == 'nado' else [
-            ('wallet_address', 'Адрес основного кошелька'), ('account_index', 'Индекс аккаунта Lighter на Robinhood Chain'),
-            ('api_key_index', 'Индекс отдельного API-ключа (4–156 или 158–254)'), ('api_private_key', 'Существующий API private key Lighter (40 байт)')]
-        entries = {}
-        for key, title in definitions:
-            label(content, title, size=10).pack(anchor='w')
-            entry = entries[key] = ttk.Entry(content, show='●' if 'private_key' in key else '')
-            entry.pack(fill='x', pady=(5, 11))
-            value = saved.get(key)
-            if value is None and key in ('owner', 'wallet_address'):
-                panel = self.app.nado if venue == 'nado' else self.app.lighter
-                value = panel.address.get() if panel.address.get().startswith('0x') else ''
-            if key == 'subaccount' and value is None:
-                value = self.app.nado.subaccount.get()
-            if value is not None:
-                entry.insert(0, str(value))
-        label(content, 'Можно вставить уже зарегистрированный отдельный ключ или создать новый и привязать через браузерный кошелёк. Основной приватный ключ и seed-фраза не нужны.',
-              color=MUTED, size=9, wraplength=650, justify='left').pack(fill='x', pady=(0, 8))
-        label(content, 'Nado signer имеет полные права субаккаунта. Смена signer заменяет 1-Click Trading и отменяет resting-ордера. Методы вывода/перевода отсутствуют в боте.' if venue == 'nado' else
-              'Используйте свободный индекс ключа именно на Robinhood Chain. Ключ Lighter также допускает secure withdrawal; команды вывода/перевода отсутствуют в боте.',
-              color=MUTED, size=9, wraplength=650, justify='left').pack(fill='x', pady=(0, 12))
-        buttons = tk.Frame(content, bg=content.cget('bg'))
-        buttons.pack(fill='x')
-        def collect():
-            return {key: entry.get().strip() for key, entry in entries.items()}
-        def finished(result):
-            for key, entry in entries.items():
-                if 'private_key' in key and entry.winfo_exists():
-                    entry.delete(0, 'end')
-            if dialog.winfo_exists():
-                dialog.destroy()
-            if result.get('wallet_url'):
-                webbrowser.open(result['wallet_url'])
-        def existing():
-            self.request('/credentials', {'revision': self.data.get('revision', 0), 'venue': venue, 'credentials': collect()}, finished)
-        def generate():
-            value = {key: item for key, item in collect().items() if 'private_key' not in key}
-            self.request('/register/' + venue, {'revision': self.data.get('revision', 0), 'credentials': value}, finished)
-        ttk.Button(buttons, text='Сохранить существующий ключ', command=existing).pack(side='left')
-        ttk.Button(buttons, text='Создать и привязать через кошелёк', style='Primary.TButton', command=generate).pack(side='right')
+        from .credentials_ui import CredentialsDialog
+        return CredentialsDialog(self, venue)
 
     def strategy_dialog(self):
         from .app import label, MUTED, FIELD, INK
@@ -324,13 +287,20 @@ class TradingPanel:
             return
         while True:
             try:
-                result, error, callback = self.results.get_nowait()
+                item = self.results.get_nowait()
+                result, error, callback = item[:3]
+                on_error = item[3] if len(item) > 3 else None
             except queue.Empty:
                 break
             self.busy = False
             if error:
                 self.message.configure(text=error)
                 self.app.log('Торговля', error, error=True)
+                if on_error:
+                    try:
+                        on_error(error)
+                    except tk.TclError:
+                        pass
             else:
                 if callback:
                     try:
