@@ -14,6 +14,7 @@ button.secondary{color:#f1f3f5;background:#262e34}button:disabled{opacity:.45;cu
 .actions{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}.status{background:#19232a;border-left:3px solid #8bd7b7;padding:15px;overflow-wrap:anywhere}
 pre{font:13px/1.6 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere;background:#171c20;padding:16px;margin:12px 0}
 summary{cursor:pointer}details{margin-top:16px}li{margin:8px 0}.notice{font-size:14px;color:#a7b1bc}.success{color:#8bd7b7}
+[hidden]{display:none}a{color:#8bd7b7}a.button{display:inline-block;text-decoration:none;background:#262e34;padding:12px 18px;border-radius:5px;font-weight:600}a:focus-visible{outline:2px solid #8bd7b7;outline-offset:3px}
 @media(max-width:600px){main{margin-top:24px;padding:0 16px 24px}h1{font-size:25px}.actions button{width:100%}}
 </style></head><body><main>
 <div class="brand">HEDGE BOT / ТОРГОВЫЙ ДОСТУП</div>
@@ -26,8 +27,17 @@ summary{cursor:pointer}details{margin-top:16px}li{margin:8px 0}.notice{font-size
 <p id="scope" class="notice"></p><details><summary>Данные привязки и права ключа</summary><pre id="details">Загрузка…</pre></details>
 <p id="expiry" class="notice"></p></section>
 <section class="step"><h2><span class="number">02</span>Подключите этот кошелёк</h2>
+<div id="lighter-key-help" hidden>
+<h2>Используете Robinhood Wallet?</h2>
+<p>Создайте ключ на официальном сайте Lighter, где есть вход через Robinhood Wallet. Вернитесь в бот → «Настроить ключ» → «Robinhood Wallet · API-ключ с сайта Lighter».</p>
+<ol><li>Откройте API Keys → Connect Wallet → Robinhood Wallet. Подтвердите подключение на телефоне к адресу из шага 01.</li>
+<li>Generate API Key → свободный индекс 4–156 или 158–254; Maker Only выключен. Подтвердите привязку.</li>
+<li>Скопируйте Your Account Index, API Key Index и Private Key до закрытия окна создания. Вставьте их в бот и нажмите «Сохранить ключ», затем «Проверить доступ».</li></ol>
+<a class="button" href="https://robinhoodchain.lighter.xyz/apikeys" target="_blank" rel="noopener noreferrer">API Keys на официальном сайте Lighter ↗</a>
+<p class="notice">Эта страница бота подключает расширения браузера. Robinhood Wallet подключается на сайте Lighter; переносить seed-фразу в MetaMask не нужно. Множитель 2× для сделок бота через API пока не подтверждён.</p>
+</div>
 <p class="muted">Подключение к сайту Nado или Lighter не даёт доступ этой странице. Разрешите подключение отдельно для адреса бота, показанного в строке браузера.</p>
-<label for="provider">Кошелёк в этом браузере</label><select id="provider" disabled><option>Ищу расширения…</option></select>
+<label for="provider">Расширение кошелька в этом браузере (MetaMask)</label><select id="provider" disabled><option>Ищу расширения…</option></select>
 <div class="actions"><button id="connect" disabled>Подключить кошелёк</button><button id="change" class="secondary" disabled>Выбрать другой аккаунт</button></div>
 <label for="account">Адреса, к которым кошелёк разрешил доступ</label><input id="account" readonly value="Кошелёк ещё не подключён">
 <p id="match" class="notice"></p></section>
@@ -81,7 +91,7 @@ function discover(){
  const injected=window.ethereum;
  if(injected){for(const p of injected.providers||[injected])addProvider(p,p.isMetaMask?'MetaMask (injected)':'EVM-кошелёк (injected)');}
  if(!providers.length){$('provider').replaceChildren();const o=document.createElement('option');o.textContent='Расширение кошелька не найдено';$('provider').appendChild(o);
-  if(challenge)message('В этом браузере кошелёк не найден. Скопируйте ссылку и откройте её в браузере с MetaMask. Затем нажмите «Подключить кошелёк».');}controls();
+  if(challenge)message(challenge.method==='personal_sign'?'В этом браузере кошелёк не найден. Для Robinhood Wallet откройте API Keys на официальном сайте Lighter по инструкции ниже. Для MetaMask скопируйте эту ссылку в браузер с расширением.':'В этом браузере кошелёк не найден. Скопируйте ссылку и откройте её в браузере с MetaMask. Затем нажмите «Подключить кошелёк».');}controls();
 }
 function explain(error){
  const code=Number(error?.code);
@@ -154,7 +164,8 @@ async function initialize(){
  try{const value=await call('/wallet/payload');challenge=value.challenge;
   $('owner').value=challenge.owner;$('title').textContent='Привязка ключа · '+(challenge.display?.['Площадка']||'аккаунт');
   $('details').textContent=JSON.stringify(challenge.display,null,2);
-  $('scope').textContent=challenge.method==='eth_signTypedData_v4'?'Выберите кошелёк, с которым вы входите в этот субаккаунт Nado. Сеть проверяется перед подписью.':'Выберите кошелёк аккаунта Lighter именно на Robinhood Chain. Здесь подписывается сообщение, переключать сеть для него не нужно.';
+  $('lighter-key-help').hidden=challenge.method!=='personal_sign';
+  $('scope').textContent=challenge.method==='eth_signTypedData_v4'?'Выберите MetaMask, с которым вы входите в этот субаккаунт Nado. Сеть проверяется перед подписью.':'Для Robinhood Wallet создайте API-ключ на сайте Lighter по инструкции в шаге 02. Для подписи на этой странице используйте MetaMask с адресом аккаунта Lighter на Robinhood Chain.';
   message('Проверьте адрес в шаге 01, затем подключите кошелёк в шаге 02.');discover();
  }catch(error){message(error.userMessage||'Нет связи с приложением. Убедитесь, что процесс торговли включён, и откройте ссылку снова.');}
 }

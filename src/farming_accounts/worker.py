@@ -102,9 +102,13 @@ class Runtime:
                     'strategy': config.get('strategy'), 'execution': state, 'error': self.error,
                     'history': self.journal.history(50), 'events': self.journal.events(50)}
 
-    def save_config(self, config):
+    def save_config(self, config, *, replaces_key_for=None):
         config['revision'] = config.get('revision', 0) + 1
-        self.vault.update(lambda value: value.update(trading=config))
+        def persist(value):
+            value['trading'] = config
+            if replaces_key_for and value.get('pending_registration', {}).get('venue') == replaces_key_for:
+                value.pop('pending_registration', None)
+        self.vault.update(persist)
         self.discard_engine()
 
     def command(self, route, value):
@@ -163,7 +167,18 @@ class Runtime:
                     if close:
                         close()
             config[venue] = replacement
-            self.save_config(config)
+            # A superseded browser link/recovery must not restore the previous key.
+            for token, session in list(self.challenges.items()):
+                if session['venue'] == venue:
+                    del self.challenges[token]
+                    close = getattr(session.get('helper'), 'close', None)
+                    if close:
+                        try:
+                            close()
+                        except Exception:
+                            pass  # Local resource cleanup; never repeat a registration write.
+            # Persist replacement and cancellation together, including after a crash.
+            self.save_config(config, replaces_key_for=venue)
             self.verified.pop(venue, None)
             return {'ok': True, 'message': 'Ключ сохранён зашифрованно. Выполните проверку доступа.'}
         if route == '/strategy':

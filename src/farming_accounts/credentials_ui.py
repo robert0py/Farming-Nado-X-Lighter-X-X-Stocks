@@ -7,6 +7,7 @@ import re
 
 from .trade_config import credentials, lighter_registration_inputs
 from .trading.domain import TradingError
+from .key_guide import LIGHTER_API_KEYS_URL, LIGHTER_KEY_STEPS, LIGHTER_POINTS_NOTE
 
 
 class CredentialsDialog:
@@ -37,7 +38,8 @@ class CredentialsDialog:
         # Reserve the action area before packing the scrollable content, also at high DPI.
         footer = tk.Frame(dialog, bg=PANEL)
         footer.pack(side='bottom', fill='x', padx=22, pady=16)
-        self.status = label(footer, 'Выберите способ подключения. Основной ключ кошелька и seed-фраза не нужны.',
+        self.status = label(footer, 'Создайте API-ключ на сайте, затем прокрутите форму для ввода данных и сохраните ключ.' if venue == 'lighter' else
+                            'Выберите способ подключения. Основной ключ кошелька и seed-фраза не нужны.',
                             color=MUTED, size=10, wraplength=660, justify='left', anchor='w')
         self.status.pack(fill='x', pady=(0, 12))
         self.progress = ttk.Progressbar(footer, mode='indeterminate')
@@ -72,17 +74,28 @@ class CredentialsDialog:
         dialog.protocol('WM_DELETE_WINDOW', self.close)
 
         label(body, 'Как подключить торговый доступ?', bold=True, size=16).pack(anchor='w', pady=(0, 12))
-        self.mode = tk.StringVar(value='wallet')
+        self.mode = tk.StringVar(value='wallet' if venue == 'nado' else 'existing')
         self.mode_buttons = []
         style = ttk.Style(dialog)
         style.configure('Key.TRadiobutton', background=PANEL, foreground=INK, font=('Segoe UI', 10))
         style.map('Key.TRadiobutton', background=[('active', FIELD)], foreground=[('active', INK)])
-        for value, title in (('wallet', 'Создать отдельный ключ через кошелёк'), ('existing', 'У меня уже есть зарегистрированный ключ')):
+        choices = (('wallet', 'MetaMask · создать отдельный signer'), ('existing', 'Вставить уже привязанный signer')) if venue == 'nado' else (
+            ('existing', 'Robinhood Wallet · API-ключ с сайта Lighter'),
+            ('wallet', 'MetaMask · создать API-ключ в боте'))
+        for value, title in choices:
             button = ttk.Radiobutton(body, text=title, value=value, variable=self.mode, command=self.change_mode, style='Key.TRadiobutton')
             button.pack(anchor='w', pady=4)
             self.mode_buttons.append(button)
         self.instructions = label(body, '', color=MUTED, size=10, wraplength=640, justify='left', anchor='w')
         self.instructions.pack(fill='x', pady=(12, 16))
+        self.site_frame = tk.Frame(body, bg=PANEL)
+        self.site_buttons = []
+        if venue == 'lighter':
+            for title, action in (('API Keys на сайте Lighter', self.open_official_site), ('Скопировать адрес сайта', self.copy_official_link)):
+                button = ttk.Button(self.site_frame, text=title, command=action)
+                button.pack(anchor='w', pady=(0, 8))
+                self.site_buttons.append(button)
+            label(self.site_frame, LIGHTER_API_KEYS_URL, color=MUTED, size=9, wraplength=640, justify='left').pack(fill='x', pady=(0, 12))
         self.saved = saved = panel.data.get('credentials', {}).get(venue, {})
         definitions = [('owner', 'Адрес кошелька аккаунта Nado (0x…)'), ('subaccount', 'Субаккаунт Nado')] if venue == 'nado' else [
             ('wallet_address', 'Адрес кошелька аккаунта Lighter (0x…)'), ('account_index', 'Индекс аккаунта на Robinhood Chain'),
@@ -120,7 +133,8 @@ class CredentialsDialog:
                             color=MUTED, size=9, wraplength=640, justify='left')
         self.notice.pack(fill='x', pady=(12, 16))
         self.link_frame = tk.Frame(body, bg=PANEL)
-        label(self.link_frame, 'Ссылка действует 5 минут. Откройте её в браузере с MetaMask или другим EVM-кошельком.',
+        label(self.link_frame, 'Ссылка действует 5 минут. Откройте её в браузере с MetaMask.' +
+              (' Для Robinhood Wallet используйте способ «API-ключ с сайта Lighter».' if venue == 'lighter' else ''),
               color=MUTED, size=10, wraplength=640, justify='left').pack(fill='x')
         self.link_value = tk.StringVar()
         ttk.Entry(self.link_frame, textvariable=self.link_value, state='readonly').pack(fill='x', pady=8)
@@ -132,21 +146,29 @@ class CredentialsDialog:
 
     def change_mode(self):
         if self.mode.get() == 'existing':
-            self.instructions.configure(text='Вставьте отдельный ключ, уже привязанный к этому аккаунту. Сохраните его, затем нажмите «Проверить доступ» в приложении.')
+            self.instructions.configure(text=LIGHTER_KEY_STEPS if self.venue == 'lighter' else
+                                        'Вставьте отдельный signer, уже привязанный к этому аккаунту Nado. Сохраните его, затем нажмите «Проверить доступ» в приложении.')
+            if self.venue == 'lighter':
+                self.site_frame.pack(fill='x', before=self.instructions, pady=(8, 0))
             self.secret_frame.pack(fill='x', before=self.notice)
+            self.link_frame.pack_forget()
             title = 'Сохранить ключ'
             if self.venue == 'lighter' and not self.entries['api_key_index'].get() and self.saved.get('api_key_index') is not None:
                 self.entries['api_key_index'].insert(0, str(self.saved['api_key_index']))
         else:
             self.instructions.configure(text='1. Проверьте адрес аккаунта ниже.\n2. Создайте ключ и откройте браузер с кошельком.\n3. Подключите этот адрес и отдельно подпишите привязку.' if self.venue == 'nado' else
-                                        'Достаточно публичного адреса кошелька. Индексы можно оставить пустыми: приложение найдёт аккаунт и свободный API key index на Robinhood Chain. При нескольких аккаунтах предложит выбрать нужный.')
+                                        'Этот способ использует MetaMask в браузере. Для Robinhood Wallet выберите «API-ключ с сайта Lighter» выше. Индексы можно оставить пустыми: приложение найдёт аккаунт и свободный API key index на Robinhood Chain.')
+            self.site_frame.pack_forget()
             self.secret_frame.pack_forget()
+            if self.wallet_url:
+                self.link_frame.pack(fill='x', pady=(0, 16))
             title = 'Создать ключ и открыть браузер'
             if self.venue == 'lighter' and self.last_mode == 'existing' and self.entries['api_key_index'].get() == str(self.saved.get('api_key_index')):
                 self.entries['api_key_index'].delete(0, 'end')
         if self.venue == 'lighter':
             self.labels['account_index'].configure(text='Индекс аккаунта (пусто — найти по кошельку)' if self.mode.get() == 'wallet' else 'Индекс аккаунта на Robinhood Chain')
             self.labels['api_key_index'].configure(text='API key index (пусто — выбрать свободный)' if self.mode.get() == 'wallet' else 'Индекс зарегистрированного API-ключа')
+            self.notice.configure(text='Вставляйте Private Key отдельного API-ключа Lighter (40 байт), не ключ основного кошелька. Он имеет широкие права, включая secure withdrawal.\n' + LIGHTER_POINTS_NOTE)
         self.submit_button.configure(text=title, state='disabled' if self.pending else 'normal')
         self.last_mode = self.mode.get()
 
@@ -155,6 +177,8 @@ class CredentialsDialog:
         for entry in self.entries.values():
             entry.configure(state='disabled' if value else 'normal')
         for button in self.mode_buttons:
+            button.configure(state='disabled' if value else 'normal')
+        for button in self.site_buttons:
             button.configure(state='disabled' if value else 'normal')
         if value:
             self.progress.pack(fill='x', before=self.submit_button.master, pady=(0, 12))
@@ -254,6 +278,23 @@ class CredentialsDialog:
             opened = False
         self.status_text('Страница открыта. Подключите кошелёк и подпишите привязку, затем вернитесь и нажмите «Проверить доступ».' if opened else
                               'Браузер не открылся. Скопируйте ссылку в этом окне и вставьте её в браузер с расширением кошелька.')
+
+    def open_official_site(self):
+        if self.pending or self.venue != 'lighter':
+            return
+        try:
+            opened = webbrowser.open(LIGHTER_API_KEYS_URL)
+        except Exception:
+            opened = False
+        self.status_text('На сайте Lighter выберите Connect Wallet → Robinhood Wallet. Создайте API-ключ и вставьте данные в эту форму.' if opened else
+                         'Браузер не открылся. Нажмите «Скопировать адрес сайта» и откройте его вручную.', error=not opened)
+
+    def copy_official_link(self):
+        if self.pending or self.venue != 'lighter':
+            return
+        self.window.clipboard_clear()
+        self.window.clipboard_append(LIGHTER_API_KEYS_URL)
+        self.status_text('Адрес страницы API Keys скопирован. Откройте его в браузере и выберите Robinhood Wallet.')
 
     def copy_link(self):
         if self.wallet_url:

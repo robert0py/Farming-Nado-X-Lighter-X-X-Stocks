@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "farming-accounts"
-version = "0.3.2"
+version = "0.3.3"
 description = "Desktop control and durable spot/perpetual hedge worker for Nado and Robinhood Lighter"
 requires-python = ">=3.11"
 dependencies = []

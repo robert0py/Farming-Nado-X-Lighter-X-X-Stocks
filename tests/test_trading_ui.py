@@ -62,8 +62,66 @@ class TradingDesktopTests(unittest.TestCase):
         self.panel.client = Mock()
         self.panel.next_refresh = time.monotonic() + 60
         form = self.panel.credentials_dialog(venue)
+        if venue == 'lighter':
+            form.mode.set('wallet')
+            form.change_mode()
         form.entries['owner' if venue == 'nado' else 'wallet_address'].insert(0, '0x' + '22' * 20)
         return form
+
+    def test_lighter_defaults_to_robinhood_official_key_import_without_worker_writes(self):
+        from farming_accounts.key_guide import LIGHTER_API_KEYS_URL
+        self.root.deiconify()
+        form = self.panel.credentials_dialog('lighter')
+        form.window.update()
+        self.assertEqual(form.mode.get(), 'existing')
+        self.assertTrue(form.secret_frame.winfo_ismapped())
+        self.assertTrue(form.site_frame.winfo_ismapped())
+        self.assertEqual(form.submit_button.cget('text'), 'Сохранить ключ')
+        self.assertIn('Connect Wallet → Robinhood Wallet', form.instructions.cget('text'))
+        self.assertIn('до закрытия', form.instructions.cget('text'))
+        self.assertIn('пока не подтверждён', form.notice.cget('text'))
+        with patch('farming_accounts.credentials_ui.webbrowser.open', return_value=True) as browser:
+            form.open_official_site()
+        browser.assert_called_once_with(LIGHTER_API_KEYS_URL)
+        self.assertEqual(self.panel.executor.tasks, [])
+        self.assertIsNone(form.wallet_url)
+
+    def test_official_site_failure_has_copy_fallback_and_does_not_export_credentials(self):
+        from farming_accounts.key_guide import LIGHTER_API_KEYS_URL
+        form = self.key_form('lighter')
+        form.mode.set('existing')
+        form.change_mode()
+        form.entries['api_private_key'].insert(0, '11' * 40)
+        with patch('farming_accounts.credentials_ui.webbrowser.open', side_effect=OSError()):
+            form.open_official_site()
+        self.assertIn('Скопировать адрес сайта', form.status.cget('text'))
+        form.copy_official_link()
+        self.assertEqual(form.window.clipboard_get(), LIGHTER_API_KEYS_URL)
+        self.assertEqual(self.panel.executor.tasks, [])
+        form.set_pending(True)
+        with patch('farming_accounts.credentials_ui.webbrowser.open') as browser:
+            form.open_official_site()
+        browser.assert_not_called()
+
+    def test_lighter_key_from_site_is_saved_without_browser_registration(self):
+        form = self.key_form('lighter')
+        form.mode.set('existing')
+        form.change_mode()
+        form.entries['account_index'].insert(0, '17')
+        form.entries['api_key_index'].insert(0, '5')
+        form.entries['api_private_key'].insert(0, '11' * 40)
+        self.panel.client.request.return_value = {'ok': True}
+        with patch('farming_accounts.credentials_ui.webbrowser.open') as browser:
+            form.submit()
+            self.panel.executor.run_one()
+            self.panel.poll()
+        browser.assert_not_called()
+        self.panel.client.request.assert_called_once()
+        route, data = self.panel.client.request.call_args.args
+        self.assertEqual(route, '/credentials')
+        self.assertEqual(data['venue'], 'lighter')
+        self.assertEqual(data['credentials']['api_private_key'], '0x' + '11' * 40)
+        self.assertFalse(form.window.winfo_exists())
 
     def test_save_button_stays_visible_in_short_window_at_high_dpi(self):
         self.root.tk.call('tk', 'scaling', 2.0)

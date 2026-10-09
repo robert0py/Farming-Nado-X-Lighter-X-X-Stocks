@@ -71,6 +71,40 @@ class ControlTests(unittest.TestCase):
         with self.assertRaises(TradingError):
             self.runtime.wallet('unrecognized', '0x' + '11' * 65)
 
+    def test_imported_key_invalidates_previous_link_and_same_venue_recovery(self):
+        owner = '0x' + '22' * 20
+        helper = Mock()
+        token = 'a' * 40
+        self.runtime.challenges[token] = {'venue': 'lighter', 'helper': helper, 'used': False, 'expires': time.time() + 300}
+        self.runtime.vault.update(lambda data: data.update(pending_registration={'venue': 'lighter', 'credentials': {}}))
+        update = self.runtime.vault.update
+        def check_crash_boundary(mutate):
+            def checked(data):
+                mutate(data)
+                if data.get('trading', {}).get('lighter', {}).get('api_key_index') == 5:
+                    self.assertNotIn('pending_registration', data)
+            return update(checked)
+        with patch.object(self.runtime.vault, 'update', side_effect=check_crash_boundary):
+            self.client.request('/credentials', {'revision': 0, 'venue': 'lighter', 'credentials': {
+                'wallet_address': owner, 'account_index': 17, 'api_key_index': 5, 'api_private_key': '11' * 40}})
+        self.assertNotIn('pending_registration', self.runtime.vault.load())
+        self.assertNotIn(token, self.runtime.challenges)
+        helper.close.assert_called_once()
+        with self.assertRaises(TradingError):
+            self.runtime.wallet(token, '0x' + '11' * 65)
+        helper.complete.assert_not_called()
+        self.assertEqual(self.runtime.config()['lighter']['api_key_index'], 5)
+
+    def test_import_does_not_discard_authorization_for_other_venue(self):
+        token = 'a' * 40
+        self.runtime.challenges[token] = {'venue': 'nado'}
+        pending = {'venue': 'nado', 'credentials': {'owner': '0x' + '33' * 20}}
+        self.runtime.vault.update(lambda data: data.update(pending_registration=pending))
+        self.client.request('/credentials', {'revision': 0, 'venue': 'lighter', 'credentials': {
+            'wallet_address': '0x' + '22' * 20, 'account_index': 17, 'api_key_index': 5, 'api_private_key': '11' * 40}})
+        self.assertEqual(self.runtime.vault.load()['pending_registration'], pending)
+        self.assertIn(token, self.runtime.challenges)
+
     def test_lighter_discovery_then_registration_returns_working_browser_payload_without_writes(self):
         import json
         from urllib.parse import urlsplit

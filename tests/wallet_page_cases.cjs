@@ -122,9 +122,19 @@ async function main() {
   assert.equal(p.posts.length, 0); assert.ok(!w.calls.some(x => x.method === 'wallet_addEthereumChain'));
 
   w = wallet(); p = await page({provider: w, challenge: {...fixture, method: 'personal_sign', message_utf8: 'Lighter 🔑 подпись'}});
+  assert.equal(p.elements['lighter-key-help'].hidden, false);
   await p.elements.connect.onclick(); await p.elements.sign.onclick();
   assert.equal(w.calls.find(x => x.method === 'personal_sign').params[0], '0x' + Buffer.from('Lighter 🔑 подпись').toString('hex'));
   assert.ok(!w.calls.some(x => x.method === 'eth_chainId'));
+
+  p = await page({challenge: {...fixture, method: 'personal_sign', message_utf8: 'Lighter'}});
+  assert.match(p.elements.status.textContent, /Robinhood Wallet/);
+  assert.equal(p.elements['lighter-key-help'].hidden, false);
+  assert.equal(p.elements.connect.disabled, true);
+  assert.equal(p.posts.length, 0);
+  assert.match(html, /href="https:\/\/robinhoodchain\.lighter\.xyz\/apikeys" target="_blank" rel="noopener noreferrer"/);
+  p = await page({provider: wallet()});
+  assert.equal(p.elements['lighter-key-help'].hidden, true);
 
   w = wallet(); p = await page({provider: w, postError: true});
   await p.elements.connect.onclick(); await p.elements.sign.onclick(); await p.run('sign()');
