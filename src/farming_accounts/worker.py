@@ -71,9 +71,15 @@ class Runtime:
         value = config.get('strategy')
         if not value:
             raise TradingError('Сохраните настройки стратегии.')
-        # Restore previous cycle even after eligibility proof expires; prohibit new openings separately.
-        proof_time = float(value.get('points_evidence', {}).get('confirmed_at', 0))
-        settings = strategy(value, clock=lambda: proof_time + 1)
+        settings = strategy(value)
+        fingerprint = {venue: {name: config.get(venue, {}).get(name) for name in names}
+                       for venue, names in {'nado': ('owner', 'subaccount'),
+                           'lighter': ('wallet_address', 'account_index')}.items()}
+        previous = self.journal.get('account_identity')
+        cycle = self.journal.active_cycle()
+        if previous and previous != fingerprint and cycle and cycle['state'] != 'CLOSED':
+            raise TradingError('Журнал открытого хеджа принадлежит другим аккаунтам. Восстановите соответствующее хранилище ключей.')
+        self.journal.set('account_identity', fingerprint)
         nado = self.gateway('nado', config)
         try:
             lighter = self.gateway('lighter', config)
@@ -205,7 +211,9 @@ class Runtime:
             self.check_points()
             result = self.build_engine().preflight()
             self.verified.update(nado=True, lighter=True)
-            return {'ok': True, 'preflight': result, 'message': 'Проверка аккаунтов, рынков и лимитов выполнена без ордеров.'}
+            details = ['%s: %s' % (item['asset'], 'готов' if item['ready'] else item.get('reason', 'недоступен'))
+                       for item in result['markets']]
+            return {'ok': True, 'preflight': result, 'message': 'Проверка без ордеров. ' + '; '.join(details)}
         if route == '/start':
             self.check_points()
             self.build_engine().start()

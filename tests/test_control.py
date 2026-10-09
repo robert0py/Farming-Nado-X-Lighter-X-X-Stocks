@@ -71,16 +71,18 @@ class ControlTests(unittest.TestCase):
         with self.assertRaises(TradingError):
             self.runtime.wallet('unrecognized', '0x' + '11' * 65)
 
-    def test_expired_eligibility_and_reserved_key_indexes_rejected(self):
+    def test_missing_eligibility_and_reserved_key_indexes_rejected(self):
         settings = {'assets': ['SPY', 'QQQ'], 'notional_per_leg': '100', 'max_slippage_bps': '10',
                     'residual_notional': '1', 'margin_reserve': '10', 'max_loss_quote': '5',
                     'max_unhedged_seconds': 60, 'quote_max_age_seconds': 10,
                     'points_evidence': {'url': 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado',
-                                        'confirmed_at': time.time() - 90000, 'account_enrolled': True, 'assets': ['SPY', 'QQQ']}}
+                                        'confirmed_at': time.time() - 90000, 'account_enrolled': False, 'assets': ['SPY', 'QQQ']}}
         with self.assertRaises(TradingError):
             strategy(settings)
         with self.assertRaises(TradingError):
             credentials('lighter', {'wallet_address': '0x' + '22' * 20, 'account_index': 1, 'api_key_index': 157}, require_key=False)
+        settings['points_evidence']['account_enrolled'] = True
+        self.assertEqual(strategy(settings).assets, ('SPY', 'QQQ'))
 
     def test_cli_defaults_bind_only_loopback(self):
         from farming_accounts.worker import main

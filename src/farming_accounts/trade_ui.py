@@ -264,7 +264,7 @@ class TradingPanel:
         tk.Checkbutton(content, text='Я проверил участие аккаунта и выбранных spot xStocks в действующей программе xPoints', variable=verified,
                        bg=content.cget('bg'), fg=INK, activebackground=content.cget('bg'), activeforeground=INK, selectcolor=FIELD,
                        wraplength=760, justify='left', anchor='w').pack(fill='x')
-        label(content, 'Подтверждение действует 24 часа; затем новые циклы останавливаются, существующий закрывается по таймеру.', color=MUTED, size=9, wraplength=760).pack(anchor='w', pady=6)
+        label(content, 'Участие в программе проверяется вами. Бот автоматически проверяет доступность рынков перед каждым циклом.', color=MUTED, size=9, wraplength=760).pack(anchor='w', pady=6)
         ttk.Button(content, text='Открыть действующие правила xPoints', command=lambda: webbrowser.open('https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado')).pack(anchor='w', pady=(0, 10))
         def save():
             selected = [asset.strip().upper() for asset in assets.get().split(',') if asset.strip()]
@@ -314,7 +314,7 @@ class TradingPanel:
             def stamp(value):
                 return datetime.fromtimestamp(value).strftime('%d.%m %H:%M') if value else '—'
             self.table.insert('', 'end', values=(item.get('asset', '—'), STATE_NAMES.get(item.get('state'), item.get('state', '—')),
-                              stamp(item.get('created_at')), stamp(item.get('deadline')), item.get('residual_notional', '—')))
+                              stamp(item.get('opened_at')), stamp(item.get('deadline')), item.get('residual_notional', '—')))
 
     def poll(self):
         if self.closed:

@@ -9,6 +9,9 @@ on:
       - 'run.py'
       - 'pyproject.toml'
       - 'requirements-build.txt'
+      - 'requirements-runtime.txt'
+      - 'docs/RELEASE_NOTES.md'
+      - 'deploy/**'
       - 'scripts/build-windows.ps1'
       - '.github/workflows/windows.yml'
   workflow_dispatch:

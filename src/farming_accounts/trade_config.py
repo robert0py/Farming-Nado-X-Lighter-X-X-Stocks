@@ -55,9 +55,9 @@ def strategy(value: dict, *, clock=time.time) -> Strategy:
             raise TradingError('Для смены актива между циклами выберите минимум два базовых актива.')
         proof = value.get('points_evidence', {})
         confirmed = float(proof.get('confirmed_at', 0))
-        if (proof.get('account_enrolled') is not True or not isinstance(proof.get('assets'), list) or not 0 <= clock() - confirmed < 86400 or
+        if (proof.get('account_enrolled') is not True or not isinstance(proof.get('assets'), list) or not 0 < confirmed <= clock() or
                 proof.get('url') != 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado'):
-            raise TradingError('Проверьте текущую программу xPoints и участие аккаунта/активов; подтверждение действует 24 часа.')
+            raise TradingError('Подтвердите участие аккаунта и выбранных активов в действующей программе xPoints.')
         result = Strategy(assets=assets, points_verified_assets=tuple(proof.get('assets', ())), **values)
         result.validate()
         return result
