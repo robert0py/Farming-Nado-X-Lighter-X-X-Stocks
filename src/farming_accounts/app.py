@@ -107,7 +107,10 @@ class AccountPanel:
         dialog.title('Подключить ' + self.title)
         dialog.configure(bg=PANEL)
         dialog.transient(self.app.root)
-        dialog.geometry('570x390')
+        root = self.app.root
+        x = root.winfo_rootx() + (root.winfo_width() - 570) // 2
+        y = root.winfo_rooty() + (root.winfo_height() - 390) // 2
+        dialog.geometry(f'570x390{x:+d}{y:+d}')
         dialog.minsize(520, 380)
         dialog.resizable(True, False)
         dialog.protocol('WM_DELETE_WINDOW', self.close_dialog)
