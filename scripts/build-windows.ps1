@@ -10,6 +10,7 @@ try {
     & $Python -m unittest discover -s tests -q
     if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
     & $Python -m PyInstaller --noconfirm --clean --onefile --windowed --noupx `
+        --collect-all lighter --hidden-import eth_account --hidden-import cryptography `
         --name Farming-Accounts --paths src --specpath build --workpath build/pyinstaller `
         --distpath $OutputDirectory run.py
     if ($LASTEXITCODE -ne 0) { throw 'Desktop build failed' }

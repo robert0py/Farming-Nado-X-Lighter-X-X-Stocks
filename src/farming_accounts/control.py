@@ -3,12 +3,13 @@
 import json
 from pathlib import Path
 import secrets
+import re
 import subprocess
 import sys
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
-from urllib.request import Request, build_opener
+from urllib.request import Request, ProxyHandler, build_opener
 
 from .transport import NoRedirects
 from .vault import Vault, state_directory
@@ -28,10 +29,13 @@ class ControlClient:
                 parsed.query or parsed.fragment or parsed.path.rstrip('/') or
                 (parsed.scheme != 'https' and parsed.hostname not in ('127.0.0.1', 'localhost', '::1'))):
             raise ControlError('Для сервера укажите HTTPS-адрес без пути. HTTP разрешён только на этом компьютере.')
-        if not isinstance(token, str) or len(token) < 32 or any(c.isspace() for c in token):
+        if not isinstance(token, str) or not re.fullmatch(r'[A-Za-z0-9_-]{32,128}', token):
             raise ControlError('Введите отдельный токен управления сервером.')
         self.url, self.token = url.rstrip('/'), token
-        self.opener = opener or build_opener(NoRedirects())
+        handlers = [NoRedirects()]
+        if parsed.hostname in ('127.0.0.1', 'localhost', '::1'):
+            handlers.append(ProxyHandler({}))  # Local signing credentials must never pass through an HTTP proxy.
+        self.opener = opener or build_opener(*handlers)
 
     def request(self, path: str, data: dict | None = None) -> dict:
         if path not in ('/status', '/markets', '/preflight', '/credentials', '/strategy', '/start',

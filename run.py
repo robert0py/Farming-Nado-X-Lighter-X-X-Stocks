@@ -4,7 +4,10 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from farming_accounts.app import main
-
 if __name__ == "__main__":
-    main()
+    if '--worker' in sys.argv:
+        from farming_accounts.worker import main
+        main([argument for argument in sys.argv[1:] if argument != '--worker'])
+    else:
+        from farming_accounts.app import main
+        main()
