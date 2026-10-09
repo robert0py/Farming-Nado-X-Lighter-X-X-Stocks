@@ -16,6 +16,7 @@ class CredentialsDialog:
         self.pending = False
         self.wait_timer = None
         self.wallet_url = None
+        self.last_mode = None
         self.entries = {}
         self.labels = {}
         root = panel.app.root
@@ -49,7 +50,7 @@ class CredentialsDialog:
 
         shell = tk.Frame(dialog, bg=PANEL)
         shell.pack(fill='both', expand=True, padx=22, pady=(20, 0))
-        canvas = tk.Canvas(shell, bg=PANEL, highlightthickness=0)
+        self.canvas = canvas = tk.Canvas(shell, bg=PANEL, highlightthickness=0)
         scrollbar = ttk.Scrollbar(shell, orient='vertical', command=canvas.yview)
         scrollbar.pack(side='right', fill='y')
         canvas.pack(side='left', fill='both', expand=True)
@@ -141,10 +142,13 @@ class CredentialsDialog:
                                         'Достаточно публичного адреса кошелька. Индексы можно оставить пустыми: приложение найдёт аккаунт и свободный API key index на Robinhood Chain. При нескольких аккаунтах предложит выбрать нужный.')
             self.secret_frame.pack_forget()
             title = 'Создать ключ и открыть браузер'
+            if self.venue == 'lighter' and self.last_mode == 'existing' and self.entries['api_key_index'].get() == str(self.saved.get('api_key_index')):
+                self.entries['api_key_index'].delete(0, 'end')
         if self.venue == 'lighter':
             self.labels['account_index'].configure(text='Индекс аккаунта (пусто — найти по кошельку)' if self.mode.get() == 'wallet' else 'Индекс аккаунта на Robinhood Chain')
             self.labels['api_key_index'].configure(text='API key index (пусто — выбрать свободный)' if self.mode.get() == 'wallet' else 'Индекс зарегистрированного API-ключа')
         self.submit_button.configure(text=title, state='disabled' if self.pending else 'normal')
+        self.last_mode = self.mode.get()
 
     def set_pending(self, value):
         self.pending = value
@@ -178,6 +182,8 @@ class CredentialsDialog:
             return
         if 'revision' in data:
             data['revision'] = self.panel.data.get('revision', 0)
+        self.status_text('Ищу аккаунт и свободный индекс на Lighter Robinhood Chain…' if path == '/registration-options/lighter' else
+                         'Сохраняю ключ…' if path == '/credentials' else 'Создаю отдельный ключ и готовлю страницу для кошелька…')
         self.panel.request(path, data, callback, self.fail)
 
     def fail(self, message):
@@ -235,6 +241,8 @@ class CredentialsDialog:
                 self.link_value.set(self.wallet_url)
                 self.link_frame.pack(fill='x', pady=(0, 16))
                 self.change_mode()
+                self.window.update_idletasks()
+                self.canvas.yview_moveto(1.0)
                 self.open_browser()
         data = {'revision': self.panel.data.get('revision', 0), 'credentials': value}
         if existing:
@@ -247,7 +255,7 @@ class CredentialsDialog:
         except Exception:
             opened = False
         self.status_text('Страница открыта. Подключите кошелёк и подпишите привязку, затем вернитесь и нажмите «Проверить доступ».' if opened else
-                              'Браузер не открылся. Скопируйте ссылку ниже и вставьте её в браузер с расширением кошелька.')
+                              'Браузер не открылся. Скопируйте ссылку в этом окне и вставьте её в браузер с расширением кошелька.')
 
     def copy_link(self):
         if self.wallet_url:
