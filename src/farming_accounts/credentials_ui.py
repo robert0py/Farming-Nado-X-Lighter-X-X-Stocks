@@ -10,7 +10,7 @@ from .trading.domain import TradingError
 
 class CredentialsDialog:
     def __init__(self, panel, venue):
-        from .app import PANEL, MUTED, label, set_dark_titlebar
+        from .app import PANEL, MUTED, INK, FIELD, label, set_dark_titlebar
         self.panel, self.venue = panel, venue
         self.pending = False
         self.wallet_url = None
@@ -21,7 +21,10 @@ class CredentialsDialog:
         dialog.configure(bg=PANEL)
         dialog.transient(root)
         width, height = min(760, root.winfo_screenwidth() - 60), min(690, root.winfo_screenheight() - 110)
-        dialog.geometry(f'{width}x{height}')
+        root.update_idletasks()
+        x = max(0, min(root.winfo_rootx() + (root.winfo_width() - width) // 2, root.winfo_screenwidth() - width))
+        y = max(0, min(root.winfo_rooty() + (root.winfo_height() - height) // 2, root.winfo_screenheight() - height - 50))
+        dialog.geometry(f'{width}x{height}+{x}+{y}')
         dialog.minsize(min(540, width), min(420, height))
         panel.dialogs.append(dialog)
         set_dark_titlebar(dialog)
@@ -32,6 +35,7 @@ class CredentialsDialog:
         self.status = label(footer, 'Выберите способ подключения. Основной ключ кошелька и seed-фраза не нужны.',
                             color=MUTED, size=10, wraplength=660, justify='left', anchor='w')
         self.status.pack(fill='x', pady=(0, 12))
+        footer.bind('<Configure>', lambda event: self.status.configure(wraplength=max(200, event.width - 4)))
         actions = tk.Frame(footer, bg=PANEL)
         actions.pack(fill='x')
         ttk.Button(actions, text='Закрыть', command=self.close).pack(side='right')
@@ -48,7 +52,13 @@ class CredentialsDialog:
         body = tk.Frame(canvas, bg=PANEL)
         inner = canvas.create_window(0, 0, window=body, anchor='nw')
         body.bind('<Configure>', lambda _: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>', lambda event: canvas.itemconfigure(inner, width=event.width))
+        def resize(event):
+            canvas.itemconfigure(inner, width=event.width)
+            for container in (body, self.link_frame if hasattr(self, 'link_frame') else body):
+                for widget in container.winfo_children():
+                    if isinstance(widget, tk.Label):
+                        widget.configure(wraplength=max(200, event.width - 12))
+        canvas.bind('<Configure>', resize)
         def wheel(event):
             canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units')
         dialog.bind('<MouseWheel>', wheel)
@@ -57,8 +67,11 @@ class CredentialsDialog:
 
         label(body, 'Как подключить торговый доступ?', bold=True, size=16).pack(anchor='w', pady=(0, 12))
         self.mode = tk.StringVar(value='wallet')
+        style = ttk.Style(dialog)
+        style.configure('Key.TRadioButton', background=PANEL, foreground=INK, font=('Segoe UI', 10))
+        style.map('Key.TRadioButton', background=[('active', FIELD)], foreground=[('active', INK)])
         for value, title in (('wallet', 'Создать отдельный ключ через кошелёк'), ('existing', 'У меня уже есть зарегистрированный ключ')):
-            ttk.Radiobutton(body, text=title, value=value, variable=self.mode, command=self.change_mode).pack(anchor='w', pady=4)
+            ttk.Radiobutton(body, text=title, value=value, variable=self.mode, command=self.change_mode, style='Key.TRadioButton').pack(anchor='w', pady=4)
         self.instructions = label(body, '', color=MUTED, size=10, wraplength=640, justify='left', anchor='w')
         self.instructions.pack(fill='x', pady=(12, 16))
         saved = panel.data.get('credentials', {}).get(venue, {})
