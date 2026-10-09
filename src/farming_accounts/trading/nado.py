@@ -6,6 +6,7 @@ An absent order in the book/history is UNKNOWN, never proof of a zero fill.
 """
 
 from copy import deepcopy
+from contextlib import ExitStack
 from dataclasses import replace
 from decimal import Decimal, localcontext
 import gzip
@@ -21,7 +22,8 @@ from urllib.request import Request, build_opener
 
 from ..models import AccountError, nado_subaccount, wallet_address
 from ..transport import MAX_RESPONSE, NoRedirects
-from .domain import Book, Instrument, OrderIntent, OrderObservation, TradingError, UnknownExecution
+from .domain import (Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError,
+                     TradingError, UnknownExecution)
 
 X18 = Decimal(10**18)
 VENUE = "nado"
@@ -463,7 +465,9 @@ class NadoGateway:
                 if not isinstance(raw, list) or len(raw) != 2:
                     raise TradingError("Nado вернул некорректный уровень стакана.")
                 price, qty = _x18(raw[0]), _x18(raw[1])
-                if price <= 0 or qty <= 0 or price % instrument.price_tick != 0 or qty % instrument.quantity_step != 0:
+                # A partially filled resting order may have a fractional remainder
+                # below the size increment. The increment constrains NEW orders.
+                if price <= 0 or qty <= 0 or price % instrument.price_tick != 0:
                     raise TradingError("Nado вернул недопустимую ликвидность.")
                 levels.append((price, qty))
             if not levels or levels != sorted(levels, reverse=descending):
@@ -550,14 +554,21 @@ class NadoGateway:
         return baseline
 
     def submit(self, intent):
-        self._order(intent)  # validate before touching the account
-        baseline = self._precheck(intent)
-        message, signature, digest = self._order(intent)
-        with self.stream_factory(self.transport.websocket, self.signer, self.sender, intent.instrument,
-                                 self._contracts[0], self._contracts[1], self.clock) as stream:
-            payload = {"product_id": intent.instrument.id, "order": {k: str(v) if k != "sender" else v
-                                                                      for k, v in message.items()},
-                       "signature": signature, "digest": digest, "spot_leverage": False}
+        with ExitStack() as stack:
+            try:
+                self._order(intent)  # validate before touching the account
+                baseline = self._precheck(intent)
+                message, signature, digest = self._order(intent)
+                stream = stack.enter_context(self.stream_factory(
+                    self.transport.websocket, self.signer, self.sender, intent.instrument,
+                    self._contracts[0], self._contracts[1], self.clock))
+                payload = {"product_id": intent.instrument.id, "order": {k: str(v) if k != "sender" else v
+                                                                          for k, v in message.items()},
+                           "signature": signature, "digest": digest, "spot_leverage": False}
+            except Exception as error:
+                message = str(error) if isinstance(error, TradingError) else "Подготовка Nado не выполнена. Ордер не отправлен."
+                raise PreSubmissionError(message) from None
+            # No exception from this point can claim the order was never sent.
             result = self.transport.execute({"place_order": payload})
             if result.get("status") == "failure":
                 return OrderObservation(intent.client_id, "REJECTED", Decimal(0), exchange_id=digest)

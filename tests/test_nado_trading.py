@@ -12,7 +12,8 @@ from urllib.error import URLError
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from farming_accounts.models import nado_subaccount
-from farming_accounts.trading.domain import OrderIntent, OrderObservation, TradingError, UnknownExecution
+from farming_accounts.trading.domain import (OrderIntent, OrderObservation, PreSubmissionError,
+                                            TradingError, UnknownExecution)
 from farming_accounts.trading.nado import (EthereumSigner, NadoGateway, NadoLifecycle,
                                           NadoRegistration, NadoTransport, typed_data, LINK_FIELDS)
 
@@ -245,8 +246,17 @@ class NadoTradingTests(unittest.TestCase):
             self.gateway.submit(self.intent)
 
     def test_expired_nonce_never_submits(self):
-        with self.assertRaisesRegex(TradingError, "Nonce"):
+        with self.assertRaisesRegex(PreSubmissionError, "Nonce"):
             self.gateway.submit(replace(self.intent, nonce=1))
+        self.assertFalse(any(c[0] == "execute" for c in self.transport.calls))
+
+    def test_stream_unavailable_is_definitely_not_submitted(self):
+        class FailedStream(FakeStream):
+            def __enter__(self):
+                raise TradingError("Поток исполнений недоступен.")
+        self.gateway.stream_factory = FailedStream
+        with self.assertRaises(PreSubmissionError):
+            self.gateway.submit(self.intent)
         self.assertFalse(any(c[0] == "execute" for c in self.transport.calls))
 
     def test_order_rejection_returns_safe_terminal(self):
@@ -295,6 +305,16 @@ class NadoTradingTests(unittest.TestCase):
         self.transport.query = crossed
         with self.assertRaisesRegex(TradingError, "пересечение"):
             self.gateway.book(self.instrument)
+
+    def test_real_book_partial_remainder_need_not_match_order_step(self):
+        original = self.transport.query
+        def partial(params):
+            data = original(params)
+            if params["type"] == "market_liquidity":
+                data["asks"][0][1] = raw("0.497917985996439406")
+            return data
+        self.transport.query = partial
+        self.assertEqual(self.gateway.book(self.instrument).ask_quantity, D("0.497917985996439406"))
 
 
 class NadoRegistrationTests(unittest.TestCase):
@@ -417,6 +437,20 @@ class NadoTransportTests(unittest.TestCase):
         self.assertEqual(signer.recover(data, signature), account.address.lower())
         self.assertRegex(digest, r"^0x[0-9a-f]{64}$")
         self.assertNotIn(account.key.hex(), repr(signer))
+
+    def test_browser_decimal_uint64_strings_preserve_exact_signature(self):
+        try:
+            from eth_account import Account
+        except ImportError:
+            self.skipTest("Signing dependencies are installed in the trading runtime.")
+        signer = EthereumSigner(Account.create().key)
+        data = typed_data("LinkSigner", LINK_FIELDS,
+                          {"sender": SENDER, "signer": SIGNER + "0" * 24, "nonce": 2**63 + 9}, 57073, ENDPOINT)
+        browser = copy.deepcopy(data)
+        browser["message"]["nonce"] = str(browser["message"]["nonce"])
+        signature, digest = signer.sign(browser)
+        self.assertEqual(signer.sign(data)[1], digest)
+        self.assertEqual(signer.recover(data, signature), signer.address)
 
 
 if __name__ == "__main__":
