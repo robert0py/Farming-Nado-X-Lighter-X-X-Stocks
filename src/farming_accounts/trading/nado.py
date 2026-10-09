@@ -373,6 +373,35 @@ class NadoLifecycle:
         self.socket = None
 
 
+def spot_instruments(metadata, approved_assets):
+    """Parse spot metadata with the execution adapter's explicit asset allowlist."""
+    result, ids, assets = [], set(), set()
+    for key, item in _obj(metadata).items():
+        item = _obj(item)
+        symbol = item.get("symbol")
+        match = re.fullmatch(r"w([A-Z0-9]+)x", str(symbol))
+        if item.get("type") != "spot" or item.get("exchange_rate_x18") is None or not match:
+            continue
+        underlying = match[1]
+        if underlying not in approved_assets:
+            continue
+        product_id = _integer(item.get("product_id"), minimum=1)
+        step, tick, minimum, multiplier = [_x18(item.get(field)) for field in
+                                         ("size_increment", "price_increment_x18", "min_size", "exchange_rate_x18")]
+        if symbol != key or min(step, tick, minimum, multiplier) <= 0 or product_id in ids or underlying in assets:
+            raise TradingError("Nado вернул неоднозначный или некорректный рынок xStocks.")
+        hours = item.get("market_hours")
+        opened = hours is None or _obj(hours).get("is_open") is True
+        status = item.get("trading_status")
+        if status not in {"live", "post_only", "reduce_only", "soft_reduce_only", "not_tradable"}:
+            raise TradingError("Nado вернул неизвестный статус торгового рынка.")
+        result.append(Instrument(VENUE, underlying, product_id, symbol, "spot", step, tick,
+                                 Decimal(0), minimum, multiplier, status == "live" and opened))
+        ids.add(product_id)
+        assets.add(underlying)
+    return tuple(result)
+
+
 class NadoGateway:
     def __init__(self, owner, subaccount="default", private_key=None, approved_assets=(), *,
                  transport=None, signer=None, clock=time.time, stream_factory=NadoLifecycle):
@@ -429,31 +458,7 @@ class NadoGateway:
             raise TradingError("Не удалось проверить поток исполнений Nado. Торговля ещё не готова.") from None
 
     def instruments(self):
-        result, ids, assets = [], set(), set()
-        for key, item in _obj(self.transport.symbols()).items():
-            item = _obj(item)
-            symbol = item.get("symbol")
-            match = re.fullmatch(r"w([A-Z0-9]+)x", str(symbol))
-            if item.get("type") != "spot" or item.get("exchange_rate_x18") is None or not match:
-                continue
-            underlying = match[1]
-            if underlying not in self.approved_assets:
-                continue
-            product_id = _integer(item.get("product_id"), minimum=1)
-            step, tick, minimum, multiplier = [_x18(item.get(field)) for field in
-                                             ("size_increment", "price_increment_x18", "min_size", "exchange_rate_x18")]
-            if symbol != key or min(step, tick, minimum, multiplier) <= 0 or product_id in ids or underlying in assets:
-                raise TradingError("Nado вернул неоднозначный или некорректный рынок xStocks.")
-            hours = item.get("market_hours")
-            opened = hours is None or _obj(hours).get("is_open") is True
-            status = item.get("trading_status")
-            if status not in {"live", "post_only", "reduce_only", "soft_reduce_only", "not_tradable"}:
-                raise TradingError("Nado вернул неизвестный статус торгового рынка.")
-            result.append(Instrument(VENUE, underlying, product_id, symbol, "spot", step, tick,
-                                     Decimal(0), minimum, multiplier, status == "live" and opened))
-            ids.add(product_id)
-            assets.add(underlying)
-        return tuple(result)
+        return spot_instruments(self.transport.symbols(), self.approved_assets)
 
     def _instrument(self, instrument, *, closing=False):
         if instrument.venue != VENUE or instrument.kind != "spot":

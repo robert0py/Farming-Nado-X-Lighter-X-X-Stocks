@@ -15,14 +15,6 @@ from .vault import Vault, VaultError, state_directory
 STATE_NAMES = {'NOT_CONFIGURED': 'Настройте доступ и стратегию', 'IDLE': 'Остановлен', 'WAITING': 'Ожидание рынка',
                'OPENING_SPOT': 'Покупка spot', 'OPENING_HEDGE': 'Формирование хеджа', 'HEDGED': 'Хедж удерживается',
                'CLOSING': 'Закрытие обеих сторон', 'CLOSED': 'Цикл завершён', 'RECOVERY': 'Сверка исполнения', 'HALTED': 'Требуется проверка'}
-FIELDS = (('notional_per_leg', 'Размер каждой стороны, в валюте котировки'),
-          ('max_slippage_bps', 'Макс. проскальзывание, bps (100 bps = 1%)'),
-          ('residual_notional', 'Допустимая остаточная экспозиция, в котировке'),
-          ('margin_reserve', 'Резерв средств на каждой площадке'),
-          ('max_loss_quote', 'Лимит оценки убытка цикла, в котировке'),
-          ('max_unhedged_seconds', 'Лимит времени без хеджа, секунд (> 10)'),
-          ('quote_max_age_seconds', 'Макс. возраст полученного стакана, секунд'),
-          ('hold_hours', 'Удержание сформированного хеджа, часов'))
 
 
 class TradingPanel:
@@ -201,53 +193,8 @@ class TradingPanel:
         return CredentialsDialog(self, venue)
 
     def strategy_dialog(self):
-        from .app import label, MUTED, FIELD, INK
-        dialog, content = self.dialog('Настройки циклического хеджа', 810, 675)
-        saved = self.data.get('strategy') or {}
-        values = {}
-        label(content, 'Разрешённые базовые активы через запятую (минимум два)', size=10).pack(anchor='w')
-        assets = ttk.Entry(content)
-        assets.pack(fill='x', pady=(5, 12))
-        assets.insert(0, ', '.join(saved.get('assets', ())))
-        grid = tk.Frame(content, bg=content.cget('bg'))
-        grid.pack(fill='x')
-        for index, (key, title) in enumerate(FIELDS):
-            row, column = divmod(index, 2)
-            frame = tk.Frame(grid, bg=content.cget('bg'))
-            frame.grid(row=row, column=column, sticky='ew', padx=(0, 10) if column == 0 else (10, 0), pady=7)
-            grid.columnconfigure(column, weight=1)
-            label(frame, title, size=9).pack(anchor='w')
-            entry = values[key] = ttk.Entry(frame)
-            entry.pack(fill='x', pady=(5, 0))
-            value = str(saved.get(key, ''))
-            if key == 'hold_hours':
-                value = str(saved.get('hold_seconds', 43200) / 3600).rstrip('0').rstrip('.') if saved else '12'
-            entry.insert(0, value)
-        label(content, 'Размер задаётся на каждую сторону. Бот требует средства для spot без займа и полное обеспечение short + резерв. Оценка убытка не включает funding и колебания курса USDT0/USDG.',
-              color=MUTED, size=9, wraplength=760, justify='left').pack(fill='x', pady=(12, 8))
-        verified = tk.BooleanVar(value=False)
-        tk.Checkbutton(content, text='Я проверил участие аккаунта и выбранных spot xStocks в действующей программе xPoints', variable=verified,
-                       bg=content.cget('bg'), fg=INK, activebackground=content.cget('bg'), activeforeground=INK, selectcolor=FIELD,
-                       wraplength=760, justify='left', anchor='w').pack(fill='x')
-        label(content, 'Участие в программе проверяется вами. Бот автоматически проверяет доступность рынков перед каждым циклом.', color=MUTED, size=9, wraplength=760).pack(anchor='w', pady=6)
-        ttk.Button(content, text='Открыть действующие правила xPoints', command=lambda: webbrowser.open('https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado')).pack(anchor='w', pady=(0, 10))
-        def save():
-            selected = [asset.strip().upper() for asset in assets.get().split(',') if asset.strip()]
-            value = {key: entry.get().strip() for key, entry in values.items() if key != 'hold_hours'}
-            try:
-                from decimal import Decimal
-                duration = Decimal(values['hold_hours'].get()) * 3600
-                if not duration.is_finite() or duration != duration.to_integral_value() or duration <= 0:
-                    raise ValueError()
-                value['hold_seconds'] = int(duration)
-            except Exception:
-                self.message.configure(text='Укажите положительное время удержания в часах.')
-                return
-            value.update(assets=selected, points_evidence={'url': 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado',
-                         'confirmed_at': time.time(), 'account_enrolled': verified.get(), 'assets': selected})
-            self.request('/strategy', {'revision': self.data.get('revision', 0), 'strategy': value},
-                         lambda result: dialog.destroy() if dialog.winfo_exists() else None)
-        ttk.Button(content, text='Сохранить стратегию', style='Primary.TButton', command=save).pack(anchor='e', pady=7)
+        from .strategy_ui import StrategyDialog
+        return StrategyDialog(self)
 
     def render_buttons(self):
         for button in self.buttons:
@@ -262,7 +209,7 @@ class TradingPanel:
             self.fields[venue].configure(text='Доступ подтверждён' if verified else 'Ключ сохранён · нужна проверка' if value.get('key_saved') else 'Торговый доступ не настроен', fg=GREEN if verified else MUTED)
         settings = self.data.get('strategy')
         if settings:
-            self.summary.configure(text=f"{', '.join(settings['assets'])} · размер стороны {settings['notional_per_leg']} · удержание {settings['hold_seconds'] / 3600:g} ч")
+            self.summary.configure(text=f"{', '.join(settings['assets'])} · покупка Nado до {settings['notional_per_leg']} USDT0 · удержание {settings['hold_seconds'] / 3600:g} ч")
         execution = self.data.get('execution', {})
         cycle = execution.get('cycle') or {}
         state = execution.get('state', 'NOT_CONFIGURED')

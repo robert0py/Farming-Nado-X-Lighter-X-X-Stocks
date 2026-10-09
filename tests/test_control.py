@@ -50,6 +50,18 @@ class ControlTests(unittest.TestCase):
             build_opener(ProxyHandler({})).open(request)
         self.assertEqual(raised.exception.code, 401)
 
+    def test_market_discovery_needs_no_strategy_keys_or_mutation_lock(self):
+        self.runtime.journal.save_cycle({'id': 'isolated-opening', 'state': 'OPENING_HEDGE'})
+        catalog = {'ok': True, 'assets': ['SPY', 'QQQ'], 'markets': [], 'fetched_at': 123}
+        with patch('farming_accounts.trading.markets.hedge_catalog', return_value=catalog), \
+             patch.object(self.runtime, 'gateway') as gateway, patch.object(self.runtime, 'mutable') as mutable:
+            self.assertEqual(self.client.request('/markets'), catalog)
+            with self.assertRaises(ControlError):
+                ControlClient(self.url, 'wrong_token_' * 5).request('/markets')
+        gateway.assert_not_called()
+        mutable.assert_not_called()
+        self.assertEqual(self.runtime.journal.active_cycle()['state'], 'OPENING_HEDGE')
+
     def test_command_dedupe_and_revision_prevent_repeated_mutation(self):
         value = {'command_id': 'a' * 32, 'revision': 0, 'venue': 'nado',
                  'credentials': {'owner': '0x' + '22' * 20, 'subaccount': 'default', 'private_key': '0x' + '11' * 32}}

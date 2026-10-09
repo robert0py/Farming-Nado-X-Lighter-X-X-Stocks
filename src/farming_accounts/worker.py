@@ -402,18 +402,8 @@ def handler_for(runtime):
                 elif self.path == '/status':
                     result = runtime.status()
                 elif self.path == '/markets':
-                    with runtime.lock:
-                        runtime.mutable()
-                        venues = [runtime.gateway(venue) for venue in ('nado', 'lighter')]
-                        try:
-                            nado, lighter = (v.instruments() for v in venues)
-                            assets = sorted({i.underlying for i in nado if i.tradable} & {i.underlying for i in lighter if i.tradable})
-                            result = {'ok': True, 'assets': assets}
-                        finally:
-                            for venue in venues:
-                                close = getattr(venue, 'close', None)
-                                if close:
-                                    close()
+                    from .trading.markets import hedge_catalog
+                    result = hedge_catalog()
                 else:
                     self.reply({'ok': False, 'error': 'Маршрут не найден.'}, 404)
                     return

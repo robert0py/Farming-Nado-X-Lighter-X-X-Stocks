@@ -148,6 +148,35 @@ def generate_api_key(*, sdk_module=None) -> GeneratedLighterKey:
         raise TradingError("Не удалось загрузить официальный signer Lighter.") from None
 
 
+def perpetual_instruments(metadata):
+    """Parse Robinhood stock perpetuals identically for discovery and execution."""
+    response = _response(metadata)
+    result = []
+    for item in _items(response.get("order_book_details")):
+        item = _data(item)
+        symbol = item.get("symbol")
+        if symbol not in STOCK_SYMBOLS or item.get("market_type") != "perp":
+            continue
+        multiplier = _number(item.get("multiplier"))
+        if multiplier <= 0:
+            raise TradingError("Lighter не подтвердил множитель экспозиции акции.")
+        size_decimals, price_decimals = item.get("supported_size_decimals"), item.get("supported_price_decimals")
+        if any(isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 18 for v in (size_decimals, price_decimals)):
+            raise TradingError("Некорректная точность рынка Lighter.")
+        market_id = item.get("market_id")
+        if isinstance(market_id, bool) or not isinstance(market_id, int) or not 0 <= market_id < 255:
+            raise TradingError("Некорректный идентификатор рынка Lighter.")
+        config = _data(item.get("market_config"))
+        tradable = item.get("status") == "active" and item.get("is_frozen") is False and config.get("force_reduce_only") is False
+        instrument = Instrument("lighter", symbol, market_id, symbol, "perp",
+                                Decimal(10) ** -size_decimals, Decimal(10) ** -price_decimals,
+                                _number(item.get("min_base_amount")), _number(item.get("min_quote_amount")), multiplier, tradable)
+        result.append(instrument)
+    if len({item.id for item in result}) != len(result) or len({item.underlying for item in result}) != len(result):
+        raise TradingError("Lighter вернул неоднозначное сопоставление акций.")
+    return tuple(result)
+
+
 class LighterVenue:
     """One SDK client, one event loop, serialized calls and a single key.
 
@@ -290,31 +319,9 @@ the durable engine must only call lookup(), including after a process restart.
     async def _instruments(self):
         await self._ensure_client()
         response = _response(await self._client.order_api.order_book_details(_request_timeout=REQUEST_TIMEOUT))
-        result = []
-        for item in _items(response.get("order_book_details")):
-            item = _data(item)
-            symbol = item.get("symbol")
-            if symbol not in STOCK_SYMBOLS or item.get("market_type") != "perp":
-                continue
-            multiplier = _number(item.get("multiplier"))
-            if multiplier <= 0:
-                raise TradingError("Lighter не подтвердил множитель экспозиции акции.")
-            size_decimals, price_decimals = item.get("supported_size_decimals"), item.get("supported_price_decimals")
-            if any(isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 18 for v in (size_decimals, price_decimals)):
-                raise TradingError("Некорректная точность рынка Lighter.")
-            market_id = item.get("market_id")
-            if isinstance(market_id, bool) or not isinstance(market_id, int) or not 0 <= market_id < 255:
-                raise TradingError("Некорректный идентификатор рынка Lighter.")
-            config = _data(item.get("market_config"))
-            tradable = item.get("status") == "active" and item.get("is_frozen") is False and config.get("force_reduce_only") is False
-            instrument = Instrument(self.venue, symbol, market_id, symbol, "perp",
-                                    Decimal(10) ** -size_decimals, Decimal(10) ** -price_decimals,
-                                    _number(item.get("min_base_amount")), _number(item.get("min_quote_amount")), multiplier, tradable)
-            result.append(instrument)
-        if len({item.id for item in result}) != len(result) or len({item.underlying for item in result}) != len(result):
-            raise TradingError("Lighter вернул неоднозначное сопоставление акций.")
+        result = perpetual_instruments(response)
         self._markets = {item.id: item for item in result}
-        return tuple(result)
+        return result
 
     def _instrument(self, instrument: Instrument):
         if instrument.venue != self.venue or instrument.kind != "perp" or self._markets.get(instrument.id) != instrument:

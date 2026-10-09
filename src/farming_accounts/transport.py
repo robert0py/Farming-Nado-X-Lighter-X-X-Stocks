@@ -20,7 +20,10 @@ LIGHTER_ACCOUNT = "https://api.rh.lighter.xyz/api/v1/account"
 LIGHTER_ACCOUNTS = "https://api.rh.lighter.xyz/api/v1/accountsByL1Address"
 LIGHTER_APIKEYS = "https://api.rh.lighter.xyz/api/v1/apikeys"
 
+LIGHTER_MARKETS = "https://api.rh.lighter.xyz/api/v1/orderBookDetails"
+
 ROUTES = {
+    LIGHTER_MARKETS: set(),
     NADO_ACCOUNT: {"type", "subaccount"},
     NADO_SYMBOLS: {"product_type"},
     LIGHTER_ACCOUNT: {"by", "value", "active_only", "cursor"},
@@ -46,7 +49,7 @@ class ReadOnlyTransport:
     def get(self, endpoint: str, parameters: dict) -> object:
         allowed = ROUTES.get(endpoint)
         if allowed is None or set(parameters) - allowed:
-            raise AccountError("Запрос заблокирован: разрешены только методы просмотра баланса.")
+            raise AccountError("Запрос заблокирован: разрешены только методы просмотра аккаунтов и рынков.")
         if endpoint == NADO_ACCOUNT and parameters.get("type") != "subaccount_info":
             raise AccountError("Запрос Nado заблокирован: разрешён только subaccount_info.")
         host = urlsplit(endpoint).hostname
