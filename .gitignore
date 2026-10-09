@@ -12,3 +12,9 @@ secrets*
 accounts.json
 .pytest_cache/
 *.log
+*.sqlite*
+*.db*
+*.key
+*.bin
+vault-*.tmp
+state/
