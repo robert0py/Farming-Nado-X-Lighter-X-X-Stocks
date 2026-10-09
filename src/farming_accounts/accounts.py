@@ -1,6 +1,6 @@
 """Exchange-specific account adapters. Intentionally no signer or trading SDK."""
 
-from decimal import Decimal, localcontext
+from decimal import localcontext
 
 from .models import (
     AccountError, Balance, LighterAccount, Snapshot, account_index,
@@ -148,19 +148,3 @@ def parse_lighter(info: dict, identity: str) -> Snapshot:
     ), now(), note="Токены и маржинальный баланс показаны отдельно, как их возвращает Lighter.")
 
 
-def demo_nado() -> Snapshot:
-    return Snapshot("Nado", "Демонстрационный субаккаунт", (
-        Balance("USDT0", Decimal("1250")),
-        Balance("wSPYx", Decimal("2.5"), underlying=Decimal("2.514286400715635")),
-        Balance("wQQQx", Decimal("1"), underlying=Decimal("1.003456075896837599")),
-    ), (("Стоимость аккаунта", Decimal("3520.75"), "USDT0"),), now(), demo=True,
-        note="Пример данных. К вашим аккаунтам и API не подключено.")
-
-
-def demo_lighter() -> Snapshot:
-    return Snapshot("Lighter · Robinhood Chain", "Демонстрационный аккаунт", (
-        Balance("USDG", Decimal("0"), locked=Decimal("0"), margin=Decimal("2500")),
-    ), (("Стоимость аккаунта", Decimal("2500"), "USDG"),
-        ("Доступный баланс", Decimal("2500"), "USDG"),
-        ("Обеспечение", Decimal("2500"), "USDG")), now(), demo=True,
-        note="Пример данных. К вашим аккаунтам и API не подключено.")

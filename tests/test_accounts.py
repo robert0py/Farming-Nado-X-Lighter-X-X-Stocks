@@ -9,7 +9,7 @@ from urllib.error import HTTPError, URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from farming_accounts.accounts import LighterReader, NadoReader, demo_lighter, demo_nado, parse_lighter, parse_nado
+from farming_accounts.accounts import LighterReader, NadoReader, parse_lighter, parse_nado
 from farming_accounts.models import AccountError, account_index, decimal_value, display_number, nado_subaccount
 from farming_accounts.transport import LIGHTER_ACCOUNT, LIGHTER_ACCOUNTS, NADO_ACCOUNT, NADO_SYMBOLS, ReadOnlyTransport
 
@@ -146,10 +146,6 @@ class AccountTests(unittest.TestCase):
                           ({"code": 200, "sub_accounts": []},)):
             with self.assertRaises(AccountError):
                 LighterReader(FakeTransport(*responses)).discover(ADDRESS)
-
-    def test_demo_is_explicit_and_network_independent(self):
-        self.assertTrue(demo_nado().demo)
-        self.assertTrue(demo_lighter().demo)
 
 
 class Response(io.BytesIO):

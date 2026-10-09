@@ -73,7 +73,6 @@ class Snapshot:
     balances: tuple[Balance, ...]
     metrics: tuple[tuple[str, Decimal, str], ...]
     fetched_at: datetime
-    demo: bool = False
     note: str = ""
 
 
