@@ -5,6 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 import sys
 import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -14,13 +15,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from farming_accounts.trading.domain import OrderIntent, PreSubmissionError, TradingError, UnknownExecution
 from farming_accounts.trading.lighter import (
     LighterCredentials, LighterRegistration, LighterVenue, RH_CHAIN_ID, RH_URL,
-    client_order_index, generate_api_key,
+    _RhSession, client_order_index, generate_api_key,
 )
 
 
 WALLET = "0x" + "12" * 20
 PRIVATE = "ab" * 40
 PUBLIC = "0x" + "cd" * 40
+
+
+class FakeSession:
+    def __init__(self, **kwargs):
+        self.options = kwargs
+        self.requests = []
+        self.closed = False
+
+    def request(self, **kwargs):
+        self.requests.append(kwargs)
+        return SimpleNamespace(status=302)
+
+    async def close(self):
+        self.closed = True
 
 
 class FakeSDK:
@@ -57,7 +72,10 @@ class FakeSDK:
 
     def SignerClient(self, **kwargs):
         self.construction = kwargs
-        self.api_client = SimpleNamespace(configuration=SimpleNamespace(debug=True, retries=None))
+        self.old_session = FakeSession(trust_env=True)
+        self.api_client = SimpleNamespace(configuration=SimpleNamespace(debug=True, retries=None),
+                                         rest_client=SimpleNamespace(pool_manager=self.old_session, retry_client=None,
+                                                                      proxy="environment-proxy", proxy_headers=None))
         self.tx_api = SimpleNamespace(next_nonce=self.next_nonce, send_tx=self.send_tx)
         self.order_api = SimpleNamespace(account_active_orders=self.account_active_orders,
                                          account_orders=self.account_orders, trades=self.trades,
@@ -126,6 +144,7 @@ class FakeSDK:
 
     async def close(self):
         self.closed = True
+        await self.api_client.rest_client.pool_manager.close()
 
 
 def credentials(**updates):
@@ -136,7 +155,7 @@ def credentials(**updates):
 class LighterAdapterTests(unittest.TestCase):
     def setUp(self):
         self.sdk = FakeSDK()
-        self.adapter = LighterVenue(credentials(), sdk_module=self.sdk, clock=lambda: self.sdk.now)
+        self.adapter = LighterVenue(credentials(), sdk_module=self.sdk, clock=lambda: self.sdk.now, session_factory=FakeSession)
         self.addCleanup(self.adapter.close)
         self.adapter.verify()
         self.instrument = self.adapter.instruments()[0]
@@ -159,6 +178,10 @@ class LighterAdapterTests(unittest.TestCase):
         self.assertEqual(self.sdk.construction["chain_id"], RH_CHAIN_ID)
         self.assertEqual(self.sdk.construction["api_private_keys"], {4: PRIVATE})
         self.assertNotIn(PRIVATE, repr(credentials()))
+        self.assertTrue(self.sdk.old_session.closed)
+        session = self.sdk.api_client.rest_client.pool_manager
+        self.assertTrue(session.session.options["trust_env"])
+        self.assertIsNone(self.sdk.api_client.rest_client.proxy)
 
     def test_wrong_wallet_or_private_key_rejected_before_any_write(self):
         self.sdk.address = "0x" + "34" * 20
@@ -350,7 +373,8 @@ class LighterAdapterTests(unittest.TestCase):
 class RegistrationTests(unittest.TestCase):
     def setUp(self):
         self.sdk = FakeSDK()
-        self.adapter = LighterRegistration(credentials(), PUBLIC, sdk_module=self.sdk, clock=lambda: self.sdk.now)
+        self.adapter = LighterRegistration(credentials(), PUBLIC, sdk_module=self.sdk, clock=lambda: self.sdk.now,
+                                            session_factory=FakeSession)
         self.addCleanup(self.adapter.close)
 
     def test_generated_key_is_not_printed_by_dataclass(self):
@@ -380,7 +404,7 @@ class RegistrationTests(unittest.TestCase):
         self.sdk.address = account.address.lower()
         self.adapter.close()
         self.adapter = LighterRegistration(credentials(wallet_address=account.address), PUBLIC,
-                                            sdk_module=self.sdk, clock=lambda: self.sdk.now)
+                                            sdk_module=self.sdk, clock=lambda: self.sdk.now, session_factory=FakeSession)
         challenge = self.adapter.prepare()
         signature = account.sign_message(encode_defunct(text=challenge.message)).signature.hex()
         if not signature.startswith("0x"):
@@ -391,6 +415,87 @@ class RegistrationTests(unittest.TestCase):
         with self.assertRaises(TradingError):
             self.adapter.complete(signature)
         self.assertEqual(len(self.sdk.posts), 1)
+
+
+class HttpBoundaryTests(unittest.TestCase):
+    def test_foreign_origin_and_unexposed_account_operations_never_receive_token(self):
+        session = FakeSession()
+        transport = _RhSession(session)
+        for method, url, kwargs in (
+            ("GET", "https://evil.invalid/api/v1/account", {"headers": {"authorization": "secret-token"}}),
+            ("GET", "http://api.rh.lighter.xyz/api/v1/account", {}),
+            ("GET", "https://api.rh.lighter.xyz:8443/api/v1/account", {}),
+            ("POST", RH_URL + "/api/v1/fastwithdraw", {"data": "signed-payload"}),
+            ("GET", RH_URL + "/api/v1/account", {"proxy": "http://evil.invalid"}),
+            ("GET", RH_URL + "/api/v1/account", {"ssl": False}),
+        ):
+            with self.subTest(url=url), self.assertRaises(TradingError):
+                transport.request(method, url, **kwargs)
+        self.assertEqual(session.requests, [])
+
+    def test_redirect_flags_cannot_override_token_boundary(self):
+        session = FakeSession()
+        transport = _RhSession(session)
+        transport.request("POST", RH_URL + "/api/v1/sendTx", data="signed-payload", allow_redirects=True)
+        self.assertFalse(session.requests[0]["allow_redirects"])
+
+    def test_real_aiohttp_does_not_forward_auth_or_signed_body_to_redirect_target(self):
+        try:
+            import aiohttp
+        except ImportError:
+            self.skipTest("Optional official HTTP dependency is not installed")
+        import asyncio
+        received = []
+        class TargetHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.headers.get("authorization"))
+                self.send_response(200)
+                self.end_headers()
+            do_POST = do_GET
+            def log_message(self, *args):
+                pass
+        target = HTTPServer(("127.0.0.1", 0), TargetHandler)
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{target.server_port}/capture")
+                self.end_headers()
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                self.send_response(307)
+                self.send_header("Location", f"http://127.0.0.1:{target.server_port}/capture")
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        origin = HTTPServer(("127.0.0.1", 0), RedirectHandler)
+        threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (target, origin)]
+        for thread in threads:
+            thread.start()
+        async def operation():
+            session = aiohttp.ClientSession(trust_env=False)
+            transport = _RhSession(session)
+            base = f"http://127.0.0.1:{origin.server_port}"
+            try:
+                # Only the test patches the fixed production origin; the
+                # application has no configurable alternate exchange URL.
+                with patch("farming_accounts.trading.lighter.RH_URL", base):
+                    for method, path in (("GET", "/api/v1/account"), ("POST", "/api/v1/sendTx")):
+                        response = await transport.request(method, base + path,
+                                                           headers={"authorization": "test-token"}, data="test-signed-body")
+                        self.assertIn(response.status, (302, 307))
+                        await response.read()
+                        response.release()
+            finally:
+                await transport.close()
+        try:
+            asyncio.run(operation())
+            self.assertEqual(received, [])
+        finally:
+            for server in (origin, target):
+                server.shutdown()
+                server.server_close()
+            for thread in threads:
+                thread.join()
 
 
 if __name__ == "__main__":

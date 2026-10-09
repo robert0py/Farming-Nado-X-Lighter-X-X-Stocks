@@ -12,9 +12,11 @@ import hashlib
 import importlib
 import json
 import re
+import ssl
 import threading
 import time
 from typing import Callable
+from urllib.parse import urlsplit
 
 from .domain import Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, TradingError, UnknownExecution
 
@@ -25,6 +27,35 @@ SDK_VERSION = "1.1.6"
 REQUEST_TIMEOUT = 15.0
 STOCK_SYMBOLS = frozenset({"AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "QQQ", "SPY", "TSLA"})
 RESERVED_KEY_INDICES = frozenset({0, 1, 2, 3, 157, 255})
+READ_PATHS = frozenset({"/api/v1/account", "/api/v1/apikeys", "/api/v1/accountActiveOrders",
+                        "/api/v1/accountOrders", "/api/v1/orderBookDetails", "/api/v1/orderBookOrders",
+                        "/api/v1/nextNonce", "/api/v1/trades"})
+
+
+class _RhSession:
+    """Prevent signed payloads/tokens from following redirects or other URLs."""
+
+    def __init__(self, session):
+        self.session = session
+
+    def request(self, method, url, **kwargs):
+        try:
+            parsed, allowed = urlsplit(str(url)), urlsplit(RH_URL)
+            same_origin = (parsed.scheme, parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)) == (
+                allowed.scheme, allowed.hostname, allowed.port or (443 if allowed.scheme == "https" else 80))
+        except (ValueError, TypeError):
+            raise TradingError("Lighter запросил некорректный адрес API.") from None
+        permitted = (method == "GET" and parsed.path in READ_PATHS) or (method == "POST" and parsed.path == "/api/v1/sendTx")
+        if not same_origin or parsed.username or parsed.password or parsed.fragment or not permitted:
+            raise TradingError("Запрос вне разрешённого API Lighter Robinhood Chain запрещён.")
+        if kwargs.get("proxy") or kwargs.get("proxy_headers") or kwargs.get("ssl") is False:
+            raise TradingError("Для API Lighter запрещены proxy и отключение TLS-проверки.")
+        # aiohttp otherwise follows 307/308 POST redirects with the signed body.
+        kwargs["allow_redirects"] = False
+        return self.session.request(method=method, url=url, **kwargs)
+
+    async def close(self):
+        await self.session.close()
 
 
 def _number(value: object, *, nonnegative: bool = True) -> Decimal:
@@ -126,9 +157,11 @@ the durable engine must only call lookup(), including after a process restart.
 
     venue = "lighter"
 
-    def __init__(self, credentials: LighterCredentials, *, sdk_module=None, clock: Callable[[], float] = time.time):
+    def __init__(self, credentials: LighterCredentials, *, sdk_module=None, clock: Callable[[], float] = time.time,
+                 session_factory=None):
         self.credentials = credentials
         self._sdk = sdk_module
+        self._session_factory = session_factory
         self._clock = clock
         self._loop = asyncio.new_event_loop()
         self._lock = threading.RLock()
@@ -175,7 +208,28 @@ the durable engine must only call lookup(), including after a process restart.
         # separately below, avoiding that logging path and controlling timeouts.
         self._client.api_client.configuration.debug = False
         self._client.api_client.configuration.retries = None
+        await self._harden_http()
         self._account_api = sdk.AccountApi(self._client.api_client)
+
+    async def _harden_http(self):
+        # Preserve the machine's configured HTTPS proxy route. The exchange's
+        # TLS certificate remains verified, while the wrapper prevents signed
+        # requests from following redirects or calling another API origin.
+        rest = self._client.api_client.rest_client
+        await rest.pool_manager.close()
+        if rest.retry_client is not None:
+            await rest.retry_client.close()
+        rest.retry_client = None
+        rest.proxy = None
+        rest.proxy_headers = None
+        if self._session_factory is None:
+            import aiohttp
+            session = aiohttp.ClientSession(trust_env=True,
+                                            connector=aiohttp.TCPConnector(ssl=ssl.create_default_context()),
+                                            timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT))
+        else:
+            session = self._session_factory(trust_env=True)
+        rest.pool_manager = _RhSession(session)
 
     async def _token(self) -> str:
         await self._ensure_client()
