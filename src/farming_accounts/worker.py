@@ -173,6 +173,9 @@ class Runtime:
             self.save_config(config)
             return {'ok': True, 'message': 'Стратегия сохранена. Выполните проверку без ордеров.'}
         if route == '/verify':
+            cycle = self.journal.active_cycle()
+            if cycle and cycle['state'] in ('OPENING_SPOT', 'OPENING_HEDGE', 'CLOSING'):
+                raise TradingError('Проверка доступа недоступна во время исполнения хеджа. Дождитесь завершения операции.')
             venue = value['venue']
             gateway = self.gateway(venue)
             try:
@@ -208,6 +211,7 @@ class Runtime:
                 threading.Thread(target=self.shutdown, daemon=True).start()
             return {'ok': True, 'message': 'Worker остановлен. Открытых циклов нет.'}
         if route == '/preflight':
+            self.mutable()
             self.check_points()
             result = self.build_engine().preflight()
             self.verified.update(nado=True, lighter=True)
@@ -371,6 +375,7 @@ def handler_for(runtime):
                     result = runtime.status()
                 elif self.path == '/markets':
                     with runtime.lock:
+                        runtime.mutable()
                         venues = [runtime.gateway(venue) for venue in ('nado', 'lighter')]
                         try:
                             nado, lighter = (v.instruments() for v in venues)

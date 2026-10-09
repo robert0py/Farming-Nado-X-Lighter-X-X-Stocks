@@ -141,3 +141,14 @@ class ControlTests(unittest.TestCase):
         helper.submit_link.assert_called_once()
         with self.assertRaises(TradingError):
             self.runtime.wallet('isolated', '0x' + '11' * 65)
+
+    def test_preflight_cannot_block_an_opening_hedge(self):
+        self.runtime.journal.save_cycle({'id': 'opening-fixture', 'state': 'OPENING_HEDGE'})
+        with patch.object(self.runtime, 'build_engine') as factory:
+            response = self.runtime.command('/preflight', {'command_id': 'f' * 32})
+            self.assertFalse(response['ok'])
+            factory.assert_not_called()
+        with patch.object(self.runtime, 'gateway') as factory:
+            response = self.runtime.command('/verify', {'command_id': '1' * 32, 'venue': 'nado'})
+            self.assertFalse(response['ok'])
+            factory.assert_not_called()

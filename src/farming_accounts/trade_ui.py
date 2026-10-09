@@ -159,8 +159,10 @@ class TradingPanel:
             def connected(result):
                 self.client, self.data = result
                 Vault(state_directory() / 'desktop').update(lambda value: value.update(remote_control={'url': values[0], 'token': values[1]}))
-                token.delete(0, 'end')
-                dialog.destroy()
+                if token.winfo_exists():
+                    token.delete(0, 'end')
+                if dialog.winfo_exists():
+                    dialog.destroy()
                 self.worker_label.configure(text='Торговля: VPS ' + values[0])
                 self.message.configure(text='Подключён независимый серверный worker.')
                 self.render()
@@ -280,7 +282,8 @@ class TradingPanel:
                 return
             value.update(assets=selected, points_evidence={'url': 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado',
                          'confirmed_at': time.time(), 'account_enrolled': verified.get(), 'assets': selected})
-            self.request('/strategy', {'revision': self.data.get('revision', 0), 'strategy': value}, lambda result: dialog.destroy())
+            self.request('/strategy', {'revision': self.data.get('revision', 0), 'strategy': value},
+                         lambda result: dialog.destroy() if dialog.winfo_exists() else None)
         ttk.Button(content, text='Сохранить стратегию', style='Primary.TButton', command=save).pack(anchor='e', pady=7)
 
     def render_buttons(self):
@@ -330,7 +333,10 @@ class TradingPanel:
                 self.app.log('Торговля', error, error=True)
             else:
                 if callback:
-                    callback(result)
+                    try:
+                        callback(result)
+                    except Exception:
+                        self.message.configure(text='Ответ получен. Обновляю состояние после закрытия или изменения окна.')
                 elif isinstance(result, dict) and 'execution' in result:
                     self.data = result
                 if isinstance(result, dict) and result.get('message'):

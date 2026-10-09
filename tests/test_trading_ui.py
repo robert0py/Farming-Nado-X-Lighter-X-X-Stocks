@@ -46,3 +46,12 @@ class TradingDesktopTests(unittest.TestCase):
         self.panel.data = {'history': []}
         self.panel.render()
         self.assertEqual(self.panel.table.get_children(), ())
+
+    def test_dismissed_dialog_callback_does_not_stop_status_updates(self):
+        self.panel.client = Mock()
+        def dismissed(_):
+            raise tk.TclError('widget has been destroyed')
+        self.panel.results.put(({'ok': True}, None, dismissed))
+        self.panel.poll()
+        self.assertEqual(len(self.panel.executor.tasks), 1)
+        self.assertIn(self.panel.refresh_id, self.root.tk.call('after', 'info'))
