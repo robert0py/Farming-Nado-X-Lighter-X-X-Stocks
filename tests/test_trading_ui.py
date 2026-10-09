@@ -117,6 +117,7 @@ class TradingDesktopTests(unittest.TestCase):
     def test_busy_status_read_defers_key_request_and_sends_it_once(self):
         form = self.key_form()
         self.panel.busy = True
+        self.panel.data = {'revision': 1}
         self.panel.client.request.return_value = {'ok': True, 'wallet_url': 'http://127.0.0.1:8765/wallet#test'}
         with patch.object(form.window, 'after', return_value='scheduled') as schedule:
             form.submit()
@@ -126,11 +127,13 @@ class TradingDesktopTests(unittest.TestCase):
             self.assertEqual(self.panel.executor.tasks, [])
             schedule.assert_called_once()
             self.panel.busy = False
+            self.panel.data = {'revision': 2}
             schedule.call_args.args[1]()
         self.panel.executor.run_one()
         with patch('farming_accounts.credentials_ui.webbrowser.open', return_value=True):
             self.panel.poll()
         self.panel.client.request.assert_called_once()
+        self.assertEqual(self.panel.client.request.call_args.args[1]['revision'], 1)
 
     def test_browser_failure_preserves_registration_link_without_exporting_key(self):
         form = self.key_form()

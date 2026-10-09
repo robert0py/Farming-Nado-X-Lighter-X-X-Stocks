@@ -180,8 +180,6 @@ class CredentialsDialog:
             self.status_text('Дожидаюсь текущего запроса. Подготовка подключения продолжится автоматически…')
             self.wait_timer = self.window.after(150, lambda: self.send_when_ready(path, data, callback))
             return
-        if 'revision' in data:
-            data['revision'] = self.panel.data.get('revision', 0)
         self.status_text('Ищу аккаунт и свободный индекс на Lighter Robinhood Chain…' if path == '/registration-options/lighter' else
                          'Сохраняю ключ…' if path == '/credentials' else 'Создаю отдельный ключ и готовлю страницу для кошелька…')
         self.panel.request(path, data, callback, self.fail)

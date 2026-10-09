@@ -108,6 +108,13 @@ class ControlTests(unittest.TestCase):
         generate.assert_not_called()
         self.assertEqual(self.runtime.challenges, {})
 
+    def test_lighter_setup_does_not_block_active_hedge_with_api_reads(self):
+        self.runtime.journal.save_cycle({'id': 'isolated-opening', 'state': 'OPENING_HEDGE'})
+        with patch('farming_accounts.trading.lighter_setup.registration_options') as lookup:
+            with self.assertRaises(ControlError):
+                self.client.request('/registration-options/lighter', {'credentials': {'wallet_address': '0x' + '22' * 20}})
+        lookup.assert_not_called()
+
     def test_missing_eligibility_and_reserved_key_indexes_rejected(self):
         settings = {'assets': ['SPY', 'QQQ'], 'notional_per_leg': '100', 'max_slippage_bps': '10',
                     'residual_notional': '1', 'margin_reserve': '10', 'max_loss_quote': '5',

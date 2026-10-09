@@ -133,6 +133,7 @@ class Runtime:
 
     def _command(self, route, value):
         if route == '/registration-options/lighter':
+            self.mutable()  # Setup reads must not hold the execution lock during an active hedge.
             from .trading.lighter_setup import registration_options
             return registration_options(value.get('credentials', {}))
         if route in ('/credentials', '/strategy', '/register/nado', '/register/lighter'):
