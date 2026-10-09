@@ -16,7 +16,7 @@ import threading
 import time
 from typing import Callable
 
-from .domain import Book, Instrument, OrderIntent, OrderObservation, TradingError, UnknownExecution
+from .domain import Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, TradingError, UnknownExecution
 
 
 RH_URL = "https://api.rh.lighter.xyz"
@@ -340,8 +340,24 @@ the durable engine must only call lookup(), including after a process restart.
             raise TradingError("Размер или цена превышают предел signer Lighter.")
 
     def submit(self, intent: OrderIntent) -> OrderObservation:
-        self._validate_intent(intent)
-        return self._run(lambda: self._submit(intent), writing=True)
+        # The engine may classify a pure preparation failure as a zero-fill
+        # rejection. This classification is never allowed for a client ID that
+        # was submitted or observed on the exchange, even when its intent has
+        # since expired or the new response is incomplete.
+        with self._lock:
+            index = None
+            try:
+                index = client_order_index(intent.client_id)
+                if index in self._submitted or index in self._observed_ids:
+                    raise UnknownExecution("Операция Lighter уже существует. Выполните сверку исполнения.")
+                self._validate_intent(intent)
+                return self._run(lambda: self._submit(intent), writing=True)
+            except Exception as error:
+                if index in self._submitted or index in self._observed_ids:
+                    raise UnknownExecution("Исполнение Lighter не подтверждено. Повтор отправки запрещён до сверки.") from None
+                if isinstance(error, TradingError):
+                    raise PreSubmissionError(str(error)) from None
+                raise PreSubmissionError("Ордер Lighter не был отправлен: не удалось завершить предварительную проверку.") from None
 
     async def _submit(self, intent):
         self._validate_intent(intent)

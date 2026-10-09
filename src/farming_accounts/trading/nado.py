@@ -411,6 +411,23 @@ class NadoGateway:
         self._contracts = (_integer(contracts.get("chain_id"), minimum=1), _address(contracts.get("endpoint_addr")))
         self._account()
 
+    def execution_ready(self, instrument):
+        """Prove the linked signer can monitor this live market, without an order.
+
+        The public linked-signer query alone does not prove permission to the
+        authenticated order-update stream. Preflight must test its handshake.
+        """
+        self.verify()
+        self._instrument(instrument)
+        try:
+            with self.stream_factory(self.transport.websocket, self.signer, self.sender, instrument,
+                                     self._contracts[0], self._contracts[1], self.clock):
+                pass
+        except TradingError:
+            raise
+        except Exception:
+            raise TradingError("Не удалось проверить поток исполнений Nado. Торговля ещё не готова.") from None
+
     def instruments(self):
         result, ids, assets = [], set(), set()
         for key, item in _obj(self.transport.symbols()).items():

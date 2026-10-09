@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from farming_accounts.trading.domain import OrderIntent, TradingError, UnknownExecution
+from farming_accounts.trading.domain import OrderIntent, PreSubmissionError, TradingError, UnknownExecution
 from farming_accounts.trading.lighter import (
     LighterCredentials, LighterRegistration, LighterVenue, RH_CHAIN_ID, RH_URL,
     client_order_index, generate_api_key,
@@ -34,6 +34,9 @@ class FakeSDK:
         self.api_error = None
         self.order_error = None
         self.check_error = None
+        self.sign_error = None
+        self.nonce_error = None
+        self.post_code = 200
         self.orders = []
         self.trade_rows = []
         self.positions = []
@@ -102,17 +105,21 @@ class FakeSDK:
                     asks=[dict(price="100.03", remaining_base_amount="3.0000")])
 
     async def next_nonce(self, **kwargs):
+        if self.nonce_error:
+            raise self.nonce_error
         return dict(code=200, nonce=51)
 
     def sign_create_order(self, **kwargs):
         self.signs.append(kwargs)
+        if self.sign_error:
+            return None, None, None, self.sign_error
         return 14, '{"signed":true}', "tx-hash", None
 
     async def send_tx(self, **kwargs):
         self.posts.append(kwargs)
         if self.order_error:
             raise self.order_error
-        return dict(code=200, tx_hash="tx-hash")
+        return dict(code=self.post_code, tx_hash="tx-hash")
 
     async def trades(self, **kwargs):
         return dict(code=200, trades=self.trade_rows)
@@ -215,9 +222,37 @@ class LighterAdapterTests(unittest.TestCase):
         for intent in (replace(self.intent, quantity=Decimal("1.23456")),
                        replace(self.intent, limit_price=Decimal("99.999")),
                        replace(self.intent, expiry=999)):
-            with self.assertRaises(TradingError):
+            with self.assertRaises(PreSubmissionError):
                 self.adapter.submit(intent)
         self.assertEqual(self.sdk.posts, [])
+
+    def test_presigning_rejection_proves_no_post_or_fill(self):
+        self.sdk.sign_error = "sensitive native error " + PRIVATE
+        with self.assertRaises(PreSubmissionError) as caught:
+            self.adapter.submit(self.intent)
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.assertEqual(self.sdk.posts, [])
+
+    def test_nonce_failure_proves_no_post_or_fill(self):
+        self.sdk.nonce_error = TimeoutError(PRIVATE)
+        with self.assertRaises(PreSubmissionError) as caught:
+            self.adapter.submit(self.intent)
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.assertEqual(self.sdk.posts, [])
+
+    def test_post_error_code_stays_unknown_and_cannot_be_zero_rejection(self):
+        self.sdk.post_code = 400
+        with self.assertRaises(UnknownExecution):
+            self.adapter.submit(self.intent)
+        self.assertEqual(len(self.sdk.posts), 1)
+
+    def test_expired_prior_uncertain_submission_does_not_become_zero_rejection(self):
+        self.sdk.order_error = TimeoutError()
+        with self.assertRaises(UnknownExecution):
+            self.adapter.submit(self.intent)
+        with self.assertRaises(UnknownExecution):
+            self.adapter.submit(replace(self.intent, expiry=999))
+        self.assertEqual(len(self.sdk.posts), 1)
 
     def test_uncertain_post_is_not_retried_even_on_same_client_id(self):
         self.sdk.order_error = TimeoutError("sensitive response " + PRIVATE)

@@ -156,6 +156,36 @@ class NadoTradingTests(unittest.TestCase):
             self.gateway.verify()
         self.assertFalse(any(c[0] == "execute" for c in self.transport.calls))
 
+    def test_execution_ready_subscribes_and_closes_without_orders(self):
+        actions = []
+        class ProbeStream(FakeStream):
+            def __enter__(self):
+                actions.append("authenticated_subscriptions")
+                return self
+            def __exit__(self, *args):
+                actions.append("closed")
+            def collect(self, *args):
+                raise AssertionError("Preflight does not collect order fills.")
+        self.gateway.stream_factory = ProbeStream
+        self.gateway.execution_ready(self.instrument)
+        self.assertEqual(actions, ["authenticated_subscriptions", "closed"])
+        self.assertFalse(any(c[0] == "execute" for c in self.transport.calls))
+
+    def test_execution_ready_reports_stream_authorization_rejection(self):
+        class RejectedStream(FakeStream):
+            def __enter__(self):
+                raise TradingError("Nado не авторизовал поток linked signer.")
+        self.gateway.stream_factory = RejectedStream
+        with self.assertRaisesRegex(TradingError, "не авторизовал"):
+            self.gateway.execution_ready(self.instrument)
+        self.assertFalse(any(c[0] == "execute" for c in self.transport.calls))
+
+    def test_execution_ready_checks_current_market_rules_before_stream(self):
+        self.transport.metadata["wSPYx"]["trading_status"] = "post_only"
+        with self.assertRaisesRegex(TradingError, "запрещены"):
+            self.gateway.execution_ready(self.instrument)
+        self.assertFalse(any(c[0] == "execute" for c in self.transport.calls))
+
     def test_master_wallet_key_is_rejected(self):
         signer = FakeSigner()
         signer.address = OWNER
