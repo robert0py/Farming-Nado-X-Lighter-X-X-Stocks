@@ -106,7 +106,6 @@ class AccountPanel:
         dialog = self.dialog = tk.Toplevel(self.app.root)
         dialog.title('Подключить ' + self.title)
         dialog.configure(bg=PANEL)
-        set_dark_titlebar(dialog)
         dialog.transient(self.app.root)
         dialog.geometry('570x390')
         dialog.minsize(520, 380)
@@ -143,6 +142,8 @@ class AccountPanel:
         link.bind('<Button-1>', lambda event: webbrowser.open(url))
         link.bind('<Return>', lambda event: webbrowser.open(url))
         self.render_controls()
+        # Transient/resizable configuration can recreate the native window handle.
+        set_dark_titlebar(dialog)
         self.address_entry.focus_set()
 
     def close_dialog(self):
