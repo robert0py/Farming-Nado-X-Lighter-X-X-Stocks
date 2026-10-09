@@ -402,12 +402,8 @@ class Application:
         self.lighter.frame.grid(row=0, column=1, sticky='nsew', padx=(8, 0))
         self.trading_page = tk.Frame(self.pages, bg=BG)
         self.trading_page.grid(row=0, column=0, sticky='nsew')
-        trading_content = tk.Frame(self.trading_page, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
-        trading_content.pack(fill='x')
-        label(trading_content, 'Торговое исполнение не подключено', size=17, bold=True).pack(anchor='w', padx=24, pady=(24, 12))
-        label(trading_content, 'Открытие и закрытие хеджированных позиций ещё не реализовано.\nПодключение аккаунтов и реальные балансы доступны в разделе «Баланс».',
-              color=MUTED, anchor='w', justify='left', wraplength=700).pack(fill='x', padx=24, pady=(0, 20))
-        ttk.Button(trading_content, text='Перейти к балансу', command=lambda: self.navigate('balance')).pack(anchor='w', padx=24, pady=(0, 24))
+        from .trade_ui import TradingPanel
+        self.trading = TradingPanel(self, self.trading_page)
         logs = tk.Frame(main, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
         logs.pack(fill='x', padx=22, pady=(12, 0))
         self.logs_button = tk.Button(logs, text='События подключения  ▸', bg=PANEL, fg=MUTED, activebackground=FIELD,
@@ -418,7 +414,7 @@ class Application:
                                  padx=12, pady=6, state='disabled', wrap='word', takefocus=False)
         self.logs_text.tag_configure('error', foreground=RED)
         self.logs_open = False
-        label(main, 'Публичный просмотр · секретные ключи не требуются · данные хранятся только в памяти',
+        label(main, 'Баланс: публичное чтение · торговля: отдельные зашифрованные ключи · управление независимым worker',
               color=MUTED, size=8, anchor='w').pack(fill='x', padx=22, pady=(10, 12))
         self.navigate('balance')
         self.render_balances()
@@ -520,6 +516,7 @@ class Application:
         self.root.after_cancel(self.poll_id)
         for panel in (self.nado, self.lighter):
             panel.close_dialog()
+        self.trading.close()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 

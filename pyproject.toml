@@ -4,10 +4,16 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "farming-accounts"
-version = "0.2.0"
-description = "Read-only desktop account viewer for Nado and Lighter on Robinhood Chain"
+version = "0.3.0"
+description = "Desktop control and durable spot/perpetual hedge worker for Nado and Robinhood Lighter"
 requires-python = ">=3.11"
 dependencies = []
+
+[project.optional-dependencies]
+trading = ["lighter-sdk==1.1.6", "eth-account==0.13.7", "cryptography==50.0.2"]
+
+[project.scripts]
+hedge-worker = "farming_accounts.worker:main"
 
 [project.gui-scripts]
 farming-accounts = "farming_accounts.app:main"
