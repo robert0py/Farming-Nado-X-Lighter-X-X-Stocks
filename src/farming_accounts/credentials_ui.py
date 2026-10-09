@@ -68,10 +68,10 @@ class CredentialsDialog:
         label(body, 'Как подключить торговый доступ?', bold=True, size=16).pack(anchor='w', pady=(0, 12))
         self.mode = tk.StringVar(value='wallet')
         style = ttk.Style(dialog)
-        style.configure('Key.TRadioButton', background=PANEL, foreground=INK, font=('Segoe UI', 10))
-        style.map('Key.TRadioButton', background=[('active', FIELD)], foreground=[('active', INK)])
+        style.configure('Key.TRadiobutton', background=PANEL, foreground=INK, font=('Segoe UI', 10))
+        style.map('Key.TRadiobutton', background=[('active', FIELD)], foreground=[('active', INK)])
         for value, title in (('wallet', 'Создать отдельный ключ через кошелёк'), ('existing', 'У меня уже есть зарегистрированный ключ')):
-            ttk.Radiobutton(body, text=title, value=value, variable=self.mode, command=self.change_mode, style='Key.TRadioButton').pack(anchor='w', pady=4)
+            ttk.Radiobutton(body, text=title, value=value, variable=self.mode, command=self.change_mode, style='Key.TRadiobutton').pack(anchor='w', pady=4)
         self.instructions = label(body, '', color=MUTED, size=10, wraplength=640, justify='left', anchor='w')
         self.instructions.pack(fill='x', pady=(12, 16))
         saved = panel.data.get('credentials', {}).get(venue, {})
