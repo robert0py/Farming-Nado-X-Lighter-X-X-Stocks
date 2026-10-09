@@ -1,9 +1,11 @@
 """Native desktop shell with real account data only."""
 
 import argparse
+import ctypes
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import queue
+import sys
 import time
 import tkinter as tk
 from tkinter import ttk
@@ -26,7 +28,7 @@ BLUE = '#69B4FF'
 REFRESH_SECONDS = 30
 
 
-def label(parent, text='', *, size=10, color=INK, bold=False, **options):
+def label(parent, text='', *, size=11, color=INK, bold=False, **options):
     return tk.Label(parent, text=text, bg=parent.cget('bg'), fg=color,
                     font=('Segoe UI', size, 'bold' if bold else 'normal'), **options)
 
@@ -64,7 +66,7 @@ class AccountPanel:
         self.connect_button.pack(side='right')
         self.settings_button = ttk.Button(header, text='⋯', width=3, command=self.open_dialog)
         self.settings_button.pack(side='right', padx=(0, 7))
-        label(header, self.title, size=16, bold=True).pack(side='left')
+        label(header, self.title, size=17, bold=True).pack(side='left')
         divider(self.frame).pack(fill='x')
         content = tk.Frame(self.frame, bg=PANEL)
         content.pack(fill='x', padx=18, pady=(7, 0))
@@ -76,8 +78,8 @@ class AccountPanel:
         for key, title in rows:
             row = tk.Frame(content, bg=PANEL)
             row.pack(fill='x')
-            label(row, title, color=MUTED, size=10).pack(side='left', pady=8)
-            value = label(row, '—', size=10, anchor='e')
+            label(row, title, color=MUTED, size=11).pack(side='left', pady=8)
+            value = label(row, '—', size=11, anchor='e')
             value.pack(side='right', pady=8)
             self.values[key] = value
             divider(content).pack(fill='x')
@@ -325,6 +327,7 @@ class Application:
         root.geometry(f'{width}x{height}')
         root.minsize(1060, 700)
         root.configure(bg=BG)
+        set_dark_titlebar(root)
         self.configure_styles()
         sidebar = tk.Frame(root, bg=SIDEBAR, width=176, highlightbackground=LINE, highlightthickness=1)
         sidebar.pack(side='left', fill='y')
@@ -333,7 +336,7 @@ class Application:
         divider(sidebar).pack(fill='x', pady=(0, 16))
         self.nav_buttons = {}
         for key, text in (('balance', '▦   Баланс'), ('trading', '⇄   Торговля')):
-            button = tk.Button(sidebar, text=text, font=('Segoe UI', 11), anchor='w', relief='flat', bd=0,
+            button = tk.Button(sidebar, text=text, font=('Segoe UI', 12), anchor='w', relief='flat', bd=0,
                                padx=14, pady=12, fg=INK, bg=SIDEBAR, activebackground=FIELD, activeforeground=INK,
                                command=lambda selected=key: self.navigate(selected), cursor='hand2')
             button.pack(fill='x', padx=10, pady=3)
@@ -369,16 +372,21 @@ class Application:
         divider(section).pack(fill='x')
         table_frame = tk.Frame(section, bg=PANEL)
         table_frame.pack(fill='both', expand=True, padx=18, pady=(12, 0))
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
         columns = ('venue', 'symbol', 'amount', 'locked', 'margin', 'underlying')
         self.table = ttk.Treeview(table_frame, columns=columns, show='headings', height=5, selectmode='browse')
         headings = ('Площадка', 'Актив', 'Токены', 'Заблокировано', 'Маржа', 'Экв. xStock')
         for index, column in enumerate(columns):
             self.table.heading(column, text=headings[index])
             self.table.column(column, width=128, minwidth=92, anchor='w' if index < 2 else 'e')
-        self.table.pack(side='left', fill='both', expand=True)
+        self.table.grid(row=0, column=0, sticky='nsew')
         scrollbar = ttk.Scrollbar(table_frame, orient='vertical', command=self.table.yview)
-        scrollbar.pack(side='right', fill='y')
+        scrollbar.grid(row=0, column=1, sticky='ns')
         self.table.configure(yscrollcommand=scrollbar.set)
+        horizontal = ttk.Scrollbar(table_frame, orient='horizontal', command=self.table.xview)
+        horizontal.grid(row=1, column=0, sticky='ew')
+        self.table.configure(xscrollcommand=horizontal.set)
         self.empty_message = label(section, '', color=MUTED, anchor='w', justify='left', wraplength=800, size=9)
         self.empty_message.pack(fill='x', padx=18, pady=(8, 6))
         label(section, 'Nado: стоимость учитывает позиции и долги. Токены USDT0 не означают сумму, доступную для вывода.',
@@ -432,13 +440,16 @@ class Application:
         self.root.option_add('*TCombobox*Listbox.background', FIELD)
         self.root.option_add('*TCombobox*Listbox.foreground', INK)
         style.configure('Treeview', background=PANEL, fieldbackground=PANEL, foreground=INK,
-                        rowheight=32, font=('Consolas', 10), borderwidth=0)
+                        rowheight=34, font=('Consolas', 11), borderwidth=0,
+                        bordercolor=LINE, lightcolor=LINE, darkcolor=LINE)
         style.map('Treeview', background=[('selected', '#2A3644')], foreground=[('selected', INK)])
-        style.configure('Treeview.Heading', background=FIELD, foreground=MUTED, font=('Segoe UI', 9),
+        style.configure('Treeview.Heading', background=FIELD, foreground=MUTED, font=('Segoe UI', 10),
                         padding=(6, 8), relief='flat')
         style.map('Treeview.Heading', background=[('active', FIELD)])
-        style.configure('Vertical.TScrollbar', background=FIELD, troughcolor=PANEL, bordercolor=PANEL,
-                        arrowcolor=MUTED, lightcolor=FIELD, darkcolor=FIELD)
+        for orientation in ('Vertical', 'Horizontal'):
+            style.configure(orientation + '.TScrollbar', background=FIELD, troughcolor=PANEL, bordercolor=PANEL,
+                            arrowcolor=MUTED, lightcolor=FIELD, darkcolor=FIELD, borderwidth=0)
+            style.map(orientation + '.TScrollbar', background=[('active', '#3A424A'), ('!active', FIELD)])
 
     def navigate(self, page):
         if page not in ('balance', 'trading'):
@@ -506,6 +517,19 @@ class Application:
             panel.close_dialog()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
+
+
+def set_dark_titlebar(window):
+    """Ask DWM for dark chrome on this app only; retain normal OS window controls."""
+    if sys.platform != 'win32':
+        return
+    try:
+        window.update_idletasks()
+        handle = ctypes.windll.user32.GetParent(window.winfo_id())
+        enabled = ctypes.c_int(1)
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(handle, 20, ctypes.byref(enabled), ctypes.sizeof(enabled))
+    except (AttributeError, OSError):
+        pass
 
 
 def main():
