@@ -20,7 +20,7 @@ FIELDS = (('notional_per_leg', 'Размер каждой стороны, в в�
           ('residual_notional', 'Допустимая остаточная экспозиция, в котировке'),
           ('margin_reserve', 'Резерв средств на каждой площадке'),
           ('max_loss_quote', 'Лимит оценки убытка цикла, в котировке'),
-          ('max_unhedged_seconds', 'Макс. время без полного хеджа, секунд'),
+          ('max_unhedged_seconds', 'Лимит времени без хеджа, секунд (> 10)'),
           ('quote_max_age_seconds', 'Макс. возраст полученного стакана, секунд'),
           ('hold_hours', 'Удержание сформированного хеджа, часов'))
 
@@ -158,7 +158,7 @@ class TradingPanel:
                 return client, client.request('/status')
             def connected(result):
                 self.client, self.data = result
-                Vault(state_directory()).update(lambda value: value.update(remote_control={'url': values[0], 'token': values[1]}))
+                Vault(state_directory() / 'desktop').update(lambda value: value.update(remote_control={'url': values[0], 'token': values[1]}))
                 token.delete(0, 'end')
                 dialog.destroy()
                 self.worker_label.configure(text='Торговля: VPS ' + values[0])
@@ -167,7 +167,7 @@ class TradingPanel:
             self.work(job, connected)
         ttk.Button(content, text='Подключить', command=connect, style='Primary.TButton').pack(anchor='w', pady=(15, 0))
         try:
-            saved = Vault(state_directory()).load().get('remote_control', {})
+            saved = Vault(state_directory() / 'desktop').load().get('remote_control', {})
             url.insert(0, saved.get('url', ''))
             token.insert(0, saved.get('token', ''))
         except VaultError:

@@ -48,6 +48,8 @@ def strategy(value: dict, *, clock=time.time) -> Strategy:
         values = {name: Decimal(str(value[name])) for name in DECIMAL_FIELDS}
         values.update({name: int(str(value.get(name, 43200 if name == 'hold_seconds' else '')))
                        for name in INTEGER_FIELDS})
+        if values['max_unhedged_seconds'] <= 10:
+            raise TradingError('Максимальное время без хеджа должно быть больше 10 секунд: worker учитывает интервалы API.')
         if not isinstance(value['assets'], list):
             raise TradingError('Разрешённые активы должны быть списком базовых символов.')
         assets = tuple(str(asset).strip().upper() for asset in value['assets'])

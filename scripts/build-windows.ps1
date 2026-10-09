@@ -17,6 +17,8 @@ try {
     $desktopExecutable = (Resolve-Path -LiteralPath (Join-Path $OutputDirectory 'Farming-Accounts.exe')).Path
     $checkProcess = Start-Process -FilePath $desktopExecutable -ArgumentList '--self-check' -WindowStyle Hidden -PassThru -Wait
     if ($checkProcess.ExitCode -ne 0) { throw 'Packaged application self-check failed' }
+    $signerCheck = Start-Process -FilePath $desktopExecutable -ArgumentList '--signer-self-check' -WindowStyle Hidden -PassThru -Wait
+    if ($signerCheck.ExitCode -ne 0) { throw 'Packaged trading signer self-check failed' }
     $checksum = (Get-FileHash -LiteralPath $desktopExecutable -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -LiteralPath (Join-Path $OutputDirectory 'SHA256SUMS.txt') -Value "$checksum  Farming-Accounts.exe" -Encoding ascii
     Write-Output "Built and verified: $desktopExecutable"
