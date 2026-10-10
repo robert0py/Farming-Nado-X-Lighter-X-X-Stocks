@@ -34,6 +34,47 @@ AUTH_FIELDS = [("sender", "bytes32"), ("expiration", "uint64")]
 CANCEL_FIELDS = [("sender", "bytes32"), ("productIds", "uint32[]"), ("digests", "bytes32[]"), ("nonce", "uint64")]
 QUERY_TYPES = {"contracts", "linked_signer", "nonces", "subaccount_info", "market_liquidity",
                "fee_rates", "max_order_size", "subaccount_orders", "order"}
+MAKER_REPRICE_SECONDS = 300
+
+# Only exchange-defined numeric codes become user-facing diagnostics. The raw
+# response can contain reflected request data and must never enter the journal.
+ORDER_REJECTIONS = {
+    1000: "Nado ограничил частоту запросов. Дождитесь паузы API.",
+    1015: "Nado ограничил частоту запросов. Дождитесь паузы API.",
+    1001: "Nado ограничил торговый доступ аккаунта. Проверьте статус на площадке.",
+    1002: "Nado ограничил торговый доступ из текущего региона.",
+    1003: "Nado ограничил торговый доступ из текущего региона.",
+    1004: "Nado временно недоступен из-за обслуживания.",
+    2000: "Nado изменил допустимый шаг цены. Обновите параметры рынка.",
+    2001: "Nado изменил допустимый шаг количества. Обновите параметры рынка.",
+    2003: "Ордер меньше допустимого количества Nado.",
+    2004: "Срок действия ордера Nado истёк до отправки.",
+    2006: "Nado отклонил ордер из-за недостаточного обеспечения аккаунта.",
+    2008: "Цена изменилась: maker-ордер Nado пересекает стакан.",
+    2009: "Nado не поддерживает этот тип ордера на выбранном рынке.",
+    2011: "Nado получил ордер после допустимого времени отправки.",
+    2012: "Nado получил ордер раньше допустимого времени отправки.",
+    2013: "Nado уже знает этот ордер. Требуется сверка; повтор запрещён.",
+    2017: "Nado отклонил spot-ордер: для исполнения потребовался бы заём.",
+    2028: "Nado отклонил подпись. Проверьте текущую привязку ключа бота.",
+    2031: "Nado не смог полностью исполнить ордер Fill-or-Kill.",
+    2036: "На Nado недостаточно обеспечения для этого ордера.",
+    2064: "Nado отклонил ордер: он увеличивает позицию вместо закрытия.",
+    2067: "Nado разрешает reduce-only только для taker-ордеров.",
+    2068: "Nado временно недоступен из-за обслуживания.",
+    2069: "Nado временно запретил торговлю выбранным активом.",
+    2094: "Стоимость ордера меньше текущего минимума Nado.",
+    2117: "Nado принимает на этом рынке только maker-ордера.",
+    2119: "Nado принимает на этом рынке только закрытие позиций.",
+    2135: "Nado отклонил ордер из-за недостаточного лимита комиссии.",
+}
+
+
+def _rejection(result):
+    raw_code = result.get('error_code')
+    code = raw_code if isinstance(raw_code, int) and not isinstance(raw_code, bool) and 0 <= raw_code <= 999999 else None
+    reason = ORDER_REJECTIONS.get(code, "Nado отклонил ордер. Проверьте статус аккаунта и выбранного рынка.")
+    return {'venue': VENUE, 'code': code, 'reason': reason}
 
 
 def _obj(value):
@@ -537,7 +578,10 @@ class NadoGateway:
                    # Appendix v1: order type is bits 9..10 (IOC=1, FOK=2);
                    # bit11 is reduce-only. These flags are part of the signature.
                    "appendix": 1 | ((3 if intent.post_only else 1 if intent.reduce_only else 2) << 9)
-                               | ((1 << 11) if intent.reduce_only else 0)}
+                               # Nado rejects reduce-only makers (error2067).
+                               # Logical spot reduction is enforced below by
+                               # owned quantity and spot_leverage=false.
+                               | ((1 << 11) if intent.reduce_only and not intent.post_only else 0)}
         if self._contracts is None:
             contracts = self.transport.query({"type": "contracts"})
             self._contracts = (_integer(contracts.get("chain_id"), minimum=1), _address(contracts.get("endpoint_addr")))
@@ -574,7 +618,7 @@ class NadoGateway:
         maximum = self.transport.query({"type": "max_order_size", "sender": self.sender,
                                        "product_id": intent.instrument.id, "price_x18": str(_scaled(intent.limit_price)),
                                        "direction": "long" if intent.side == "buy" else "short",
-                                       "spot_leverage": "false", "reduce_only": str(intent.reduce_only).lower()})
+                                       "spot_leverage": "false", "reduce_only": str(intent.reduce_only and not intent.post_only).lower()})
         if abs(_x18(maximum.get("max_order_size"))) < intent.quantity:
             raise TradingError("Размер spot-ордера превышает лимит Nado без займа.")
         return baseline
@@ -599,13 +643,18 @@ class NadoGateway:
                     if not any(saved == intent for _, saved, _ in self.journal.orders(intent.cycle_id)):
                         raise TradingError('Maker-intent отсутствует в постоянном журнале. Ордер не отправлен.')
                     self.journal.set('maker:' + intent.client_id, {'baseline': str(baseline), 'digest': digest,
-                                                                 'cancel_state': None})
+                                                                 'submitted_at': self.clock(), 'cancel_state': None})
             except Exception as error:
                 message = str(error) if isinstance(error, TradingError) else "Подготовка Nado не выполнена. Ордер не отправлен."
                 raise PreSubmissionError(message) from None
             # No exception from this point can claim the order was never sent.
             result = self.transport.execute({"place_order": payload})
             if result.get("status") == "failure":
+                rejection = _rejection(result)
+                if self.journal:
+                    self.journal.set('rejection:' + intent.client_id, rejection)
+                if rejection['code'] == 2013:
+                    raise UnknownExecution(rejection['reason'])
                 return OrderObservation(intent.client_id, "REJECTED", Decimal(0), exchange_id=digest)
             if result.get("status") != "success" or _obj(result.get("data")).get("digest") != digest:
                 raise UnknownExecution("Nado не подтвердил digest ордера. Повторная отправка запрещена.")
@@ -651,13 +700,46 @@ class NadoGateway:
         self.journal.set('maker:' + intent.client_id, record)
         return record
 
+    def request_cancel(self, intent):
+        """Ask to cancel only a durably saved maker; never repeat an uncertain write."""
+        if not intent.post_only or self.journal is None:
+            raise TradingError('Отмена разрешена только для сохранённого maker-ордера Nado.')
+        record = self.journal.get('maker:' + intent.client_id)
+        if record is None:
+            raise UnknownExecution('Нет сохранённой операции maker Nado. Требуется сверка без повторной отправки.')
+        record['cancel_requested'] = True
+        self.journal.set('maker:' + intent.client_id, record)
+        return self.lookup(intent)
+
     def lookup(self, intent):
         _, _, digest = self._order(intent)
         record = self.journal.get('maker:' + intent.client_id) if intent.post_only and self.journal else None
         if record and record['digest'] != digest:
             raise UnknownExecution('Digest maker-ордера отличается от сохранённого журнала.')
-        if record and record.get('cancel_state') is None and digest in self.open_orders(intent.instrument):
-            record = self._cancel_maker(intent, digest, record)
+        if record:
+            live = self.open_orders(intent.instrument)
+            if digest in live:
+                if any(other != digest for other in live):
+                    raise UnknownExecution('На рынке Nado есть посторонние ордера. Требуется сверка.')
+                actual = self.position(intent.instrument)
+                baseline = Decimal(record['baseline'])
+                # A stream timeout is not an order timeout. An unfilled maker
+                # remains on the exchange between polls and through restart.
+                # Any balance change makes us cancel only our remaining amount
+                # immediately; positive fills still require archive proof.
+                placed = float(record.get('submitted_at', intent.expiry - 90))
+                wait = 20 if intent.reduce_only else MAKER_REPRICE_SECONDS
+                due = (record.get('cancel_requested') is True or actual != baseline
+                       or self.clock() >= placed + wait or self.clock() >= intent.expiry)
+                if record.get('cancel_state') is None and due:
+                    record = self._cancel_maker(intent, digest, record)
+                else:
+                    # A lost cancellation reply or changed balance cannot reset
+                    # previously observed partial fills to zero. Reconcile only;
+                    # no second cancellation is submitted after INTENT.
+                    if record.get('cancel_state') is None and actual == baseline:
+                        return OrderObservation(intent.client_id, 'PENDING', Decimal(0), exchange_id=digest)
+                    return None
         if record and record.get('cancel_state') == 'CONFIRMED' and Decimal(record['filled']) == 0:
             if not self.open_orders(intent.instrument) and self.position(intent.instrument) == Decimal(record['baseline']):
                 return OrderObservation(intent.client_id, 'CANCELLED', Decimal(0), exchange_id=digest)

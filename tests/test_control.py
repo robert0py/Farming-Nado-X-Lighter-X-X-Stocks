@@ -44,6 +44,32 @@ class ControlTests(unittest.TestCase):
         with self.assertRaises(ControlError):
             ControlClient(self.url, 'bad_token_' * 5).request('/status')
 
+    def test_status_exposes_durable_order_progress_without_private_payloads(self):
+        from dataclasses import replace
+        from decimal import Decimal
+        from farming_accounts.trading.domain import Instrument, OrderIntent, OrderObservation
+        instrument = Instrument('nado', 'SPY', 117, 'wSPYx', 'spot', Decimal('.002'),
+                                Decimal('.01'), Decimal(0), Decimal(100), Decimal(1))
+        intent = OrderIntent('progress', 'current', 'nado', instrument, 'buy', Decimal('.134'),
+                             Decimal('780.72'), False, 7, 1800000900, True)
+        self.runtime.journal.save_cycle({'id': 'current', 'state': 'OPENING_SPOT'})
+        for sequence in range(20):
+            previous = replace(intent, client_id='previous-' + str(sequence))
+            self.runtime.journal.put_intent(previous, 'open_spot')
+            self.runtime.journal.observe(OrderObservation(previous.client_id, 'CANCELLED', Decimal(0)))
+        self.runtime.journal.put_intent(intent, 'open_spot')
+        self.runtime.journal.observe(OrderObservation('progress', 'PENDING', Decimal(0),
+                                                     exchange_id='0x' + 'ab' * 32))
+        self.runtime.journal.set('maker:progress', {'baseline': 'private-baseline', 'signature': 'private-signature'})
+        status = self.client.request('/status')
+        self.assertEqual(len(status['orders']), 1)
+        self.assertEqual(len(self.runtime.journal.orders('current')), 21)
+        self.assertEqual(status['orders'][0]['status'], 'PENDING')
+        self.assertEqual(status['orders'][0]['exchange_id'], '0x' + 'ab' * 32)
+        self.assertEqual(status['orders'][0]['filled_quantity'], '0')
+        self.assertNotIn('private-', str(status))
+        self.assertNotIn('nonce', status['orders'][0])
+
     def test_failed_reverification_removes_stale_green_status(self):
         self.runtime.verified['nado'] = True
         gateway = Mock()

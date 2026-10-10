@@ -118,6 +118,197 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.nado.requests[-1].limit_price, D(201))
         self.assertTrue(self.nado.requests[-1].post_only)
 
+    def test_zero_fill_maker_attempt_waits_in_same_cycle_without_starting_hold(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.responses.append('CANCELLED')
+        self.engine.start()
+        self.engine.tick()
+        cycle = self.engine.status()['cycle']
+        self.assertEqual(cycle['state'], 'OPENING_SPOT')
+        self.assertIsNone(cycle['hedged_at'])
+        self.assertIsNone(cycle['deadline'])
+        self.assertIsNone(cycle['unhedged_since'])
+        self.assertEqual(self.lighter.requests, [])
+        identity = cycle['id']
+        self.clock.value += self.strategy.max_unhedged_seconds + 1
+        self.engine.tick()
+        self.assertEqual(self.engine.status()['cycle']['id'], identity)
+        self.assertEqual(len(self.journal.history()), 1)
+        self.assertTrue(self.engine.status()['running'])
+        self.assertEqual(self.nado.requests[1].instrument.underlying, self.nado.requests[0].instrument.underlying)
+        for _ in range(2):
+            self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'HEDGED')
+        self.assertEqual(self.engine.status()['cycle']['deadline'], self.clock() + self.strategy.hold_seconds)
+
+    def test_resting_maker_order_never_creates_fake_closed_cycles_or_another_order(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.responses.append('PENDING')
+        self.engine.start()
+        self.engine.tick()
+        intent = self.nado.requests[0]
+        self.assertEqual(self.engine.status()['state'], 'OPENING_SPOT')
+        self.assertEqual(intent.expiry, int(self.clock()) + 900)
+        self.assertEqual((intent.nonce >> 20) // 1000, int(self.clock()) + 90)
+        self.clock.value += 120
+        for _ in range(20):
+            self.engine.tick()
+        cycle = self.engine.status()['cycle']
+        self.assertEqual(cycle['state'], 'OPENING_SPOT')
+        self.assertIsNone(cycle['deadline'])
+        self.assertIsNone(cycle['unhedged_since'])
+        self.assertEqual(len(self.journal.history()), 1)
+        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(self.lighter.requests, [])
+
+    def test_stop_new_cancels_only_own_pending_maker_without_claiming_a_completed_hedge(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.responses.append('PENDING')
+        self.engine.start()
+        self.engine.tick()
+        cancelled = []
+        def cancel(intent):
+            cancelled.append(intent.client_id)
+            return OrderObservation(intent.client_id, 'CANCELLED', D(0))
+        self.nado.request_cancel = cancel
+        self.engine.stop_new_cycles()
+        self.engine.tick()
+        self.assertEqual(cancelled, [self.nado.requests[0].client_id])
+        self.assertEqual(self.engine.status()['state'], 'CLOSED')
+        self.assertEqual(self.engine.status()['cycle']['outcome'], 'NOT_OPENED')
+        self.assertIsNone(self.engine.status()['cycle']['deadline'])
+        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(self.lighter.requests, [])
+
+    def test_old_pending_ack_does_not_hide_a_current_unknown_execution(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.responses.append('PENDING')
+        self.engine.start()
+        self.engine.tick()
+        self.nado.lookup = lambda intent: None
+        for _ in range(3):
+            self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'RECOVERY')
+        self.assertNotIn('Ожидаем покупку', self.engine.status()['cycle']['message'])
+        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(self.lighter.requests, [])
+        self.assertIsNone(self.engine.status()['cycle']['deadline'])
+
+    def test_close_and_stop_cancels_pending_zero_fill_and_never_opens_a_hedge(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.responses.append('PENDING')
+        self.engine.start()
+        self.engine.tick()
+        cancelled = []
+        def cancel(intent):
+            cancelled.append(intent.client_id)
+            return OrderObservation(intent.client_id, 'CANCELLED', D(0))
+        self.nado.request_cancel = cancel
+        self.engine.close_and_stop()
+        self.engine.tick()
+        self.assertEqual(cancelled, [self.nado.requests[0].client_id])
+        self.assertEqual(self.engine.status()['cycle']['outcome'], 'NOT_OPENED')
+        self.assertFalse(self.engine.status()['close_requested'])
+        self.assertEqual(self.lighter.requests, [])
+
+    def test_rejected_opening_stops_with_exchange_reason_without_false_hedge_history(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.responses.append('REJECTED')
+        original = self.nado.submit
+        def submit(intent):
+            result = original(intent)
+            self.journal.set('rejection:' + intent.client_id, {'code': 2067, 'reason': 'fixture unsupported order flags'})
+            return result
+        self.nado.submit = submit
+        self.engine.start()
+        for _ in range(4):
+            self.engine.tick()
+        cycle = self.engine.status()['cycle']
+        self.assertEqual(cycle['outcome'], 'REJECTED')
+        self.assertIn('fixture unsupported order flags', cycle['message'])
+        self.assertFalse(self.engine.status()['running'])
+        self.assertIsNone(cycle['deadline'])
+        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(self.lighter.requests, [])
+
+    def test_post_only_cross_reprices_once_after_cooldown_in_same_cycle(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.responses.append('REJECTED')
+        original = self.nado.submit
+        def submit(intent):
+            result = original(intent)
+            if result.status == 'REJECTED':
+                self.journal.set('rejection:' + intent.client_id, {'code': 2008, 'reason': 'fixture post-only crossed'})
+            return result
+        self.nado.submit = submit
+        self.engine.start()
+        self.engine.tick()
+        identity = self.engine.status()['cycle']['id']
+        for _ in range(3):
+            self.engine.tick()
+        self.assertEqual(len(self.nado.requests), 1)
+        self.assertTrue(self.engine.status()['running'])
+        self.clock.value += 11
+        self.engine.tick()
+        self.assertEqual(self.engine.status()['cycle']['id'], identity)
+        self.assertEqual(len(self.nado.requests), 2)
+        self.assertIsNone(self.engine.status()['cycle']['deadline'])
+
+    def test_normal_zero_fill_maker_waits_do_not_exhaust_correction_budget(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.responses.extend(['CANCELLED'] * 20)
+        self.engine.start()
+        for _ in range(20):
+            self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'OPENING_SPOT')
+        self.assertTrue(self.engine.status()['running'])
+        self.assertEqual(len(self.journal.history()), 1)
+        self.assertEqual(len(self.nado.requests), 20)
+        for _ in range(3):
+            self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'HEDGED')
+        self.assertEqual(len(self.lighter.requests), 1)
+
+    def test_maker_reprice_recalculates_quantity_without_exceeding_user_budget(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.responses.append('CANCELLED')
+        self.engine.start()
+        self.engine.tick()
+        self.nado.book = lambda instrument: Book(D(250), D(251), self.clock())
+        self.engine.tick()
+        intent = self.nado.requests[-1]
+        self.assertEqual(intent.quantity, D(8))
+        self.assertLessEqual(intent.quantity * intent.limit_price, self.strategy.notional_per_leg)
+
+    def test_rejected_maker_close_keeps_actual_spot_and_halts_without_repeating(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.hedge()
+        self.nado.responses.append('REJECTED')
+        self.engine.close_and_stop()
+        self.engine.tick()
+        self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'HALTED')
+        self.assertEqual(self.engine.status()['cycle']['spot_quantity'], '10')
+        self.assertEqual(self.nado.positions[1], D(10))
+        self.assertEqual(self.lighter.positions[101], D(0))
+        self.assertTrue(self.nado.requests[-1].reduce_only)
+        self.assertEqual(self.nado.requests[-1].expiry, int(self.clock()) + 90)
+        for _ in range(4):
+            self.engine.tick()
+        self.assertEqual(len(self.nado.requests), 2)
+
+    def test_three_empty_maker_closes_halt_with_remaining_position_intact(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.hedge()
+        self.nado.responses.extend(['CANCELLED'] * 3)
+        self.engine.close_and_stop()
+        for _ in range(5):
+            self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'HALTED')
+        self.assertEqual(self.nado.positions[1], D(10))
+        self.assertEqual(self.lighter.positions[101], D(0))
+        self.assertEqual(len(self.nado.requests), 4)
+
     def test_significant_preexisting_spot_is_never_adopted_as_bot_inventory(self):
         self.engine.strategy = replace(self.strategy, preserve_spot_dust=True)
         self.nado.positions[1] = D('0.5')

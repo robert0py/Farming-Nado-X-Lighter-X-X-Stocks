@@ -96,11 +96,22 @@ class Runtime:
         with self.lock:
             config = self.config()
             state = self.engine.status() if self.engine else {'state': 'NOT_CONFIGURED', 'running': False}
+            cycle = self.journal.active_cycle()
+            orders = {}
+            if cycle:
+                for action, intent, observation in self.journal.orders(cycle['id']):
+                    orders[intent.venue] = {'venue': intent.venue, 'action': action, 'asset': intent.instrument.symbol,
+                                   'side': intent.side, 'quantity': str(intent.quantity),
+                                   'limit_price': str(intent.limit_price), 'post_only': intent.post_only,
+                                   'status': observation.status if observation else 'UNKNOWN',
+                                   'filled_quantity': str(observation.filled_quantity) if observation else None,
+                                   'exchange_id': observation.exchange_id if observation else None,
+                                   'expiry': intent.expiry}
             return {'ok': True, 'version': __version__, 'worker': 'running', 'revision': config.get('revision', 0),
                     'credentials': public_credentials(config), 'verified': self.verified,
                     'pending_registration': self.vault.load().get('pending_registration', {}).get('venue'),
                     'strategy': config.get('strategy'), 'execution': state, 'error': self.error,
-                    'history': self.journal.history(50), 'events': self.journal.events(50)}
+                    'orders': list(orders.values()), 'history': self.journal.history(50), 'events': self.journal.events(50)}
 
     def save_config(self, config, *, replaces_key_for=None):
         config['revision'] = config.get('revision', 0) + 1

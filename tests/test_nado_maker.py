@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from test_nado_trading import FakeSigner, FakeStream, FakeTransport, NOW, OWNER, SENDER, raw
-from farming_accounts.trading.domain import OrderIntent, UnknownExecution
+from farming_accounts.trading.domain import OrderIntent, OrderObservation, UnknownExecution
 from farming_accounts.trading.journal import Journal
 from farming_accounts.trading.nado import NadoGateway
 
@@ -68,7 +68,7 @@ class MakerTests(unittest.TestCase):
         self.gateway.journal = self.journal
         instrument = self.gateway.instruments()[0]
         self.intent = OrderIntent('maker', 'cycle', 'nado', instrument, 'buy', D(1), D(104), False,
-                                  ((NOW + 90) * 1000 << 20) | 7, NOW + 90, post_only=True)
+                                  ((NOW + 90) * 1000 << 20) | 7, NOW + 900, post_only=True)
         self.journal.put_intent(self.intent, 'open_spot')
 
     def tearDown(self):
@@ -79,7 +79,10 @@ class MakerTests(unittest.TestCase):
         return [body['cancel_orders'] for kind, body in self.transport.calls if kind == 'execute' and 'cancel_orders' in body]
 
     def test_cancel_ack_proves_zero_fill_and_passive_signed_flags(self):
-        result = self.gateway.submit(self.intent)
+        pending = self.gateway.submit(self.intent)
+        self.assertEqual((pending.status, pending.filled_quantity), ('PENDING', D(0)))
+        self.assertEqual(self.cancels(), [])
+        result = self.gateway.request_cancel(self.intent)
         self.assertEqual((result.status, result.filled_quantity), ('CANCELLED', D(0)))
         order = self.transport.pending['order']
         self.assertEqual(int(order['appendix']), 1537)
@@ -89,6 +92,85 @@ class MakerTests(unittest.TestCase):
         self.assertEqual(cancellation['domain']['verifyingContract'], '0x' + '56' * 20)
         self.assertEqual(self.gateway.lookup(self.intent).filled_quantity, D(0))
         self.assertEqual(len(self.cancels()), 1)
+
+    def test_unfilled_maker_remains_resting_until_reprice_interval(self):
+        result = self.gateway.submit(self.intent)
+        self.assertEqual(result.status, 'PENDING')
+        self.gateway.clock = lambda: NOW + 299
+        self.assertEqual(self.gateway.lookup(self.intent).status, 'PENDING')
+        self.assertEqual(self.cancels(), [])
+        self.gateway.clock = lambda: NOW + 300
+        result = self.gateway.lookup(self.intent)
+        self.assertEqual((result.status, result.filled_quantity), ('CANCELLED', D(0)))
+        self.assertEqual(len(self.cancels()), 1)
+
+    def test_restart_keeps_same_unfilled_maker_without_resubmission(self):
+        self.gateway.submit(self.intent)
+        self.journal.close()
+        self.journal = Journal(Path(self.temp.name) / 'state.sqlite')
+        gateway = NadoGateway(OWNER, approved_assets=('SPY',), transport=self.transport, signer=self.signer,
+                              clock=lambda: NOW + 30, stream_factory=NoFillStream, journal=self.journal)
+        result = gateway.lookup(self.intent)
+        self.assertEqual((result.status, result.filled_quantity), ('PENDING', D(0)))
+        self.assertEqual(self.cancels(), [])
+        self.assertEqual(sum(kind == 'execute' and 'place_order' in body for kind, body in self.transport.calls), 1)
+
+    def test_disappeared_maker_without_archive_is_unknown_even_after_expiry(self):
+        self.gateway.submit(self.intent)
+        self.transport.orders = []
+        self.gateway.clock = lambda: NOW + 1000
+        self.assertIsNone(self.gateway.lookup(self.intent))
+        self.assertEqual(self.cancels(), [])
+
+    def test_safe_exchange_rejection_records_code_without_reflected_payload(self):
+        self.transport.execute = lambda body: {'status': 'failure', 'error_code': 2008,
+                                               'error': 'secret-reflected-key-and-signature'}
+        result = self.gateway.submit(self.intent)
+        self.assertEqual(result.status, 'REJECTED')
+        rejection = self.journal.get('rejection:' + self.intent.client_id)
+        self.assertEqual(rejection['code'], 2008)
+        self.assertIn('maker', rejection['reason'])
+        self.assertNotIn('secret', str(rejection))
+
+    def test_existing_digest_is_unknown_not_zero_rejection(self):
+        self.transport.execute = lambda body: {'status': 'failure', 'error_code': 2013,
+                                               'error': 'secret-reflected-key-and-signature'}
+        with self.assertRaises(UnknownExecution) as error:
+            self.gateway.submit(self.intent)
+        self.assertIn('сверка', str(error.exception))
+        self.assertNotIn('secret', str(error.exception))
+
+    def test_closing_maker_uses_short_risk_window(self):
+        self.transport.base = D(1)
+        close = replace(self.intent, client_id='close-short-wait', side='sell', reduce_only=True, expiry=NOW + 90)
+        self.journal.put_intent(close, 'close_spot')
+        self.gateway.submit(close)
+        self.gateway.clock = lambda: NOW + 19
+        self.assertEqual(self.gateway.lookup(close).status, 'PENDING')
+        self.assertEqual(self.cancels(), [])
+        self.gateway.clock = lambda: NOW + 20
+        self.assertEqual(self.gateway.lookup(close).status, 'CANCELLED')
+        self.assertEqual(len(self.cancels()), 1)
+
+    def test_maker_spot_sale_omits_unsupported_reduce_flag_but_forbids_borrowing(self):
+        self.transport.base = D(1)
+        close = replace(self.intent, client_id='maker-close', side='sell', reduce_only=True)
+        self.journal.put_intent(close, 'close_spot')
+        self.assertEqual(self.gateway.submit(close).status, 'PENDING')
+        payload = self.transport.pending
+        self.assertEqual(payload['order']['appendix'], '1537')
+        self.assertEqual(payload['order']['amount'], raw(-1))
+        self.assertIs(payload['spot_leverage'], False)
+        maximum = next(body for kind, body in self.transport.calls if kind == 'query' and body['type'] == 'max_order_size')
+        self.assertEqual(maximum['reduce_only'], 'false')
+        self.gateway.request_cancel(close)
+        unavailable = replace(close, client_id='no-owned-spot')
+        self.journal.put_intent(unavailable, 'close_spot')
+        self.transport.base = D('0.5')
+        from farming_accounts.trading.domain import PreSubmissionError
+        with self.assertRaisesRegex(PreSubmissionError, 'имеющегося spot'):
+            self.gateway.submit(unavailable)
+        self.assertEqual(sum(kind == 'execute' and 'place_order' in body for kind, body in self.transport.calls), 1)
 
     def partial_cancel_with_archive(self):
         self.transport.executed_quantity = D('0.4')
@@ -114,7 +196,7 @@ class MakerTests(unittest.TestCase):
         record.pop('filled')
         self.journal.set('maker:' + self.intent.client_id, record)
         self.assertFalse(self.gateway.lookup(self.intent).terminal)
-        self.gateway.clock = lambda: NOW + 100
+        self.gateway.clock = lambda: NOW + 1000
         self.assertTrue(self.gateway.lookup(self.intent).terminal)
         self.assertEqual(len(self.cancels()), 1)
 
@@ -125,19 +207,47 @@ class MakerTests(unittest.TestCase):
             self.gateway.lookup(self.intent)
 
     def test_lost_cancel_reply_is_never_resent_after_restart(self):
+        self.gateway.submit(self.intent)
         self.transport.cancel_error = True
         with self.assertRaises(UnknownExecution):
-            self.gateway.submit(self.intent)
+            self.gateway.request_cancel(self.intent)
         gateway = NadoGateway(OWNER, approved_assets=('SPY',), transport=self.transport, signer=self.signer,
                               clock=lambda: NOW, stream_factory=NoFillStream)
         gateway.journal = self.journal
         self.assertIsNone(gateway.lookup(self.intent))
         self.assertEqual(len(self.cancels()), 1)
 
+    def test_lost_cancel_of_resting_partial_never_regresses_observed_fills(self):
+        pending = self.gateway.submit(self.intent)
+        self.journal.observe(pending, observed_at=NOW)
+        self.transport.base = D('0.4')
+        self.transport.executed_quantity = D('0.4')
+        partial = OrderObservation(self.intent.client_id, 'PENDING', D('0.4'), D(104),
+                                   exchange_id=self.transport.pending['digest'])
+        self.journal.observe(partial, observed_at=NOW + 1)
+        self.transport.cancel_error = True
+        with self.assertRaises(UnknownExecution):
+            self.gateway.request_cancel(self.intent)
+        self.assertIsNone(self.gateway.lookup(self.intent))
+        self.assertEqual(self.journal.orders(self.intent.cycle_id)[0][2].filled_quantity, D('0.4'))
+        self.gateway.clock = lambda: NOW + 301
+        self.assertIsNone(self.gateway.lookup(self.intent))
+        self.assertEqual(len(self.cancels()), 1)
+
+    def test_confirmed_cancel_with_still_resting_partial_cannot_emit_zero(self):
+        self.gateway.submit(self.intent)
+        record = self.journal.get('maker:' + self.intent.client_id)
+        record.update(cancel_state='CONFIRMED', filled='0.4')
+        self.journal.set('maker:' + self.intent.client_id, record)
+        self.transport.base = D('0.4')
+        self.assertIsNone(self.gateway.lookup(self.intent))
+        self.assertEqual(self.cancels(), [])
+
     def test_unrelated_receipt_cannot_prove_zero_fill(self):
+        self.gateway.submit(self.intent)
         self.transport.cancel_other_order = True
         with self.assertRaises(UnknownExecution):
-            self.gateway.submit(self.intent)
+            self.gateway.request_cancel(self.intent)
         self.assertIsNone(self.gateway.lookup(self.intent))
 
     def test_durable_baseline_is_required_before_live_maker_submit(self):
@@ -162,12 +272,13 @@ class MakerTests(unittest.TestCase):
         self.journal.close()
         self.journal = Journal(Path(self.temp.name) / 'state.sqlite')
         self.gateway.journal = self.journal
-        result = self.gateway.lookup(self.intent)
+        result = self.gateway.request_cancel(self.intent)
         self.assertEqual((result.status, result.filled_quantity), ('CANCELLED', D(0)))
         self.assertEqual(len(self.cancels()), 1)
         self.assertFalse(any(kind == 'execute' and 'place_order' in body for kind, body in self.transport.calls))
 
     def test_zero_cancel_with_external_balance_change_stays_unknown(self):
         self.gateway.submit(self.intent)
+        self.gateway.request_cancel(self.intent)
         self.transport.base = D('0.01')
         self.assertIsNone(self.gateway.lookup(self.intent))

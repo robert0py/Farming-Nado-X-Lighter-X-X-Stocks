@@ -17,6 +17,14 @@ STATE_NAMES = {'NOT_CONFIGURED': 'Настройте доступ и страт�
                'CLOSING': 'Закрытие обеих сторон', 'CLOSED': 'Цикл завершён', 'RECOVERY': 'Сверка исполнения', 'HALTED': 'Требуется проверка'}
 
 
+def cycle_label(cycle):
+    if cycle.get('state') == 'CLOSED' and cycle.get('outcome') == 'REJECTED':
+        return 'Ордер отклонён'
+    if cycle.get('state') == 'CLOSED' and cycle.get('hedged_at') is None:
+        return 'Без открытия хеджа'
+    return STATE_NAMES.get(cycle.get('state'), cycle.get('state', '—'))
+
+
 class TradingPanel:
     def __init__(self, app, parent):
         from .app import BG, PANEL, LINE, MUTED, INK, label
@@ -75,7 +83,10 @@ class TradingPanel:
         self.cycle_detail = label(current, 'Nado: —     Lighter: —     Осталось: —', color=MUTED, size=10, anchor='w')
         self.cycle_detail.pack(fill='x', padx=16, pady=(0, 7))
         self.pnl = label(current, 'Оценка PnL: — · без funding и курса USDT0/USDG', color=MUTED, size=9, anchor='w')
-        self.pnl.pack(fill='x', padx=16, pady=(0, 12))
+        self.pnl.pack(fill='x', padx=16, pady=(0, 7))
+        self.order_detail = label(current, 'Ордеров текущей попытки нет.', color=MUTED, size=9,
+                                  anchor='w', justify='left', wraplength=1100)
+        self.order_detail.pack(fill='x', padx=16, pady=(0, 12))
         history = tk.Frame(parent, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
         history.pack(fill='both', expand=True, pady=(12, 0))
         row = tk.Frame(history, bg=PANEL)
@@ -239,20 +250,37 @@ class TradingPanel:
         execution = self.data.get('execution', {})
         cycle = execution.get('cycle') or {}
         state = execution.get('state', 'NOT_CONFIGURED')
-        self.cycle_state.configure(text=STATE_NAMES.get(state, state) + (' · ' + cycle['asset'] if cycle.get('asset') else ''))
+        title = cycle_label(cycle) if state == 'CLOSED' else STATE_NAMES.get(state, state)
+        self.cycle_state.configure(text=title + (' · ' + cycle['asset'] if cycle.get('asset') else ''))
         deadline = cycle.get('deadline')
         seconds = max(0, int(deadline - time.time())) if deadline is not None else None
-        timer = f'{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}' if seconds is not None else '—'
+        timer = (f'{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}' if seconds is not None
+                 else 'после открытия обеих сторон' if state in ('OPENING_SPOT', 'OPENING_HEDGE') else '—')
         self.cycle_detail.configure(text=f"Nado spot: {cycle.get('spot_quantity', '—')} · Lighter: {cycle.get('perp_quantity', '—')} · остаточная экспозиция: {cycle.get('residual_notional', '—')} · осталось: {timer}")
         self.pnl.configure(text=f"Оценка PnL: {cycle.get('pnl_quote', '—')} · без funding и курса USDT0/USDG")
+        latest = {}
+        for order in self.data.get('orders', ()):
+            latest[order['venue']] = order
+        details = []
+        for venue, order in latest.items():
+            status_name = {'ACK': 'принят', 'PENDING': 'ожидает исполнения', 'UNKNOWN': 'результат сверяется',
+                           'FILLED': 'исполнен', 'CANCELLED': 'отменён', 'REJECTED': 'отклонён',
+                           'EXPIRED': 'истёк срок'}.get(order['status'], order['status'])
+            number = ' · ID ' + order['exchange_id'] if order.get('exchange_id') else ''
+            details.append(f"{'Nado' if venue == 'nado' else 'Lighter'}: {status_name} · {order['quantity']} {order['asset']} по {order['limit_price']} · исполнено {order.get('filled_quantity') or '0'}{number}")
+        self.order_detail.configure(text='\n'.join(details) if details else 'Ордеров текущей попытки нет.')
         reason = self.data.get('error') or cycle.get('message') or execution.get('waiting_reason')
+        if cycle.get('state') == 'CLOSED' and cycle.get('hedged_at') is None and not self.data.get('error'):
+            reason = ('Ордер отклонён площадкой. ' + cycle.get('message', '') if cycle.get('outcome') == 'REJECTED'
+                      else 'Хедж не был открыт; удержание не запускалось. ' + cycle.get('message', '')
+                      if cycle.get('outcome') else 'Хедж не был открыт; удержание не запускалось.')
         if reason:
             self.message.configure(text=reason)
         self.table.delete(*self.table.get_children())
         for item in self.data.get('history', ()):
             def stamp(value):
                 return datetime.fromtimestamp(value).strftime('%d.%m %H:%M') if value else '—'
-            self.table.insert('', 'end', values=(item.get('asset', '—'), STATE_NAMES.get(item.get('state'), item.get('state', '—')),
+            self.table.insert('', 'end', values=(item.get('asset', '—'), cycle_label(item),
                               stamp(item.get('opened_at')), stamp(item.get('deadline')), item.get('residual_notional', '—')))
 
     def poll(self):

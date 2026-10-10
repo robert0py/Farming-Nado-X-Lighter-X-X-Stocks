@@ -48,6 +48,33 @@ class TradingDesktopTests(unittest.TestCase):
         self.panel.render()
         self.assertEqual(self.panel.table.get_children(), ())
 
+    def test_old_zero_fill_cycles_are_not_displayed_as_completed_hedges(self):
+        cycle = {'asset': 'SPY', 'state': 'CLOSED', 'opened_at': 1800000000,
+                 'hedged_at': None, 'deadline': None, 'spot_quantity': '0', 'perp_quantity': '0',
+                 'message': 'Обе стороны закрыты и сверены с площадками.'}
+        self.panel.data = {'execution': {'state': 'CLOSED', 'cycle': cycle}, 'history': [cycle]}
+        self.panel.render()
+        row = self.panel.table.item(self.panel.table.get_children()[0], 'values')
+        self.assertEqual(row[1], 'Без открытия хеджа')
+        self.assertIn('не был открыт', self.panel.message.cget('text'))
+        self.assertNotIn('Цикл завершён', self.panel.cycle_state.cget('text'))
+
+    def test_resting_order_shows_exchange_id_and_timer_waits_for_both_sides(self):
+        self.panel.data = {'execution': {'state': 'OPENING_SPOT', 'cycle': {
+            'asset': 'SPY', 'state': 'OPENING_SPOT', 'deadline': None}}, 'orders': [{
+            'venue': 'nado', 'status': 'PENDING', 'quantity': '0.134', 'asset': 'wSPYx',
+            'limit_price': '780.72', 'filled_quantity': '0', 'exchange_id': '0x' + 'ab' * 32}]}
+        self.panel.render()
+        self.assertIn('после открытия обеих сторон', self.panel.cycle_detail.cget('text'))
+        self.assertIn('ожидает исполнения', self.panel.order_detail.cget('text'))
+        self.assertIn('0x' + 'ab' * 32, self.panel.order_detail.cget('text'))
+
+    def test_confirmed_hedge_history_remains_completed(self):
+        self.panel.data = {'history': [{'asset': 'QQQ', 'state': 'CLOSED', 'hedged_at': 1800000000}]}
+        self.panel.render()
+        row = self.panel.table.item(self.panel.table.get_children()[0], 'values')
+        self.assertEqual(row[1], 'Цикл завершён')
+
     def test_dismissed_dialog_callback_does_not_stop_status_updates(self):
         self.panel.client = Mock()
         def dismissed(_):

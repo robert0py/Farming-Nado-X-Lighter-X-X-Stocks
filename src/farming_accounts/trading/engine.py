@@ -180,7 +180,7 @@ class Engine:
         pairs = self._pairs()
         last = self.journal.get("last_asset")
         previous = self.journal.active_cycle()
-        if previous and previous["state"] == "CLOSED":
+        if previous and previous["state"] == "CLOSED" and previous.get("hedged_at") is not None:
             last = previous["asset"]
         assets = list(self.strategy.assets)
         if last in assets:
@@ -212,7 +212,7 @@ class Engine:
                          "spot_baseline": str(baseline),
                          "strategy": json.loads(encoded(asdict(self.strategy))),
                          "opened_at": self.clock(), "hedged_at": None, "deadline": None,
-                         "unhedged_since": self.clock(), "spot_quantity": "0", "perp_quantity": "0",
+                         "unhedged_since": None, "spot_quantity": "0", "perp_quantity": "0",
                          "residual_notional": "0", "pnl_quote": "0", "attempts": 0,
                          "closing_requested": False}
                 self._transition(cycle, "OPENING_SPOT", "Начало подтверждённого хедж-цикла.")
@@ -245,25 +245,85 @@ class Engine:
 
     def _reconcile(self, cycle: dict) -> bool:
         unresolved = False
+        confirmed_resting = set()
         for _, intent, observation in self.journal.orders(cycle["id"]):
             if observation is not None and observation.terminal:
                 continue
             unresolved = True
-            result = self._gateway(intent.venue).lookup(intent)
+            gateway = self._gateway(intent.venue)
+            cancel_opening = (intent.post_only and not intent.reduce_only and
+                              (self.journal.get('close_requested', False) or
+                               not self.journal.get('running', False)))
+            cancel = getattr(gateway, 'request_cancel', None)
+            result = cancel(intent) if cancel_opening and cancel is not None else gateway.lookup(intent)
             if result is not None:
                 if result.client_id != intent.client_id:
                     raise TradingError("Площадка вернула другой ордер при сверке.")
                 self.journal.observe(result, observed_at=self.clock())
-                if result.terminal and intent.reduce_only and result.filled_quantity == 0 and not intent.post_only:
+                if result.status == 'PENDING' and result.filled_quantity == 0:
+                    confirmed_resting.add(intent.client_id)
+                if result.terminal and intent.reduce_only and result.filled_quantity == 0 and (not intent.post_only or result.status == 'REJECTED'):
                     self.journal.set("running", False)
-                    self._transition(cycle, "HALTED", "Закрытие не исполнилось. Остаток сохранён; автоматических повторов нет.")
+                    _, reason = self._rejection(intent)
+                    self._transition(cycle, "HALTED", "Закрытие не исполнилось. Остаток сохранён; автоматических повторов нет. " + reason)
                     return False
         if unresolved:
             unresolved = any(obs is None or not obs.terminal for _, _, obs in self.journal.orders(cycle["id"]))
         if unresolved:
-            self._transition(cycle, "RECOVERY", "Результат отправки не подтверждён. Только сверка, без повторных ордеров.")
+            pending = [(intent, obs) for action, intent, obs in self.journal.orders(cycle['id'])
+                       if obs is None or not obs.terminal]
+            maker_wait = (len(pending) == 1 and pending[0][0].post_only and
+                          pending[0][0].client_id in confirmed_resting and
+                          not pending[0][0].reduce_only and pending[0][1] is not None and
+                          pending[0][1].status == 'PENDING' and pending[0][1].filled_quantity == 0)
+            if maker_wait:
+                self._transition(cycle, 'OPENING_SPOT',
+                                 'Лимитный maker-ордер Nado принят. Ожидаем покупку; таймер удержания начнётся после открытия обеих сторон.')
+            else:
+                self._transition(cycle, "RECOVERY", "Результат отправки не подтверждён. Только сверка, без повторных ордеров.")
             return False
         return True
+
+    def _rejection(self, intent: OrderIntent) -> tuple[int | None, str]:
+        value = self.journal.get('rejection:' + intent.client_id, {})
+        if not isinstance(value, dict):
+            value = {}
+        code = value.get('code')
+        return code if isinstance(code, int) else None, value.get('reason') or 'Площадка отклонила ордер без исполнения.'
+
+    def _closed(self, cycle: dict, outcome: str, message: str) -> None:
+        cycle['outcome'] = outcome
+        self._transition(cycle, 'CLOSED', message)
+
+    def _opening_result(self, cycle: dict) -> None:
+        """A terminal zero fill is an opening attempt, never a completed hedge."""
+        orders = self.journal.orders(cycle['id'])
+        _, intent, result = orders[-1]
+        if result is None or not result.terminal:
+            return
+        if result.filled_quantity > 0:
+            if cycle.get('unhedged_since') is None:
+                cycle['unhedged_since'] = self.journal.completion_time(cycle['id']) or self.clock()
+            self._transition(cycle, 'OPENING_HEDGE', 'Покупка Nado исполнена; открываем встречную позицию на подтверждённый объём.')
+            return
+        if result.status == 'REJECTED':
+            code, reason = self._rejection(intent)
+            if intent.post_only and code == 2008:
+                if cycle.get('last_opening_rejection') != intent.client_id:
+                    cycle['last_opening_rejection'] = intent.client_id
+                    cycle['next_opening_at'] = self.clock() + 10
+                self._transition(cycle, 'OPENING_SPOT', reason + ' Обновим maker-цену после проверки отсутствия исполнения.')
+                return
+            self.journal.set('running', False)
+            self.journal.set('waiting_reason', reason)
+            self._closed(cycle, 'REJECTED', 'Позиции не открыты: ' + reason)
+            return
+        if intent.post_only:
+            self._transition(cycle, 'OPENING_SPOT',
+                             'Maker-ордер не исполнился и его отмена подтверждена. Продолжаем ждать покупку по обновлённой цене.')
+        else:
+            self.journal.set('running', False)
+            self._closed(cycle, 'NOT_OPENED', 'Ордер завершился без исполнения. Позиции и хедж не открыты.')
 
     def _write(self, cycle: dict, instrument: Instrument, book: Book, side: str,
                quantity: Decimal, action: str, *, reduce_only: bool) -> None:
@@ -290,10 +350,11 @@ class Engine:
         if not reduce_only and self._gateway(instrument.venue).available() < quantity * limit + strategy.margin_reserve:
             raise TradingError("Недостаточно средств с установленным резервом.")
         sequence = len(self.journal.orders(cycle["id"])) + 1
-        expiry = int(self.clock()) + 90
+        expiry = int(self.clock()) + (900 if maker and not reduce_only else 90)
+        receive_until = int(self.clock()) + 90
         intent = OrderIntent(uuid.uuid5(uuid.NAMESPACE_URL, f"{cycle['id']}:{sequence}:{instrument.venue}").hex,
                              cycle["id"], instrument.venue, instrument, side, quantity, limit, reduce_only,
-                             (expiry * 1000 << 20) | sequence, expiry, post_only=maker)
+                             (receive_until * 1000 << 20) | sequence, expiry, post_only=maker)
         self.journal.put_intent(intent, action)
         cycle["attempts"] += 1
         self.journal.save_cycle(cycle)
@@ -303,10 +364,15 @@ class Engine:
                 raise UnknownExecution("Площадка не подтвердила идентификатор отправленного ордера.")
             self.journal.observe(result, observed_at=self.clock())
             if not result.terminal:
-                self._transition(cycle, "RECOVERY", "Ордер принят; ожидание фактического исполнения.")
-            elif reduce_only and result.filled_quantity == 0 and not maker:
+                if maker and not reduce_only and result.status == 'PENDING' and result.filled_quantity == 0:
+                    self._transition(cycle, 'OPENING_SPOT',
+                                     'Лимитный maker-ордер Nado принят. Ожидаем покупку; таймер удержания начнётся после открытия обеих сторон.')
+                else:
+                    self._transition(cycle, "RECOVERY", "Ордер принят; ожидание фактического исполнения.")
+            elif reduce_only and result.filled_quantity == 0 and (not maker or result.status == 'REJECTED'):
                 self.journal.set("running", False)
-                self._transition(cycle, "HALTED", "Площадка не исполнила закрытие в пределах цены. Требуется проверка остатка; повторов нет.")
+                _, reason = self._rejection(intent)
+                self._transition(cycle, "HALTED", "Площадка не исполнила закрытие в пределах цены. Требуется проверка остатка; повторов нет. " + reason)
         except PreSubmissionError as error:
             self.journal.observe(OrderObservation(intent.client_id, "REJECTED", Decimal(0)), observed_at=self.clock())
             if reduce_only:
@@ -316,7 +382,7 @@ class Engine:
                 self.journal.set('running', False)
                 self.journal.set('waiting_reason', str(error))
                 self._verified = False
-                self._transition(cycle, 'CLOSED', 'Ордер не отправлен: ' + str(error))
+                self._closed(cycle, 'NOT_SUBMITTED', 'Ордер не отправлен: ' + str(error))
             else:
                 self._transition(cycle, 'OPENING_HEDGE', 'Встречный ордер не отправлен: ' + str(error))
         except Exception:
@@ -375,7 +441,18 @@ class Engine:
                 cycle.update(spot_quantity=str(spot_quantity), perp_quantity=str(perp_quantity),
                              residual_notional=str(residual_quote), pnl_quote=str(pnl))
                 self.journal.save_cycle(cycle)
-                if cycle["attempts"] - cycle.get("retry_budget_start", 0) > 16:
+                correcting_orders = []
+                for index, (action, intent, observation) in enumerate(self.journal.orders(cycle['id'])):
+                    if index < cycle.get('retry_budget_start', 0):
+                        continue
+                    code, _ = self._rejection(intent)
+                    maker_wait = (action == 'open_spot' and intent.post_only and observation and
+                                  observation.terminal and observation.filled_quantity == 0 and
+                                  (observation.status in ('CANCELLED', 'EXPIRED') or
+                                   observation.status == 'REJECTED' and code == 2008))
+                    if not maker_wait:
+                        correcting_orders.append(intent)
+                if len(correcting_orders) > 16:
                     raise TradingError("Превышен предел корректирующих ордеров; автоматическое исполнение остановлено.")
                 hedged = spot_quantity > 0 and perp_quantity < 0 and residual_quote <= strategy.residual_notional
                 if hedged and cycle["deadline"] is None:
@@ -390,16 +467,34 @@ class Engine:
                            cycle["deadline"] is not None and self.clock() >= cycle["deadline"] or
                            risk_close)
                 if cycle["attempts"] == 0 and not self.journal.get("running", False):
-                    self._transition(cycle, "CLOSED", "Открытие остановлено до отправки ордеров.")
+                    self._closed(cycle, 'NOT_OPENED', "Открытие остановлено до отправки ордеров.")
                     return self.status()
                 if cycle["state"] == "OPENING_SPOT" and cycle["attempts"] == 0 and not closing:
+                    cycle['target_spot'] = str(self._opening_size(spot, spot_book, strategy))
                     self._write(cycle, spot, spot_book, "buy", Decimal(cycle["target_spot"]), "open_spot", reduce_only=False)
                     if cycle["state"] not in ('RECOVERY', 'CLOSED', 'HALTED'):
-                        self._transition(cycle, "OPENING_HEDGE", "Spot исполнение подтверждено; формирование встречной позиции.")
+                        self._opening_result(cycle)
                     return self.status()
                 if spot_quantity == 0 and perp_quantity == 0 and cycle["attempts"]:
-                    self._transition(cycle, "CLOSED", "Обе стороны закрыты и сверены с площадками.")
-                    self.journal.set("last_asset", cycle["asset"])
+                    orders = self.journal.orders(cycle['id'])
+                    had_fill = any(obs and obs.terminal and obs.filled_quantity > 0 for _, _, obs in orders)
+                    if not had_fill:
+                        cycle['unhedged_since'] = None
+                        if closing or not self.journal.get('running', False):
+                            self._closed(cycle, 'NOT_OPENED', 'Открытие остановлено. Ордер отменён без исполнения; позиции не открывались.')
+                        else:
+                            self._opening_result(cycle)
+                            if cycle['state'] != 'CLOSED' and self.clock() >= cycle.get('next_opening_at', 0):
+                                cycle['target_spot'] = str(self._opening_size(spot, spot_book, strategy))
+                                self._write(cycle, spot, spot_book, 'buy', Decimal(cycle['target_spot']), 'open_spot', reduce_only=False)
+                                if cycle['state'] not in ('RECOVERY', 'CLOSED', 'HALTED'):
+                                    self._opening_result(cycle)
+                        self.journal.set('close_requested', False)
+                        return self.status()
+                    outcome = 'COMPLETED' if cycle.get('hedged_at') is not None else 'UNWOUND'
+                    self._closed(cycle, outcome, "Обе стороны закрыты и сверены с площадками.")
+                    if cycle.get('hedged_at') is not None:
+                        self.journal.set("last_asset", cycle["asset"])
                     self.journal.set("close_requested", False)
                     return self.status()
                 if closing:
@@ -414,14 +509,14 @@ class Engine:
                     elif spot_quantity > 0:
                         self._write(cycle, spot, spot_book, "sell", spot_quantity, "close_spot", reduce_only=True)
                     elif cycle["attempts"] == 0:
-                        self._transition(cycle, "CLOSED", "Открытие остановлено до отправки ордеров.")
+                        self._closed(cycle, 'NOT_OPENED', "Открытие остановлено до отправки ордеров.")
                     return self.status()
                 if hedged:
                     cycle["unhedged_since"] = None
                     self._transition(cycle, "HEDGED", "Обе стороны подтверждены; удержание хеджа.")
                     return self.status()
                 if cycle["unhedged_since"] is None:
-                    cycle["unhedged_since"] = self.clock()
+                    cycle["unhedged_since"] = self.journal.completion_time(cycle['id']) or self.clock()
                 expired = self.clock() - cycle["unhedged_since"] >= strategy.max_unhedged_seconds
                 failed_hedge = any(action == "open_perp" and obs and obs.terminal and obs.filled_quantity == 0
                                    for action, _, obs in self.journal.orders(cycle["id"]))
