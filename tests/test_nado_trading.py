@@ -65,6 +65,7 @@ class FakeTransport:
         self.executed_quantity = D(1)
         self.max_size = D(10)
         self.extra_balances = []
+        self.deposit_multiplier = 10**18
 
     def query(self, params):
         self.calls.append(("query", copy.deepcopy(params)))
@@ -79,7 +80,9 @@ class FakeTransport:
             return {"exists": True, "subaccount": SENDER,
                     "healths": [{"health": raw(1)}, {"health": raw(1)}, {"health": raw(self.quote)}],
                     "spot_balances": [{"product_id": 0, "balance": {"amount": raw(self.quote)}},
-                                      {"product_id": 117, "balance": {"amount": raw(self.base)}}] + self.extra_balances}
+                                      {"product_id": 117, "balance": {"amount": raw(self.base)}}] + self.extra_balances,
+                    "spot_products": [{"product_id": 117, "state": {
+                        "cumulative_deposits_multiplier_x18": str(self.deposit_multiplier)}}]}
         if kind == "subaccount_orders":
             return {"sender": SENDER, "product_id": 117, "orders": self.orders}
         if kind == "fee_rates":
@@ -146,7 +149,8 @@ class NadoTradingTests(unittest.TestCase):
         _, _, digest = self.gateway._order(self.intent)
         return {"digest": digest, "subaccount": SENDER, "product_id": 117,
                 "nonce": str(self.intent.nonce), "amount": raw(1), "base_filled": raw(filled),
-                "quote_filled": raw(-D(filled) * 105), "fee": raw("0.0315"),
+                "price_x18": raw(105), "expiration": str(self.intent.expiry), "appendix": "1025",
+                "quote_filled": raw(-D(filled) * 105 - D('0.0315')), "fee": raw("0.0315"),
                 "last_fill_timestamp": str(NOW),
                 "post_balance": {"base": {"spot": {"product_id": 117, "balance": {"amount": raw(post)}}}}}
 

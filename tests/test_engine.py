@@ -118,6 +118,93 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.nado.requests[-1].limit_price, D(201))
         self.assertTrue(self.nado.requests[-1].post_only)
 
+    def indexed_nado(self):
+        """An isolated gateway seam: raw indexed balances differ from its ledger."""
+        scale = D(10) ** 18
+        principal = {index: quantity * scale for index, quantity in self.nado.positions.items()}
+        checked = []
+        def capture(instrument):
+            return {'amount': str(self.nado.positions[instrument.id]),
+                    'normalized': str(principal[instrument.id]), 'multiplier': str(scale)}
+        original = self.nado.submit
+        def submit(intent):
+            result = original(intent)
+            if result.terminal:
+                principal[intent.instrument.id] += result.filled_quantity * scale * (1 if intent.side == 'buy' else -1)
+            return result
+        def matches(instrument, baseline, orders):
+            if baseline is None:
+                raise TradingError('fixture missing normalized balance proof')
+            expected = D(baseline['normalized'])
+            for _, intent, observation in orders:
+                if intent.venue.casefold() == 'nado' and observation and observation.terminal:
+                    expected += observation.filled_quantity * scale * (1 if intent.side == 'buy' else -1)
+            checked.append((dict(baseline), len(orders)))
+            return principal[instrument.id] == expected
+        self.nado.capture_position, self.nado.position_matches, self.nado.submit = capture, matches, submit
+        return principal, checked
+
+    def test_indexed_interest_does_not_halt_confirmed_hedge_or_sell_preserved_dust(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True, preserve_spot_dust=True)
+        self.nado.positions[1] = D('0.0001')
+        _, checked = self.indexed_nado()
+        self.hedge()
+        baseline = dict(self.engine.status()['cycle']['spot_account_baseline'])
+        self.nado.positions[1] += D('0.00000001')
+        self.clock.value += 600
+        self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'HEDGED')
+        self.assertEqual(self.engine.status()['cycle']['spot_account_baseline'], baseline)
+        self.assertTrue(checked)
+        self.engine.close_and_stop()
+        for _ in range(3):
+            self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'CLOSED')
+        self.assertEqual(self.engine.status()['cycle']['outcome'], 'COMPLETED')
+        self.assertEqual(self.nado.positions[1], D('0.00010001'))
+        self.assertEqual(self.nado.requests[-1].quantity, D(10))
+
+    def test_normalized_external_activity_halts_even_if_raw_balance_matches_old_formula(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True, preserve_spot_dust=True)
+        self.nado.positions[1] = D('0.0001')
+        principal, _ = self.indexed_nado()
+        self.hedge()
+        principal[1] += 1
+        self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'HALTED')
+        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(len(self.lighter.requests), 1)
+
+    def test_missing_indexed_baseline_proof_fails_closed_without_replacing_it(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True, preserve_spot_dust=True)
+        self.indexed_nado()
+        self.hedge()
+        cycle = self.journal.active_cycle()
+        cycle.pop('spot_account_baseline')
+        self.journal.save_cycle(cycle)
+        self.engine = Engine(self.journal, self.nado, self.lighter, self.strategy, clock=self.clock)
+        self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'HALTED')
+        self.assertIn('missing normalized balance proof', self.engine.status()['cycle']['message'])
+        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(len(self.lighter.requests), 1)
+
+    def test_restart_keeps_original_indexed_baseline_while_raw_balance_accrues(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True, preserve_spot_dust=True)
+        self.nado.positions[1] = D('0.0001')
+        self.indexed_nado()
+        self.hedge()
+        baseline = dict(self.engine.status()['cycle']['spot_account_baseline'])
+        deadline = self.engine.status()['cycle']['deadline']
+        self.nado.positions[1] += D('0.000000001')
+        self.clock.value += 600
+        self.engine = Engine(self.journal, self.nado, self.lighter, self.strategy, clock=self.clock)
+        self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'HEDGED')
+        self.assertEqual(self.engine.status()['cycle']['spot_account_baseline'], baseline)
+        self.assertEqual(self.engine.status()['cycle']['deadline'], deadline)
+        self.assertEqual(len(self.nado.requests), 1)
+
     def test_zero_fill_maker_attempt_waits_in_same_cycle_without_starting_hold(self):
         self.engine.strategy = replace(self.strategy, nado_post_only=True)
         self.nado.responses.append('CANCELLED')

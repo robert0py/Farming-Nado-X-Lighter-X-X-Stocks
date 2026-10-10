@@ -55,14 +55,19 @@ class Engine:
         return result
 
     def _baseline(self, pair, books, strategy):
-        spot = self.nado.position(pair[0])
+        capture = getattr(self.nado, 'capture_position', None)
+        snapshot = capture(pair[0]) if capture is not None else None
+        if capture is not None and (not isinstance(snapshot, dict) or
+                                    not {'amount', 'normalized', 'multiplier'}.issubset(snapshot)):
+            raise TradingError('Nado не подтвердила снимок индексированного spot-баланса. Открытие запрещено.')
+        spot = Decimal(snapshot['amount']) if snapshot is not None else self.nado.position(pair[0])
         dust_limit = min(Decimal('0.1'), strategy.notional_per_leg * Decimal('0.001'))
         dust = (strategy.preserve_spot_dust and 0 <= spot < pair[0].quantity_step and
                 spot * books[0].ask <= dust_limit)
         if (spot != 0 and not dust or self.lighter.position(pair[1]) != 0 or
                 self.nado.open_orders(pair[0]) or self.lighter.open_orders(pair[1])):
             raise TradingError('На выбранном рынке есть существующие позиции или ордера. Бот не принимает их под управление.')
-        return spot
+        return spot, snapshot
 
     @staticmethod
     def _strategy(cycle: dict) -> Strategy:
@@ -93,7 +98,7 @@ class Engine:
                     books = [self._book(i, self.strategy) for i in pair]
                     if not all(i.tradable for i in pair):
                         raise TradingError("Новое открытие сейчас запрещено площадкой.")
-                    baseline = self._baseline(pair, books, self.strategy)
+                    baseline, _ = self._baseline(pair, books, self.strategy)
                     target = self._opening_size(pair[0], books[0], self.strategy)
                     underlying = target * pair[0].multiplier
                     hedge = quantize(underlying / pair[1].multiplier, pair[1].quantity_step)
@@ -194,7 +199,7 @@ class Engine:
                 continue
             try:
                 books = [self._book(i, self.strategy) for i in pair]
-                baseline = self._baseline(pair, books, self.strategy)
+                baseline, baseline_snapshot = self._baseline(pair, books, self.strategy)
                 target = self._opening_size(pair[0], books[0], self.strategy)
                 underlying = target * pair[0].multiplier
                 hedge_size = quantize(underlying / pair[1].multiplier, pair[1].quantity_step)
@@ -210,6 +215,7 @@ class Engine:
                 cycle = {"id": uuid.uuid4().hex, "asset": asset, "state": "OPENING_SPOT",
                          "spot_id": pair[0].id, "perp_id": pair[1].id, "target_spot": str(target),
                          "spot_baseline": str(baseline),
+                         "spot_account_baseline": baseline_snapshot,
                          "strategy": json.loads(encoded(asdict(self.strategy))),
                          "opened_at": self.clock(), "hedged_at": None, "deadline": None,
                          "unhedged_since": None, "spot_quantity": "0", "perp_quantity": "0",
@@ -430,7 +436,11 @@ class Engine:
                 spot_quantity, perp_quantity = self._quantities(cycle)
                 if spot_quantity < 0 or perp_quantity > 0:
                     raise TradingError("Нарушено направление позиций хеджа.")
-                if self.nado.position(spot) != spot_quantity + Decimal(cycle.get('spot_baseline', '0')) or self.lighter.position(perp) != perp_quantity:
+                matcher = getattr(self.nado, 'position_matches', None)
+                spot_matches = (matcher(spot, cycle.get('spot_account_baseline'), self.journal.orders(cycle['id']))
+                                if matcher is not None else
+                                self.nado.position(spot) == spot_quantity + Decimal(cycle.get('spot_baseline', '0')))
+                if not spot_matches or self.lighter.position(perp) != perp_quantity:
                     raise TradingError("Позиции площадок отличаются от подтверждённого журнала. Новые ордера запрещены.")
                 if self.nado.open_orders(spot) or self.lighter.open_orders(perp):
                     raise TradingError("На рынках обнаружены незавершённые ордера вне подтверждённого журнала.")

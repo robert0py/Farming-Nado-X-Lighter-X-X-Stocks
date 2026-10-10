@@ -19,6 +19,26 @@ class MakerTransport(FakeTransport):
         self.cancel_other_order = False
         self.pending = None
 
+    def archive_matches(self, sender, product_id, last_idx):
+        if not self.rows:
+            return {'matches': []}
+        row = self.rows[0]
+        return {'matches': [{'digest': row['digest'], 'order': self.pending['order'],
+                             'isolated': False,
+                             'base_filled': row['base_filled'], 'cumulative_base_filled': row['base_filled'],
+                             'submission_idx': row['last_fill_submission_idx'], 'post_balance': row['post_balance']}]}
+
+    def archive_event(self, sender, product_id, idx):
+        row = self.rows[0]
+        post = row['post_balance']['base']['spot']
+        return {'events': [{'subaccount': SENDER, 'product_id': product_id, 'submission_idx': str(idx),
+                            'isolated': False,
+                            'event_type': 'match_orders', 'product': {'spot': {'product_id': product_id,
+                            'state': {'cumulative_deposits_multiplier_x18': str(self.deposit_multiplier)}}},
+                            'pre_balance': {'spot': {'product_id': product_id, 'balance': {'amount':
+                                str(int(post['balance']['amount']) - int(row['base_filled']))}}},
+                            'post_balance': {'spot': post}}]}
+
     def query(self, params):
         result = super().query(params)
         if params['type'] == 'fee_rates':
@@ -70,6 +90,8 @@ class MakerTests(unittest.TestCase):
         self.intent = OrderIntent('maker', 'cycle', 'nado', instrument, 'buy', D(1), D(104), False,
                                   ((NOW + 90) * 1000 << 20) | 7, NOW + 900, post_only=True)
         self.journal.put_intent(self.intent, 'open_spot')
+        self.journal.save_cycle({'id': 'cycle', 'state': 'OPENING_SPOT',
+                                 'spot_account_baseline': self.gateway.capture_position(instrument)})
 
     def tearDown(self):
         self.journal.close()
@@ -142,6 +164,8 @@ class MakerTests(unittest.TestCase):
 
     def test_closing_maker_uses_short_risk_window(self):
         self.transport.base = D(1)
+        self.journal.save_cycle({'id': 'cycle', 'state': 'CLOSING',
+                                 'spot_account_baseline': self.gateway.capture_position(self.intent.instrument)})
         close = replace(self.intent, client_id='close-short-wait', side='sell', reduce_only=True, expiry=NOW + 90)
         self.journal.put_intent(close, 'close_spot')
         self.gateway.submit(close)
@@ -154,6 +178,8 @@ class MakerTests(unittest.TestCase):
 
     def test_maker_spot_sale_omits_unsupported_reduce_flag_but_forbids_borrowing(self):
         self.transport.base = D(1)
+        self.journal.save_cycle({'id': 'cycle', 'state': 'CLOSING',
+                                 'spot_account_baseline': self.gateway.capture_position(self.intent.instrument)})
         close = replace(self.intent, client_id='maker-close', side='sell', reduce_only=True)
         self.journal.put_intent(close, 'close_spot')
         self.assertEqual(self.gateway.submit(close).status, 'PENDING')
@@ -179,7 +205,9 @@ class MakerTests(unittest.TestCase):
         order = self.transport.pending
         self.transport.rows = [{'digest': order['digest'], 'subaccount': SENDER, 'product_id': 117,
                                 'nonce': str(self.intent.nonce), 'amount': raw(1), 'base_filled': raw('0.4'),
-                                'quote_filled': raw('-41.6'), 'fee': raw('-0.00416'),
+                                'price_x18': raw(104), 'expiration': str(self.intent.expiry), 'appendix': '1537',
+                                'quote_filled': raw('-41.59584'), 'fee': raw('-0.00416'),
+                                'submission_idx': '7', 'last_fill_submission_idx': '7',
                                 'last_fill_timestamp': str(NOW),
                                 'post_balance': {'base': {'spot': {'product_id': 117, 'balance': {'amount': raw('0.4')}}}}}]
         result = self.gateway.lookup(self.intent)
@@ -209,8 +237,7 @@ class MakerTests(unittest.TestCase):
     def test_lost_cancel_reply_is_never_resent_after_restart(self):
         self.gateway.submit(self.intent)
         self.transport.cancel_error = True
-        with self.assertRaises(UnknownExecution):
-            self.gateway.request_cancel(self.intent)
+        self.assertIsNone(self.gateway.request_cancel(self.intent))
         gateway = NadoGateway(OWNER, approved_assets=('SPY',), transport=self.transport, signer=self.signer,
                               clock=lambda: NOW, stream_factory=NoFillStream)
         gateway.journal = self.journal
@@ -226,8 +253,7 @@ class MakerTests(unittest.TestCase):
                                    exchange_id=self.transport.pending['digest'])
         self.journal.observe(partial, observed_at=NOW + 1)
         self.transport.cancel_error = True
-        with self.assertRaises(UnknownExecution):
-            self.gateway.request_cancel(self.intent)
+        self.assertIsNone(self.gateway.request_cancel(self.intent))
         self.assertIsNone(self.gateway.lookup(self.intent))
         self.assertEqual(self.journal.orders(self.intent.cycle_id)[0][2].filled_quantity, D('0.4'))
         self.gateway.clock = lambda: NOW + 301
@@ -266,7 +292,9 @@ class MakerTests(unittest.TestCase):
 
     def test_restart_cancels_only_previously_saved_resting_order(self):
         message, signature, digest = self.gateway._order(self.intent)
-        self.journal.set('maker:' + self.intent.client_id, {'baseline': '0', 'digest': digest, 'cancel_state': None})
+        self.journal.set('maker:' + self.intent.client_id, {'baseline': '0', 'baseline_normalized': '0',
+                                                          'baseline_multiplier': str(10**18),
+                                                          'digest': digest, 'cancel_state': None})
         self.transport.pending = {'digest': digest, 'order': {k: str(v) for k, v in message.items()}}
         self.transport.orders = [{'digest': digest}]
         self.journal.close()
