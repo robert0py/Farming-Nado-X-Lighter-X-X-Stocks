@@ -90,7 +90,7 @@ class MakerTests(unittest.TestCase):
         self.assertEqual(self.gateway.lookup(self.intent).filled_quantity, D(0))
         self.assertEqual(len(self.cancels()), 1)
 
-    def test_partial_cancel_waits_for_archive_and_never_hedges_missing_proof(self):
+    def partial_cancel_with_archive(self):
         self.transport.executed_quantity = D('0.4')
         with self.assertRaises(UnknownExecution):
             self.gateway.submit(self.intent)
@@ -103,6 +103,26 @@ class MakerTests(unittest.TestCase):
         result = self.gateway.lookup(self.intent)
         self.assertEqual((result.status, result.filled_quantity, result.average_price), ('CANCELLED', D('0.4'), D(104)))
         self.assertEqual(len(self.cancels()), 1)
+
+    def test_partial_cancel_waits_for_archive_and_never_hedges_missing_proof(self):
+        self.partial_cancel_with_archive()
+
+    def test_positive_archive_after_expiry_recovers_lost_cancel_without_resending(self):
+        self.partial_cancel_with_archive()
+        record = self.journal.get('maker:' + self.intent.client_id)
+        record['cancel_state'] = 'INTENT'
+        record.pop('filled')
+        self.journal.set('maker:' + self.intent.client_id, record)
+        self.assertFalse(self.gateway.lookup(self.intent).terminal)
+        self.gateway.clock = lambda: NOW + 100
+        self.assertTrue(self.gateway.lookup(self.intent).terminal)
+        self.assertEqual(len(self.cancels()), 1)
+
+    def test_archived_fill_cannot_exceed_saved_limit_price(self):
+        self.partial_cancel_with_archive()
+        self.transport.rows[0]['quote_filled'] = raw('-42.4')
+        with self.assertRaises(UnknownExecution):
+            self.gateway.lookup(self.intent)
 
     def test_lost_cancel_reply_is_never_resent_after_restart(self):
         self.transport.cancel_error = True

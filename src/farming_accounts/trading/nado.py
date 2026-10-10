@@ -683,6 +683,9 @@ class NadoGateway:
         if (filled <= 0 or filled > intent.quantity or (signed_filled > 0) != (intent.side == "buy")
                 or (quote < 0) != (intent.side == "buy")):
             raise UnknownExecution("Nado не подтвердил достоверное исполнение ордера.")
+        average = abs(quote) / filled
+        if average <= 0 or (intent.side == 'buy' and average > intent.limit_price) or (intent.side == 'sell' and average < intent.limit_price):
+            raise UnknownExecution('История Nado показывает цену вне сохранённого лимита.')
         # Complete filled quantity is proof even after a missed stream/restart.
         # Partial history is terminal only if its archived balance has caught up
         # to the current account and the IOC is no longer on the matching engine.
@@ -698,7 +701,15 @@ class NadoGateway:
         if intent.post_only:
             if record is None or self.position(intent.instrument) != Decimal(record['baseline']) + signed_filled:
                 return OrderObservation(intent.client_id, 'PENDING', filled, abs(quote) / filled, fee, digest, filled_at)
-            if filled < intent.quantity and (record.get('cancel_state') != 'CONFIRMED' or Decimal(record['filled']) != filled):
+            if record.get('cancel_state') == 'CONFIRMED' and Decimal(record['filled']) != filled:
+                if filled > Decimal(record['filled']):
+                    raise UnknownExecution('История Nado противоречит подтверждённой отмене.')
                 return OrderObservation(intent.client_id, 'PENDING', filled, abs(quote) / filled, fee, digest, filled_at)
+            if filled < intent.quantity and record.get('cancel_state') != 'CONFIRMED':
+                if self.clock() < intent.expiry + 5:
+                    return OrderObservation(intent.client_id, 'PENDING', filled, average, fee, digest, filled_at)
+                # Expired signed order, no open orders, positive archive proof and
+                # matching post-balance/baseline: no remaining quantity can fill.
+                return OrderObservation(intent.client_id, 'EXPIRED', filled, average, fee, digest, filled_at)
         return OrderObservation(intent.client_id, "FILLED" if filled == intent.quantity else "CANCELLED",
                                 filled, abs(quote) / filled, fee, digest, filled_at)
