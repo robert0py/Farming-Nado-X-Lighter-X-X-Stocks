@@ -43,6 +43,9 @@ class StrategyFormTests(unittest.TestCase):
         return form
 
     def fill(self, form):
+        if hasattr(form, 'advanced'):
+            form.advanced.set(True)
+            form.toggle_advanced()
         inputs = dict(notional_per_leg='200', slippage_percent='0,25', residual_notional='1',
                       margin_reserve='10', max_loss_quote='5', max_unhedged_seconds='60',
                       quote_max_age_seconds='10', hold_hours='12')
@@ -54,6 +57,24 @@ class StrategyFormTests(unittest.TestCase):
         form.selection_changed()
         form.verified.set(True)
         form.update_actions()
+
+    def test_basic_form_needs_only_amount_time_and_assets(self):
+        form = self.load_form()
+        self.assertFalse(form.advanced.get())
+        self.assertFalse(form.advanced_grid.winfo_ismapped())
+        form.entries['notional_per_leg'].insert(0, '200')
+        for var in form.selected.values():
+            var.set(True)
+        form.selection_changed()
+        form.verified.set(True)
+        form.save()
+        self.panel.executor.run_one()
+        route, value = self.panel.client.request.call_args.args
+        self.assertEqual(route, '/strategy')
+        settings = value['strategy']
+        self.assertEqual(settings['mode'], 'automatic')
+        self.assertEqual(settings['hold_seconds'], 43200)
+        self.assertNotIn('max_slippage_bps', settings)
 
     def test_loads_without_saved_strategy_and_never_starts_or_guesses_money(self):
         form = self.load_form()

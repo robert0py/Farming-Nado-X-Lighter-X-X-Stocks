@@ -1,7 +1,7 @@
 """Nado xStocks spot execution. No wallet master key, borrowing, or write retries.
 
 Signed orders are identified by their EIP-712 digest, not by the echoed API id.
-FOK opens avoid below-minimum partial spot purchases; reduce-only IOC closes.
+Maker batches cancel their remaining quantity before handing actual fills to the hedge.
 An absent order in the book/history is UNKNOWN, never proof of a zero fill.
 """
 
@@ -31,6 +31,7 @@ ORDER_FIELDS = [("sender", "bytes32"), ("priceX18", "int128"), ("amount", "int12
                 ("expiration", "uint64"), ("nonce", "uint64"), ("appendix", "uint128")]
 LINK_FIELDS = [("sender", "bytes32"), ("signer", "bytes32"), ("nonce", "uint64")]
 AUTH_FIELDS = [("sender", "bytes32"), ("expiration", "uint64")]
+CANCEL_FIELDS = [("sender", "bytes32"), ("productIds", "uint32[]"), ("digests", "bytes32[]"), ("nonce", "uint64")]
 QUERY_TYPES = {"contracts", "linked_signer", "nonces", "subaccount_info", "market_liquidity",
                "fee_rates", "max_order_size", "subaccount_orders", "order"}
 
@@ -313,7 +314,7 @@ class NadoLifecycle:
         update_filled, terminal = Decimal(0), None
         filled_at = None
         seen = set()
-        until = time.monotonic() + 10
+        until = time.monotonic() + (20 if intent.post_only else 10)
         try:
             while time.monotonic() < until:
                 item = _obj(json.loads(self.socket.recv(timeout=max(.01, until - time.monotonic()))))
@@ -404,7 +405,7 @@ def spot_instruments(metadata, approved_assets):
 
 class NadoGateway:
     def __init__(self, owner, subaccount="default", private_key=None, approved_assets=(), *,
-                 transport=None, signer=None, clock=time.time, stream_factory=NadoLifecycle):
+                 transport=None, signer=None, clock=time.time, stream_factory=NadoLifecycle, journal=None):
         self.owner = _address(owner)
         self.sender = _sender(self.owner, subaccount)
         self.signer = signer or EthereumSigner(private_key)
@@ -413,6 +414,7 @@ class NadoGateway:
         self.approved_assets = frozenset(approved_assets)
         self.transport, self.clock = transport or NadoTransport(), clock
         self.stream_factory = stream_factory
+        self.journal = journal
         self._contracts = None
 
     def _account(self):
@@ -435,7 +437,7 @@ class NadoGateway:
     def verify(self):
         linked = self.transport.query({"type": "linked_signer", "subaccount": self.sender})
         if _address(linked.get("linked_signer")) != self.signer.address:
-            raise TradingError("Ключ Nado не совпадает с текущим linked signer субаккаунта.")
+            raise TradingError("Ключ Nado не совпадает с текущим linked signer субаккаунта. Нажмите «Перепривязать ключ Nado» и подтвердите подпись владельца в MetaMask. 1-Click Trading на сайте Nado может заменить привязку бота.")
         contracts = self.transport.query({"type": "contracts"})
         self._contracts = (_integer(contracts.get("chain_id"), minimum=1), _address(contracts.get("endpoint_addr")))
         self._account()
@@ -534,7 +536,7 @@ class NadoGateway:
                    "expiration": intent.expiry, "nonce": intent.nonce,
                    # Appendix v1: order type is bits 9..10 (IOC=1, FOK=2);
                    # bit11 is reduce-only. These flags are part of the signature.
-                   "appendix": 1 | ((1 if intent.reduce_only else 2) << 9)
+                   "appendix": 1 | ((3 if intent.post_only else 1 if intent.reduce_only else 2) << 9)
                                | ((1 << 11) if intent.reduce_only else 0)}
         if self._contracts is None:
             contracts = self.transport.query({"type": "contracts"})
@@ -559,12 +561,14 @@ class NadoGateway:
         if intent.reduce_only and intent.side != "sell":
             raise TradingError("Закрытие spot Nado должно быть reduce-only продажей.")
         fees = self.transport.query({"type": "fee_rates", "sender": self.sender})
-        rates = _list(fees.get("taker_fee_rates_x18"))
+        rates = _list(fees.get("maker_fee_rates_x18" if intent.post_only else "taker_fee_rates_x18"))
         if len(rates) <= intent.instrument.id:
             raise TradingError("Nado не вернул комиссию выбранного рынка.")
-        fee_rate, fee_fixed = _x18(rates[intent.instrument.id]), _x18(fees.get("taker_sequencer_fee"))
-        if fee_rate < 0 or fee_rate > 1 or fee_fixed < 0:
-            raise TradingError("Nado вернул недопустимую taker-комиссию.")
+        fee_rate = _x18(rates[intent.instrument.id])
+        fee_fixed = Decimal(0) if intent.post_only else _x18(fees.get("taker_sequencer_fee"))
+        if abs(fee_rate) > 1 or (fee_rate < 0 and not intent.post_only) or fee_fixed < 0:
+            raise TradingError("Nado вернул недопустимую комиссию.")
+        fee_rate = max(Decimal(0), fee_rate)  # Rebates are not spendable before settlement.
         if intent.side == "buy" and balances[0] < intent.quantity * intent.limit_price * (1 + fee_rate) + fee_fixed:
             raise TradingError("Недостаточно USDT0 для spot-покупки и комиссий без займа.")
         maximum = self.transport.query({"type": "max_order_size", "sender": self.sender,
@@ -576,6 +580,8 @@ class NadoGateway:
         return baseline
 
     def submit(self, intent):
+        if intent.post_only and self.journal and self.journal.get('maker:' + intent.client_id) is not None:
+            raise UnknownExecution('Maker-ордер уже подготовлен или отправлен. Разрешена только сверка сохранённой операции.')
         with ExitStack() as stack:
             try:
                 self._order(intent)  # validate before touching the account
@@ -587,6 +593,13 @@ class NadoGateway:
                 payload = {"product_id": intent.instrument.id, "order": {k: str(v) if k != "sender" else v
                                                                           for k, v in message.items()},
                            "signature": signature, "digest": digest, "spot_leverage": False}
+                if intent.post_only:
+                    if self.journal is None:
+                        raise TradingError('Maker-ордер требует постоянного журнала до отправки.')
+                    if not any(saved == intent for _, saved, _ in self.journal.orders(intent.cycle_id)):
+                        raise TradingError('Maker-intent отсутствует в постоянном журнале. Ордер не отправлен.')
+                    self.journal.set('maker:' + intent.client_id, {'baseline': str(baseline), 'digest': digest,
+                                                                 'cancel_state': None})
             except Exception as error:
                 message = str(error) if isinstance(error, TradingError) else "Подготовка Nado не выполнена. Ордер не отправлен."
                 raise PreSubmissionError(message) from None
@@ -597,7 +610,7 @@ class NadoGateway:
             if result.get("status") != "success" or _obj(result.get("data")).get("digest") != digest:
                 raise UnknownExecution("Nado не подтвердил digest ордера. Повторная отправка запрещена.")
             observation = stream.collect(intent, digest)
-            if observation is not None:
+            if observation is not None and (not intent.post_only or observation.terminal):
                 expected = baseline + observation.filled_quantity * (1 if intent.side == "buy" else -1)
                 if self.position(intent.instrument) != expected or self.open_orders(intent.instrument):
                     raise UnknownExecution("Исполнение Nado расходится с фактическим spot-балансом. Нужна сверка.")
@@ -607,8 +620,48 @@ class NadoGateway:
             return observation
         raise UnknownExecution("Nado не подтвердил полный результат ордера. Нужна сверка исполнений.")
 
+    def _cancel_maker(self, intent, digest, record):
+        """Persist the ONE cancellation before sending. A lost reply is read-only recovery."""
+        nonce = (int((self.clock() + 30) * 1000) << 20) | (int(digest[2:10], 16) & ((1 << 20) - 1))
+        tx = {'sender': self.sender, 'productIds': [intent.instrument.id], 'digests': [digest], 'nonce': nonce}
+        record.update(cancel_state='INTENT', cancel_tx=tx)
+        self.journal.set('maker:' + intent.client_id, record)
+        signature, _ = self.signer.sign(typed_data('Cancellation', CANCEL_FIELDS, tx, *self._contracts))
+        try:
+            result = self.transport.execute({'cancel_orders': {'tx': tx | {'nonce': str(nonce)}, 'signature': signature}})
+        except Exception:
+            raise UnknownExecution('Ответ отмены maker-ордера Nado неизвестен. Повторная отправка запрещена; выполняется сверка.') from None
+        rows = result.get('data', {}).get('cancelled_orders', []) if result.get('status') == 'success' else []
+        if not isinstance(rows, list) or len(rows) != 1:
+            return record
+        item = _obj(rows[0])
+        message, _, _ = self._order(intent)
+        if (item.get('digest') != digest or str(item.get('sender', '')).lower() != self.sender or
+                _integer(item.get('product_id')) != intent.instrument.id or
+                _integer(item.get('nonce'), maximum=2**64-1) != intent.nonce or
+                _integer(item.get('expiration'), maximum=2**64-1) != intent.expiry or
+                _integer(item.get('appendix')) != message['appendix'] or
+                _x18(item.get('price_x18')) != intent.limit_price or
+                _x18(item.get('amount')) != intent.quantity * (1 if intent.side == 'buy' else -1)):
+            raise UnknownExecution('Ответ отмены Nado относится к другому ордеру.')
+        remaining = _x18(item.get('unfilled_amount'))
+        if abs(remaining) > intent.quantity or (remaining != 0 and (remaining > 0) != (intent.side == 'buy')):
+            raise UnknownExecution('Nado не подтвердил остаток отменённого ордера.')
+        record.update(cancel_state='CONFIRMED', filled=str(intent.quantity - abs(remaining)))
+        self.journal.set('maker:' + intent.client_id, record)
+        return record
+
     def lookup(self, intent):
         _, _, digest = self._order(intent)
+        record = self.journal.get('maker:' + intent.client_id) if intent.post_only and self.journal else None
+        if record and record['digest'] != digest:
+            raise UnknownExecution('Digest maker-ордера отличается от сохранённого журнала.')
+        if record and record.get('cancel_state') is None and digest in self.open_orders(intent.instrument):
+            record = self._cancel_maker(intent, digest, record)
+        if record and record.get('cancel_state') == 'CONFIRMED' and Decimal(record['filled']) == 0:
+            if not self.open_orders(intent.instrument) and self.position(intent.instrument) == Decimal(record['baseline']):
+                return OrderObservation(intent.client_id, 'CANCELLED', Decimal(0), exchange_id=digest)
+            return None
         rows = _list(_obj(self.transport.archive_orders(digest)).get("orders"))
         if not rows:
             return None
@@ -642,5 +695,10 @@ class NadoGateway:
         post_amount = _x18(_obj(spot.get("balance")).get("amount"))
         if self.position(intent.instrument) != post_amount:
             return OrderObservation(intent.client_id, "PENDING", filled, abs(quote) / filled, fee, digest, filled_at)
+        if intent.post_only:
+            if record is None or self.position(intent.instrument) != Decimal(record['baseline']) + signed_filled:
+                return OrderObservation(intent.client_id, 'PENDING', filled, abs(quote) / filled, fee, digest, filled_at)
+            if filled < intent.quantity and (record.get('cancel_state') != 'CONFIRMED' or Decimal(record['filled']) != filled):
+                return OrderObservation(intent.client_id, 'PENDING', filled, abs(quote) / filled, fee, digest, filled_at)
         return OrderObservation(intent.client_id, "FILLED" if filled == intent.quantity else "CANCELLED",
                                 filled, abs(quote) / filled, fee, digest, filled_at)

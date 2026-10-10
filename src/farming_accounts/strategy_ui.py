@@ -88,7 +88,7 @@ class StrategyDialog:
         self.saved_assets = list((panel.data.get('strategy') or {}).get('assets', ()))
         root = panel.app.root
         self.window = dialog = tk.Toplevel(root)
-        dialog.title('Стратегия · выбор активов и ограничения')
+        dialog.title('Стратегия · активы, сумма и время')
         dialog.configure(bg=PANEL)
         dialog.transient(root)
         dialog.close_handler = self.close
@@ -134,16 +134,28 @@ class StrategyDialog:
         self.market_box = tk.Frame(inner, bg=PANEL)
         self.market_box.pack(fill='x', pady=(8, 16))
 
-        label(inner, 'Размер позиции и защита исполнения', bold=True, size=14).pack(anchor='w')
-        label(inner, 'Наведите на кружок ! для пояснения. Денежные ограничения выбираете вы; бот не подставляет их за вас.',
-              color=MUTED, size=9, wraplength=840, anchor='w', justify='left').pack(fill='x', pady=(5, 8))
+        first = inner.winfo_children()[0]
+        label(inner, 'Сумма и время одного цикла', bold=True, size=14).pack(anchor='w', before=first)
+        label(inner, 'Nado: maker post-only, ожидание до 20 секунд и отмена остатка. Lighter: хедж фактического исполнения с ограничением цены. Защита рассчитывается автоматически; исполнение и отсутствие потерь не гарантированы.',
+              color=MUTED, size=9, wraplength=840, anchor='w', justify='left').pack(fill='x', pady=(5, 8), before=first)
         grid = tk.Frame(inner, bg=PANEL)
-        grid.pack(fill='x')
+        grid.pack(fill='x', before=first)
+        self.advanced = tk.BooleanVar(dialog, value=False)
+        self.advanced_check = tk.Checkbutton(inner, text='Настроить защиту вручную', variable=self.advanced,
+                                             command=self.toggle_advanced, bg=PANEL, fg=INK,
+                                             activebackground=PANEL, activeforeground=INK, selectcolor=FIELD)
+        self.advanced_check.pack(anchor='w', pady=(6, 20), before=first)
+        self.advanced_grid = tk.Frame(inner, bg=PANEL)
         saved = panel.data.get('strategy') or {}
+        basic_index, advanced_index = 0, 0
         for index, (key, title, help_text) in enumerate(FIELDS):
-            row, column = divmod(index, 2)
-            grid.columnconfigure(column, weight=1, uniform='strategy')
-            frame = tk.Frame(grid, bg=PANEL)
+            basic = key in ('notional_per_leg', 'hold_hours')
+            target = grid if basic else self.advanced_grid
+            row, column = divmod(basic_index if basic else advanced_index, 2)
+            basic_index += int(basic)
+            advanced_index += int(not basic)
+            target.columnconfigure(column, weight=1, uniform='strategy')
+            frame = tk.Frame(target, bg=PANEL)
             frame.grid(row=row, column=column, sticky='nsew', padx=(0, 14) if column == 0 else (14, 0), pady=8)
             heading = tk.Frame(frame, bg=PANEL)
             heading.pack(fill='x')
@@ -161,15 +173,31 @@ class StrategyDialog:
             entry.insert(0, str(value))
         label(inner, 'Подтверждение программы xPoints', bold=True, size=13).pack(anchor='w', pady=(15, 7))
         self.verified = tk.BooleanVar(dialog, value=False)
-        self.points_check = tk.Checkbutton(inner, text='Я проверил участие аккаунта и выбранных spot xStocks в действующей программе xPoints',
+        self.points_check = tk.Checkbutton(footer, text='Я проверил участие аккаунта и выбранных spot xStocks в действующей программе xPoints',
                                           variable=self.verified, command=self.update_actions, bg=PANEL, fg=INK,
                                           activebackground=PANEL, activeforeground=INK, selectcolor=FIELD,
                                           wraplength=820, justify='left', anchor='w')
-        self.points_check.pack(fill='x')
+        self.points_check.pack(fill='x', before=self.status, pady=(0, 6))
         label(inner, 'Наличие пары в API подтверждает рынки, но не право на поинты. Проверьте условия и участие аккаунта по ссылке.',
               color=MUTED, size=9, wraplength=840, justify='left', anchor='w').pack(fill='x', pady=6)
         ttk.Button(inner, text='Открыть правила xPoints', command=lambda: webbrowser.open(POINTS_URL)).pack(anchor='w', pady=6)
         self.refresh()
+
+    def toggle_advanced(self):
+        if self.advanced.get():
+            self.advanced_grid.pack(fill='x', after=self.advanced_check)
+            from .trade_config import canonical_strategy
+            try:
+                defaults = canonical_strategy({'mode': 'automatic', 'notional_per_leg': self.entries['notional_per_leg'].get()})
+            except TradingError:
+                defaults = {}
+            for key, entry in self.entries.items():
+                if entry.get().strip():
+                    continue
+                value = Decimal(defaults['max_slippage_bps']) / 100 if key == 'slippage_percent' and defaults else defaults.get(key, '')
+                entry.insert(0, str(value))
+        else:
+            self.advanced_grid.pack_forget()
 
     def alive(self):
         return bool(self.window.winfo_exists())
@@ -179,6 +207,7 @@ class StrategyDialog:
         self.save_button.configure(state='normal' if enabled else 'disabled')
         self.refresh_button.configure(state='disabled' if self.pending else 'normal')
         self.points_check.configure(state='disabled' if self.pending else 'normal')
+        self.advanced_check.configure(state='disabled' if self.pending else 'normal')
         for asset, check in self.checks.items():
             row = next(item for item in self.markets if item['asset'] == asset)
             check.configure(state='normal' if self.ready and not self.pending and row['can_select'] else 'disabled')
@@ -252,12 +281,11 @@ class StrategyDialog:
                                                       activebackground=PANEL, activeforeground=INK, selectcolor=FIELD,
                                                       anchor='w', font=('Segoe UI', 10))
             check.pack(anchor='w')
-            label(frame, f"{row['nado_symbol']} · Nado ID {row['nado_id']} ↔ Lighter ID {row['lighter_id']}\n{row['status']}",
-                  color=MUTED, size=9, justify='left', anchor='w', wraplength=380).pack(fill='x', padx=(24, 0))
             minimum = tk.Frame(frame, bg=PANEL)
             minimum.pack(fill='x', padx=(24, 0))
-            HelpIcon(minimum, f"Минимальная стоимость ордера из текущего API: Nado — {row['nado_min_notional']} USDT0; Lighter — {row['lighter_min_notional']} USDG. Перед стартом бот также проверяет шаг количества, округления, комиссии, цены и обеспечение. Эти ID получены из API и не вводятся вручную.").pack(side='right')
-            label(minimum, f"Минимум: {row['nado_min_notional']} USDT0 / {row['lighter_min_notional']} USDG", color=MUTED, size=9).pack(side='left')
+            HelpIcon(minimum, f"{row['nado_symbol']} · Nado ID {row['nado_id']} ↔ {row['lighter_symbol']} · Lighter ID {row['lighter_id']}. Минимальная стоимость ордера из текущего API: Nado — {row['nado_min_notional']} USDT0; Lighter — {row['lighter_min_notional']} USDG. Перед стартом бот также проверяет округления, комиссии, цены и обеспечение. ID берутся из API автоматически.").pack(side='right')
+            label(minimum, f"{row['status']}\nМинимум: {row['nado_min_notional']} USDT0 / {row['lighter_min_notional']} USDG",
+                  color=MUTED, size=9, justify='left', anchor='w', wraplength=345).pack(side='left', fill='x', expand=True)
         self.ready = True
         self.catalog_status.configure(text=f'Пары из API: {len(markets)} · обновлено {stamp}')
         self.selection_changed()
@@ -281,8 +309,10 @@ class StrategyDialog:
         if not set(assets) <= {row['asset'] for row in self.markets if row['can_select']}:
             self.status.configure(text='Выбран недоступный рынок. Обновите список и выберите подходящие активы.')
             return
-        value = {}
+        value = {'mode': 'manual' if self.advanced.get() else 'automatic', 'nado_post_only': True, 'preserve_spot_dust': True}
         for key, title, _ in FIELDS:
+            if not self.advanced.get() and key not in ('notional_per_leg', 'hold_hours'):
+                continue
             raw = self.entries[key].get().strip().replace(',', '.')
             try:
                 number = Decimal(raw)

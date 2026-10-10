@@ -53,6 +53,7 @@ class OrderIntent:
     reduce_only: bool
     nonce: int
     expiry: int
+    post_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,8 +94,12 @@ class Strategy:
     quote_max_age_seconds: int
     hold_seconds: int = 43200
     points_verified_assets: tuple[str, ...] = ()
+    nado_post_only: bool = False
+    preserve_spot_dust: bool = False
 
     def validate(self) -> None:
+        if any(not isinstance(value, bool) for value in (self.nado_post_only, self.preserve_spot_dust)):
+            raise TradingError('Некорректный режим исполнения стратегии.')
         amounts = (self.notional_per_leg, self.max_slippage_bps, self.residual_notional,
                    self.margin_reserve, self.max_loss_quote)
         if not self.assets or len(set(self.assets)) != len(self.assets):

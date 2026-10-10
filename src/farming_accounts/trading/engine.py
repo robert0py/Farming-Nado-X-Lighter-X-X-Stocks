@@ -54,6 +54,16 @@ class Engine:
             raise TradingError("Стакан недоступен, устарел или содержит некорректные цены.")
         return result
 
+    def _baseline(self, pair, books, strategy):
+        spot = self.nado.position(pair[0])
+        dust_limit = min(Decimal('0.1'), strategy.notional_per_leg * Decimal('0.001'))
+        dust = (strategy.preserve_spot_dust and 0 <= spot < pair[0].quantity_step and
+                spot * books[0].ask <= dust_limit)
+        if (spot != 0 and not dust or self.lighter.position(pair[1]) != 0 or
+                self.nado.open_orders(pair[0]) or self.lighter.open_orders(pair[1])):
+            raise TradingError('На выбранном рынке есть существующие позиции или ордера. Бот не принимает их под управление.')
+        return spot
+
     @staticmethod
     def _strategy(cycle: dict) -> Strategy:
         raw = dict(cycle["strategy"])
@@ -83,8 +93,7 @@ class Engine:
                     books = [self._book(i, self.strategy) for i in pair]
                     if not all(i.tradable for i in pair):
                         raise TradingError("Новое открытие сейчас запрещено площадкой.")
-                    if any(self._gateway(i.venue).position(i) != 0 or self._gateway(i.venue).open_orders(i) for i in pair):
-                        raise TradingError("На выбранном рынке есть существующие позиции или ордера.")
+                    baseline = self._baseline(pair, books, self.strategy)
                     target = self._opening_size(pair[0], books[0], self.strategy)
                     underlying = target * pair[0].multiplier
                     hedge = quantize(underlying / pair[1].multiplier, pair[1].quantity_step)
@@ -102,7 +111,8 @@ class Engine:
                         checker = getattr(self._gateway(instrument.venue), "execution_ready", None)
                         if checker is not None:
                             checker(instrument)
-                    result.append({"asset": asset, "ready": True, "reason": "Пара и единицы подтверждены."})
+                    result.append({"asset": asset, "ready": True, "reason": "Пара и единицы подтверждены.",
+                                   "spot_baseline": str(baseline), "nado_post_only": self.strategy.nado_post_only})
                 except TradingError as error:
                     result.append({"asset": asset, "ready": False, "reason": str(error)})
             return {"markets": result, "nado_available": str(cash), "lighter_available": str(margin)}
@@ -114,7 +124,8 @@ class Engine:
                 raise TradingError("Текущий цикл остановлен из-за риска. Сначала устраните причину и выполните сверку.")
             preflight = self.preflight() if not current or current["state"] == "CLOSED" else None
             if preflight and not any(x["ready"] for x in preflight["markets"]):
-                raise TradingError("Нет доступного подтверждённого рынка для хеджа.")
+                reasons = '; '.join(f"{x['asset']}: {x['reason']}" for x in preflight['markets'])
+                raise TradingError("Нет готового рынка для хеджа. " + reasons)
             self.journal.set("strategy", asdict(self.strategy))
             self.journal.set("running", True)
             self.journal.set("close_requested", False)
@@ -154,12 +165,15 @@ class Engine:
         self.journal.save_cycle(cycle, message=message if changed else "", time=self.clock())
 
     def _opening_size(self, instrument: Instrument, book: Book, strategy: Strategy) -> Decimal:
-        cap = quantize(book.ask * (1 + strategy.max_slippage_bps / 10000), instrument.price_tick)
-        if cap < book.ask or cap <= 0:
+        maker = strategy.nado_post_only
+        cap = quantize(book.bid if maker else book.ask * (1 + strategy.max_slippage_bps / 10000), instrument.price_tick)
+        if (not maker and cap < book.ask) or cap <= 0:
             raise TradingError("Ценовой шаг не позволяет соблюсти установленное проскальзывание.")
         quantity = quantize(strategy.notional_per_leg / cap, instrument.quantity_step)
         if quantity < instrument.min_qty or quantity * cap < instrument.min_notional:
-            raise TradingError("Размер позиции меньше минимального ордера после округления.")
+            minimum = quantize(max(instrument.min_qty, instrument.min_notional / cap),
+                               instrument.quantity_step, upward=True) * cap
+            raise TradingError(f"После округления нужна сумма не меньше {minimum} USDT0 при текущей цене. Увеличьте бюджет или уберите этот актив.")
         return quantity
 
     def _new_cycle(self) -> dict | None:
@@ -180,8 +194,7 @@ class Engine:
                 continue
             try:
                 books = [self._book(i, self.strategy) for i in pair]
-                if any(self._gateway(i.venue).position(i) != 0 or self._gateway(i.venue).open_orders(i) for i in pair):
-                    raise TradingError("На рынке есть позиции или ордера вне журнала бота.")
+                baseline = self._baseline(pair, books, self.strategy)
                 target = self._opening_size(pair[0], books[0], self.strategy)
                 underlying = target * pair[0].multiplier
                 hedge_size = quantize(underlying / pair[1].multiplier, pair[1].quantity_step)
@@ -196,12 +209,14 @@ class Engine:
                     raise TradingError("Недостаточно свободных средств для обеих экспозиций с заданным резервом.")
                 cycle = {"id": uuid.uuid4().hex, "asset": asset, "state": "OPENING_SPOT",
                          "spot_id": pair[0].id, "perp_id": pair[1].id, "target_spot": str(target),
+                         "spot_baseline": str(baseline),
                          "strategy": json.loads(encoded(asdict(self.strategy))),
                          "opened_at": self.clock(), "hedged_at": None, "deadline": None,
                          "unhedged_since": self.clock(), "spot_quantity": "0", "perp_quantity": "0",
                          "residual_notional": "0", "pnl_quote": "0", "attempts": 0,
                          "closing_requested": False}
                 self._transition(cycle, "OPENING_SPOT", "Начало подтверждённого хедж-цикла.")
+                self.journal.set('waiting_reason', None)
                 return cycle
             except TradingError as error:
                 reason = str(error)
@@ -239,7 +254,7 @@ class Engine:
                 if result.client_id != intent.client_id:
                     raise TradingError("Площадка вернула другой ордер при сверке.")
                 self.journal.observe(result, observed_at=self.clock())
-                if result.terminal and intent.reduce_only and result.filled_quantity == 0:
+                if result.terminal and intent.reduce_only and result.filled_quantity == 0 and not intent.post_only:
                     self.journal.set("running", False)
                     self._transition(cycle, "HALTED", "Закрытие не исполнилось. Остаток сохранён; автоматических повторов нет.")
                     return False
@@ -257,12 +272,16 @@ class Engine:
             raise TradingError("Котировка устарела перед отправкой ордера.")
         quantity = quantize(quantity, instrument.quantity_step)
         factor = strategy.max_slippage_bps / 10000
-        limit = quantize(book.ask * (1 + factor), instrument.price_tick) if side == "buy" else quantize(
-            book.bid * (1 - factor), instrument.price_tick, upward=True)
+        maker = instrument.venue.casefold() == 'nado' and strategy.nado_post_only
+        if maker:
+            limit = quantize(book.bid if side == 'buy' else book.ask, instrument.price_tick, upward=side == 'sell')
+        else:
+            limit = quantize(book.ask * (1 + factor), instrument.price_tick) if side == "buy" else quantize(
+                book.bid * (1 - factor), instrument.price_tick, upward=True)
         if quantity <= 0 or (not reduce_only and
                              (quantity < instrument.min_qty or quantity * limit < instrument.min_notional)):
             raise TradingError("Остаток меньше минимального ордера; требуется ручное безопасное завершение.")
-        if limit <= 0 or (side == "buy" and limit < book.ask) or (side == "sell" and limit > book.bid):
+        if limit <= 0 or (not maker and ((side == "buy" and limit < book.ask) or (side == "sell" and limit > book.bid))):
             raise TradingError("Ценовой шаг не позволяет соблюсти установленное проскальзывание.")
         if not instrument.tradable and not reduce_only:
             raise TradingError("Площадка сейчас запрещает исполнение этого инструмента.")
@@ -274,7 +293,7 @@ class Engine:
         expiry = int(self.clock()) + 90
         intent = OrderIntent(uuid.uuid5(uuid.NAMESPACE_URL, f"{cycle['id']}:{sequence}:{instrument.venue}").hex,
                              cycle["id"], instrument.venue, instrument, side, quantity, limit, reduce_only,
-                             (expiry * 1000 << 20) | sequence, expiry)
+                             (expiry * 1000 << 20) | sequence, expiry, post_only=maker)
         self.journal.put_intent(intent, action)
         cycle["attempts"] += 1
         self.journal.save_cycle(cycle)
@@ -285,14 +304,21 @@ class Engine:
             self.journal.observe(result, observed_at=self.clock())
             if not result.terminal:
                 self._transition(cycle, "RECOVERY", "Ордер принят; ожидание фактического исполнения.")
-            elif reduce_only and result.filled_quantity == 0:
+            elif reduce_only and result.filled_quantity == 0 and not maker:
                 self.journal.set("running", False)
                 self._transition(cycle, "HALTED", "Площадка не исполнила закрытие в пределах цены. Требуется проверка остатка; повторов нет.")
-        except PreSubmissionError:
+        except PreSubmissionError as error:
             self.journal.observe(OrderObservation(intent.client_id, "REJECTED", Decimal(0)), observed_at=self.clock())
             if reduce_only:
                 self.journal.set("running", False)
-                self._transition(cycle, "HALTED", "Закрытие отклонено до отправки. Остаток сохранён; проверьте доступ и ограничения.")
+                self._transition(cycle, "HALTED", 'Закрытие отклонено до отправки: ' + str(error))
+            elif instrument.venue.casefold() == 'nado':
+                self.journal.set('running', False)
+                self.journal.set('waiting_reason', str(error))
+                self._verified = False
+                self._transition(cycle, 'CLOSED', 'Ордер не отправлен: ' + str(error))
+            else:
+                self._transition(cycle, 'OPENING_HEDGE', 'Встречный ордер не отправлен: ' + str(error))
         except Exception:
             self.journal.mark_uncertain(intent.client_id)
             self._transition(cycle, "RECOVERY", "Результат отправки не подтверждён. Требуется сверка площадки.")
@@ -316,6 +342,7 @@ class Engine:
                     return self.status()
                 try:
                     self.strategy.validate()
+                    self._verified = False  # Linked signers can be replaced by a website between cycles.
                     self._verify()
                     cycle = self._new_cycle()
                 except TradingError as error:
@@ -337,7 +364,7 @@ class Engine:
                 spot_quantity, perp_quantity = self._quantities(cycle)
                 if spot_quantity < 0 or perp_quantity > 0:
                     raise TradingError("Нарушено направление позиций хеджа.")
-                if self.nado.position(spot) != spot_quantity or self.lighter.position(perp) != perp_quantity:
+                if self.nado.position(spot) != spot_quantity + Decimal(cycle.get('spot_baseline', '0')) or self.lighter.position(perp) != perp_quantity:
                     raise TradingError("Позиции площадок отличаются от подтверждённого журнала. Новые ордера запрещены.")
                 if self.nado.open_orders(spot) or self.lighter.open_orders(perp):
                     raise TradingError("На рынках обнаружены незавершённые ордера вне подтверждённого журнала.")
@@ -367,7 +394,7 @@ class Engine:
                     return self.status()
                 if cycle["state"] == "OPENING_SPOT" and cycle["attempts"] == 0 and not closing:
                     self._write(cycle, spot, spot_book, "buy", Decimal(cycle["target_spot"]), "open_spot", reduce_only=False)
-                    if cycle["state"] != "RECOVERY":
+                    if cycle["state"] not in ('RECOVERY', 'CLOSED', 'HALTED'):
                         self._transition(cycle, "OPENING_HEDGE", "Spot исполнение подтверждено; формирование встречной позиции.")
                     return self.status()
                 if spot_quantity == 0 and perp_quantity == 0 and cycle["attempts"]:
@@ -376,6 +403,11 @@ class Engine:
                     self.journal.set("close_requested", False)
                     return self.status()
                 if closing:
+                    empty_closes = sum(1 for index, (action, intent, obs) in enumerate(self.journal.orders(cycle['id']))
+                                       if index >= cycle.get('retry_budget_start', 0)
+                                       if action == 'close_spot' and intent.post_only and obs and obs.terminal and obs.filled_quantity == 0)
+                    if empty_closes >= 3:
+                        raise TradingError('Maker-закрытие трижды отменено без исполнения. Остаток сохранён; проверьте рынок и запросите закрытие снова.')
                     self._transition(cycle, "CLOSING", "Контролируемое закрытие обеих сторон.")
                     if perp_quantity < 0:
                         self._write(cycle, perp, perp_book, "buy", -perp_quantity, "close_perp", reduce_only=True)

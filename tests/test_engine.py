@@ -102,6 +102,40 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.nado.requests + self.lighter.requests, [])
         self.assertEqual(self.journal.history(), [])
 
+    def test_maker_uses_passive_price_and_preserves_existing_dust_through_cycle(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True, preserve_spot_dust=True)
+        self.nado.positions[1] = D('0.0001')
+        self.nado.book = lambda i: Book(D(199), D(201), self.clock())
+        self.hedge()
+        self.assertEqual(self.nado.requests[0].limit_price, D(199))
+        self.assertTrue(self.nado.requests[0].post_only)
+        self.assertEqual(self.engine.status()['cycle']['spot_baseline'], '0.0001')
+        self.engine.close_and_stop()
+        for _ in range(3):
+            self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'CLOSED')
+        self.assertEqual(self.nado.positions[1], D('0.0001'))
+        self.assertEqual(self.nado.requests[-1].limit_price, D(201))
+        self.assertTrue(self.nado.requests[-1].post_only)
+
+    def test_significant_preexisting_spot_is_never_adopted_as_bot_inventory(self):
+        self.engine.strategy = replace(self.strategy, preserve_spot_dust=True)
+        self.nado.positions[1] = D('0.5')
+        result = self.engine.preflight()
+        self.assertFalse(result['markets'][0]['ready'])
+        self.assertEqual(self.nado.requests, [])
+
+    def test_minimum_after_rounding_is_explained_without_raising_user_budget(self):
+        self.engine.strategy = replace(self.strategy, notional_per_leg=D(100), nado_post_only=True)
+        self.nado.items = tuple(replace(i, min_notional=D(100), quantity_step=D('0.03')) for i in self.nado.items)
+        self.nado.book = lambda i: Book(D(101), D(102), self.clock())
+        result = self.engine.preflight()
+        self.assertFalse(result['markets'][0]['ready'])
+        self.assertIn('103.02', result['markets'][0]['reason'])
+        with self.assertRaisesRegex(TradingError, '103.02'):
+            self.engine.start()
+        self.assertEqual(self.nado.requests, [])
+
     def test_partial_spot_hedges_only_actual_underlying(self):
         self.nado.responses.append(D(3))
         self.hedge()

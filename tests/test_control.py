@@ -44,6 +44,34 @@ class ControlTests(unittest.TestCase):
         with self.assertRaises(ControlError):
             ControlClient(self.url, 'bad_token_' * 5).request('/status')
 
+    def test_failed_reverification_removes_stale_green_status(self):
+        self.runtime.verified['nado'] = True
+        gateway = Mock()
+        gateway.verify.side_effect = TradingError('Signer был заменён')
+        with patch.object(self.runtime, 'gateway', return_value=gateway):
+            with self.assertRaises(ControlError):
+                self.client.request('/verify', {'venue': 'nado'})
+        status = self.client.request('/status')
+        self.assertFalse(status['verified'].get('nado', False))
+        self.assertIn('Signer', status['error'])
+
+    def test_relink_prepares_saved_signer_without_rotating_key_or_signing_for_owner(self):
+        key = '0x' + '11' * 32
+        owner = '0x' + '22' * 20
+        self.runtime.vault.update(lambda data: data.update(trading={'revision': 5, 'nado': {
+            'owner': owner, 'subaccount': 'default', 'private_key': key}}))
+        helper = Mock()
+        helper.link_typed_data.return_value = {'typed_data': {'message': {'nonce': 7}},
+                                              'signer_address': '0x' + '33' * 20}
+        with patch('farming_accounts.trading.nado.NadoRegistration', return_value=helper):
+            result = self.runtime.command('/relink/nado', {'command_id': 'f' * 32, 'revision': 5})
+        self.assertTrue(result['ok'])
+        self.assertIn('wallet_url', result)
+        pending = self.runtime.vault.load()['pending_registration']
+        self.assertEqual(pending['credentials']['private_key'], key)
+        self.assertNotIn(key, str(result))
+        helper.submit_link.assert_not_called()
+
     def test_cross_origin_request_is_denied_even_with_correct_token(self):
         request = Request(self.url + '/status', headers={'Authorization': 'Bearer ' + self.runtime.token, 'Origin': 'https://untrusted.test'})
         with self.assertRaises(HTTPError) as raised:

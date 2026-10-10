@@ -49,13 +49,15 @@ class TradingPanel:
             commands.pack(fill='x', padx=12, pady=(0, 12))
             self.button(commands, 'Настроить ключ', lambda v=venue: self.credentials_dialog(v)).pack(side='left', padx=4)
             self.button(commands, 'Проверить доступ', lambda v=venue: self.request('/verify', {'venue': v})).pack(side='left', padx=4)
+            if venue == 'nado':
+                self.button(card, 'Перепривязать ключ Nado', self.relink_nado).pack(anchor='w', padx=16, pady=(0, 12))
         strategy = tk.Frame(parent, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
         strategy.pack(fill='x', pady=12)
         top = tk.Frame(strategy, bg=PANEL)
         top.pack(fill='x', padx=16, pady=(12, 8))
         label(top, 'Циклический хедж', bold=True, size=15).pack(side='left')
         self.button(top, 'Настройки стратегии', self.strategy_dialog).pack(side='right')
-        self.summary = label(strategy, 'Выберите активы, размер позиции и ограничения.', color=MUTED, anchor='w', wraplength=850, size=10)
+        self.summary = label(strategy, 'Выберите активы, сумму покупки и время удержания. Защита рассчитывается автоматически.', color=MUTED, anchor='w', wraplength=850, size=10)
         self.summary.pack(fill='x', padx=16, pady=(0, 10))
         actions = tk.Frame(strategy, bg=PANEL)
         actions.pack(fill='x', padx=12, pady=(0, 12))
@@ -195,6 +197,30 @@ class TradingPanel:
     def strategy_dialog(self):
         from .strategy_ui import StrategyDialog
         return StrategyDialog(self)
+
+    def relink_nado(self):
+        def ready(result):
+            from .app import label, MUTED
+            dialog, content = self.dialog('Перепривязать сохранённый ключ Nado', 760, 340)
+            label(content, 'Подтвердите одну подпись в MetaMask', bold=True, size=15).pack(anchor='w')
+            label(content, 'Откройте ссылку в браузере с MetaMask. Выберите кошелёк владельца аккаунта, указанный на странице, и подтвердите привязку. Бот сохраняет свой прежний ключ. Затем вернитесь и нажмите «Проверить доступ».',
+                  wraplength=705, justify='left', color=MUTED, size=10).pack(fill='x', pady=12)
+            value = tk.StringVar(dialog, value=result['wallet_url'])
+            ttk.Entry(content, textvariable=value, state='readonly').pack(fill='x', pady=8)
+            def open_link():
+                try:
+                    opened = webbrowser.open(value.get())
+                except Exception:
+                    opened = False
+                if not opened:
+                    self.message.configure(text='Скопируйте ссылку и откройте её в браузере с MetaMask.')
+            def copy():
+                dialog.clipboard_clear()
+                dialog.clipboard_append(value.get())
+            ttk.Button(content, text='Открыть MetaMask в браузере', command=open_link).pack(anchor='w', pady=5)
+            ttk.Button(content, text='Скопировать ссылку', command=copy).pack(anchor='w', pady=5)
+            open_link()
+        self.request('/relink/nado', {'revision': self.data.get('revision', 0)}, callback=ready)
 
     def render_buttons(self):
         for button in self.buttons:

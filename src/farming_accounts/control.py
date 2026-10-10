@@ -42,7 +42,7 @@ class ControlClient:
     def request(self, path: str, data: dict | None = None) -> dict:
         if path not in ('/status', '/markets', '/preflight', '/credentials', '/strategy', '/start',
                         '/stop', '/close', '/verify', '/register/nado', '/register/lighter',
-                        '/registration-options/lighter', '/recover-registration', '/shutdown'):
+                        '/registration-options/lighter', '/relink/nado', '/recover-registration', '/shutdown'):
             raise ControlError('Неизвестная команда worker.')
         body = None if data is None else json.dumps(data | {'command_id': secrets.token_hex(16)}, allow_nan=False).encode()
         req = Request(self.url + path, body, method='GET' if body is None else 'POST',

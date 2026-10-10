@@ -13,7 +13,7 @@ import threading
 import time
 
 from . import __version__
-from .trade_config import credentials, public_credentials, strategy
+from .trade_config import credentials, public_credentials, strategy, canonical_strategy
 from .trading.domain import TradingError
 from .trading.journal import Journal, encoded
 from .vault import Vault, VaultError, state_directory
@@ -52,7 +52,7 @@ class Runtime:
         if venue == 'nado':
             from .trading.nado import NadoGateway
             assets = tuple((config or self.config()).get('strategy', {}).get('assets', ()))
-            return NadoGateway(value['owner'], value['subaccount'], value['private_key'], assets)
+            return NadoGateway(value['owner'], value['subaccount'], value['private_key'], assets, journal=self.journal)
         from .trading.lighter import LighterCredentials, LighterVenue
         return LighterVenue(LighterCredentials(**value))
 
@@ -125,10 +125,19 @@ class Runtime:
                 db.execute('INSERT INTO commands VALUES(?,?,NULL)', (identity, route))
             try:
                 response = self._command(route, value)
+                if (response.get('ok') and route in ('/verify', '/preflight', '/start', '/strategy', '/credentials', '/recover-registration')
+                        and not (route == '/verify' and value.get('venue') != 'nado' and 'linked signer' in self.error)):
+                    self.error = ''
             except (TradingError, VaultError) as error:
+                self.error = str(error)
+                if route in ('/preflight', '/start'):
+                    self.verified.clear()
+                elif route == '/verify':
+                    self.verified.pop(value.get('venue'), None)
                 response = {'ok': False, 'error': str(error)}
             except Exception:
                 response = {'ok': False, 'error': 'Операция не завершена. Проверьте состояние worker и авторизацию; секреты не включены в ошибку.'}
+                self.error = response['error']
             # Wallet token is deliberately transient and absent from the durable journal.
             durable = response if 'wallet_url' not in response else {'ok': False, 'error': 'Откройте новую сессию регистрации ключа.'}
             with self.journal.transaction() as db:
@@ -140,7 +149,7 @@ class Runtime:
             self.mutable()  # Setup reads must not hold the execution lock during an active hedge.
             from .trading.lighter_setup import registration_options
             return registration_options(value.get('credentials', {}))
-        if route in ('/credentials', '/strategy', '/register/nado', '/register/lighter'):
+        if route in ('/credentials', '/strategy', '/register/nado', '/register/lighter', '/relink/nado'):
             if route != '/credentials':
                 self.mutable()
             config = self.config()
@@ -182,7 +191,7 @@ class Runtime:
             self.verified.pop(venue, None)
             return {'ok': True, 'message': 'Ключ сохранён зашифрованно. Выполните проверку доступа.'}
         if route == '/strategy':
-            settings = value['strategy']
+            settings = canonical_strategy(value['strategy'])
             strategy(settings)
             if not config.get('nado') or not config.get('lighter'):
                 raise TradingError('Сначала настройте оба торговых аккаунта.')
@@ -247,14 +256,16 @@ class Runtime:
         if route == '/close':
             self.build_engine().close_and_stop()
             return {'ok': True, 'message': 'Worker получил команду контролируемого закрытия обеих сторон.'}
-        if route in ('/register/nado', '/register/lighter'):
+        if route in ('/register/nado', '/register/lighter', '/relink/nado'):
             venue = route.rsplit('/', 1)[1]
-            data = credentials(venue, value['credentials'], require_key=False)
+            if route == '/relink/nado' and not config.get('nado', {}).get('private_key'):
+                raise TradingError('Сначала сохраните отдельный ключ Nado.')
+            data = dict(config['nado']) if route == '/relink/nado' and config.get('nado') else credentials(venue, value.get('credentials', {}), require_key=False)
             token = secrets.token_urlsafe(32)
             if venue == 'nado':
                 from eth_account import Account
                 from .trading.nado import NadoRegistration
-                key = '0x' + Account.create().key.hex().removeprefix('0x')
+                key = data['private_key'] if route == '/relink/nado' else '0x' + Account.create().key.hex().removeprefix('0x')
                 data['private_key'] = key
                 helper = NadoRegistration(data['owner'], data['subaccount'], key)
                 challenge = helper.link_typed_data()
@@ -335,7 +346,14 @@ class Runtime:
                         if self.journal.get('running', False):
                             engine.stop_new_cycles()
                     engine.tick()
-                    self.error = ''
+                    state = engine.status()
+                    reason = state.get('waiting_reason') or (state.get('cycle') or {}).get('message', '')
+                    if 'linked signer' in reason:
+                        self.verified.pop('nado', None)
+                        self.error = reason
+                    if self.journal.get('running', False) and engine.status()['state'] not in ('HALTED', 'RECOVERY'):
+                        if 'linked signer' not in reason:
+                            self.error = ''
                 except (TradingError, VaultError) as error:
                     self.error = str(error)
                 except Exception:

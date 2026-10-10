@@ -60,7 +60,25 @@ def credentials(venue: str, value: dict, *, require_key=True) -> dict:
         raise TradingError('Проверьте адрес кошелька, имя субаккаунта и индексы аккаунта/ключа.') from None
 
 
+def canonical_strategy(value: dict) -> dict:
+    """Explicit product policy, not market guarantees or sample balances."""
+    if value.get('mode') != 'automatic':
+        return dict(value)
+    try:
+        amount = Decimal(str(value['notional_per_leg']).replace(',', '.'))
+        if not amount.is_finite() or not 0 < amount <= Decimal('1e12'):
+            raise ValueError()
+    except (KeyError, InvalidOperation, ValueError):
+        raise TradingError('Введите положительную сумму покупки на Nado.') from None
+    return dict(value, notional_per_leg=str(amount), max_slippage_bps='5',
+                residual_notional=str(amount * Decimal('0.001')),
+                margin_reserve=str(max(Decimal('0.5'), amount * Decimal('0.01'))),
+                max_loss_quote=str(amount * Decimal('0.01')), max_unhedged_seconds=90,
+                quote_max_age_seconds=30, nado_post_only=True, preserve_spot_dust=True)
+
+
 def strategy(value: dict, *, clock=time.time) -> Strategy:
+    value = canonical_strategy(value)
     try:
         values = {name: Decimal(str(value[name])) for name in DECIMAL_FIELDS}
         values.update({name: int(str(value.get(name, 43200 if name == 'hold_seconds' else '')))
@@ -77,7 +95,9 @@ def strategy(value: dict, *, clock=time.time) -> Strategy:
         if (proof.get('account_enrolled') is not True or not isinstance(proof.get('assets'), list) or not 0 < confirmed <= clock() or
                 proof.get('url') != 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado'):
             raise TradingError('Подтвердите участие аккаунта и выбранных активов в действующей программе xPoints.')
-        result = Strategy(assets=assets, points_verified_assets=tuple(proof.get('assets', ())), **values)
+        result = Strategy(assets=assets, points_verified_assets=tuple(proof.get('assets', ())),
+                          nado_post_only=value.get('nado_post_only', False),
+                          preserve_spot_dust=value.get('preserve_spot_dust', False), **values)
         result.validate()
         return result
     except (KeyError, TypeError, ValueError, InvalidOperation, OverflowError):
