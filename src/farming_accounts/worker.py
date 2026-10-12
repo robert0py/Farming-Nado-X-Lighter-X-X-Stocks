@@ -45,6 +45,53 @@ class Runtime:
         if self.journal.get('running', False) or (cycle and cycle['state'] != 'CLOSED'):
             raise TradingError('Сначала остановите новые циклы и завершите текущий хедж. Аккаунты и стратегию нельзя менять при открытой экспозиции.')
 
+    def key_mutable(self, venue, replacement):
+        """Restore access to the same stopped account without discarding exposure."""
+        cycle = self.journal.active_cycle()
+        if not cycle or cycle['state'] == 'CLOSED':
+            self.mutable()
+            return False
+        if self.journal.get('running', False) or cycle['state'] not in ('HALTED', 'RECOVERY'):
+            raise TradingError('Остановите новые циклы перед восстановлением ключа. Незавершённый ордер должен находиться в состоянии сверки или остановки.')
+        names = ('owner', 'subaccount') if venue == 'nado' else ('wallet_address', 'account_index')
+        def identity(data):
+            return tuple(str(data.get(name)).lower() if name in ('owner', 'wallet_address')
+                         else str(data.get(name)) for name in names)
+        previous = self.config().get(venue, {})
+        recorded = self.journal.get('account_identity', {}).get(venue)
+        if (any(previous.get(name) is None or replacement.get(name) is None for name in names)
+                or identity(previous) != identity(replacement)
+                or recorded and identity(recorded) != identity(replacement)):
+            raise TradingError('При восстановлении можно менять только ключ того же аккаунта. Смена аккаунта запрещена до сверки и закрытия прежних ордеров.')
+        return True
+
+    def note_restored_access(self, venue):
+        cycle = self.journal.active_cycle()
+        if cycle and cycle['state'] in ('HALTED', 'RECOVERY') and not self.journal.get('running', False):
+            if venue != 'nado' and 'linked signer' in self.error:
+                return
+            message = ('Доступ ' + venue + ' восстановлен. Новые циклы остановлены. '
+                       'Нажмите «Закрыть хедж и остановить» для сверки прежних ордеров; новый цикл не запускается.')
+            cycle['message'], cycle['updated_at'] = message, time.time()
+            self.journal.save_cycle(cycle, message=message)
+            self.error = ''
+
+    def request_stop(self, *, closing=False):
+        # Local durable control must work even when no gateway can be built.
+        self.journal.set('running', False)
+        if closing:
+            self.journal.set('close_requested', True)
+            cycle = self.journal.active_cycle()
+            if cycle and cycle['state'] == 'HALTED':
+                cycle['retry_budget_start'] = len(self.journal.orders(cycle['id']))
+                cycle['state'] = 'RECOVERY'
+                cycle['message'] = 'Запрошена сверка и закрытие. При ошибке ключа сначала восстановите доступ к тому же аккаунту.'
+                cycle['updated_at'] = time.time()
+                self.journal.save_cycle(cycle, message=cycle['message'])
+        message = ('Новые циклы остановлены. Закрытие запрошено; его выполнение требует действующих ключей и подтверждения бирж.'
+                   if closing else 'Новые циклы остановлены. При ошибке ключа восстановите доступ; прежние ордера сохранены для сверки.')
+        return self.status() | {'message': message}
+
     def gateway(self, venue, config=None):
         value = (config or self.config()).get(venue)
         if not value:
@@ -95,8 +142,12 @@ class Runtime:
     def status(self):
         with self.lock:
             config = self.config()
-            state = self.engine.status() if self.engine else {'state': 'NOT_CONFIGURED', 'running': False}
             cycle = self.journal.active_cycle()
+            state = self.engine.status() if self.engine else {
+                'state': cycle['state'] if cycle else 'IDLE' if config.get('strategy') else 'NOT_CONFIGURED',
+                'running': self.journal.get('running', False),
+                'close_requested': self.journal.get('close_requested', False), 'cycle': cycle,
+                'waiting_reason': self.journal.get('waiting_reason')}
             orders = {}
             if cycle:
                 for action, intent, observation in self.journal.orders(cycle['id']):
@@ -157,11 +208,15 @@ class Runtime:
 
     def _command(self, route, value):
         if route == '/registration-options/lighter':
-            self.mutable()  # Setup reads must not hold the execution lock during an active hedge.
+            inputs = dict(value.get('credentials', {}))
+            cycle = self.journal.active_cycle()
+            if cycle and cycle['state'] != 'CLOSED' and inputs.get('account_index') is None:
+                inputs['account_index'] = self.config().get('lighter', {}).get('account_index')
+            self.key_mutable('lighter', inputs)
             from .trading.lighter_setup import registration_options
-            return registration_options(value.get('credentials', {}))
+            return registration_options(inputs)
         if route in ('/credentials', '/strategy', '/register/nado', '/register/lighter', '/relink/nado'):
-            if route != '/credentials':
+            if route == '/strategy':
                 self.mutable()
             config = self.config()
             if value.get('revision') != config.get('revision', 0):
@@ -169,15 +224,8 @@ class Runtime:
         if route == '/credentials':
             venue = value['venue']
             replacement = credentials(venue, value['credentials'])
-            cycle = self.journal.active_cycle()
-            needs_recovery = self.journal.get('running', False) or (cycle and cycle['state'] != 'CLOSED')
+            needs_recovery = self.key_mutable(venue, replacement)
             if needs_recovery:
-                if not cycle or cycle['state'] not in ('HALTED', 'RECOVERY'):
-                    self.mutable()
-                names = ('owner', 'subaccount') if venue == 'nado' else ('wallet_address', 'account_index')
-                previous = config.get(venue, {})
-                if any(str(previous.get(name)).lower() != str(replacement.get(name)).lower() for name in names):
-                    raise TradingError('При восстановлении можно заменить только ключ того же аккаунта. Закройте экспозицию перед сменой аккаунта.')
                 candidate = config | {venue: replacement}
                 gateway = self.gateway(venue, candidate)
                 try:
@@ -200,6 +248,8 @@ class Runtime:
             # Persist replacement and cancellation together, including after a crash.
             self.save_config(config, replaces_key_for=venue)
             self.verified.pop(venue, None)
+            if needs_recovery:
+                self.note_restored_access(venue)
             return {'ok': True, 'message': 'Ключ сохранён зашифрованно. Выполните проверку доступа.'}
         if route == '/strategy':
             settings = canonical_strategy(value['strategy'])
@@ -220,25 +270,28 @@ class Runtime:
             try:
                 gateway.verify()
                 self.verified[venue] = True
+                self.note_restored_access(venue)
                 return {'ok': True, 'message': 'Торговый ключ ' + venue + ' подтверждён площадкой.'}
             finally:
                 close = getattr(gateway, 'close', None)
                 if close:
                     close()
         if route == '/recover-registration':
-            self.mutable()
             pending = self.vault.load().get('pending_registration')
             if not pending:
                 raise TradingError('Незавершённой привязки ключа нет.')
             venue = pending['venue']
             config = self.config()
-            config[venue] = pending['credentials']
+            replacement = credentials(venue, pending['credentials'])
+            self.key_mutable(venue, replacement)
+            config[venue] = replacement
             gateway = self.gateway(venue, config)
             try:
                 gateway.verify()
                 self.save_config(config)
                 self.vault.update(lambda v: v.pop('pending_registration', None))
                 self.verified[venue] = True
+                self.note_restored_access(venue)
                 return {'ok': True, 'message': 'Площадка подтвердила сохранённый ключ. Доступ восстановлен без повторной регистрации.'}
             finally:
                 closer = getattr(gateway, 'close', None)
@@ -262,16 +315,15 @@ class Runtime:
             self.build_engine().start()
             return {'ok': True, 'message': 'Стратегия запущена. Worker продолжает работать после закрытия приложения.'}
         if route == '/stop':
-            self.build_engine().stop_new_cycles()
-            return {'ok': True, 'message': 'Новые циклы остановлены. Текущий хедж завершится по таймеру.'}
+            return self.request_stop()
         if route == '/close':
-            self.build_engine().close_and_stop()
-            return {'ok': True, 'message': 'Worker получил команду контролируемого закрытия обеих сторон.'}
+            return self.request_stop(closing=True)
         if route in ('/register/nado', '/register/lighter', '/relink/nado'):
             venue = route.rsplit('/', 1)[1]
             if route == '/relink/nado' and not config.get('nado', {}).get('private_key'):
                 raise TradingError('Сначала сохраните отдельный ключ Nado.')
             data = dict(config['nado']) if route == '/relink/nado' and config.get('nado') else credentials(venue, value.get('credentials', {}), require_key=False)
+            self.key_mutable(venue, data)
             token = secrets.token_urlsafe(32)
             if venue == 'nado':
                 from eth_account import Account
@@ -308,7 +360,8 @@ class Runtime:
             expires = time.time() + 300
             public['expires_at'] = expires
             self.challenges = {token: {'venue': venue, 'helper': helper, 'challenge': challenge, 'public': public,
-                                       'credentials': data, 'expires': expires, 'used': False}}
+                                       'credentials': data, 'revision': config.get('revision', 0),
+                                       'expires': expires, 'used': False}}
             return {'ok': True, 'wallet_url': self.origin + '/wallet#' + token,
                     'message': 'Подтвердите привязку отдельного ключа в браузере. Основной приватный ключ не передаётся боту.'}
         raise TradingError('Неизвестная команда worker.')
@@ -330,7 +383,9 @@ class Runtime:
                 return {'ok': True, 'challenge': session['public']}
             if not re.fullmatch(r'0x[a-fA-F0-9]{130}', signature):
                 raise TradingError('Кошелёк вернул некорректную подпись.')
-            self.mutable()
+            self.key_mutable(session['venue'], session['credentials'])
+            if session.get('revision') is not None and session['revision'] != self.config().get('revision', 0):
+                raise TradingError('Настройки изменились после подготовки подписи. Создайте новую ссылку привязки.')
             session['used'] = True  # A network timeout cannot trigger a second registration POST.
             if session['venue'] == 'nado':
                 session['helper'].submit_link(signature, session['challenge'])
@@ -341,6 +396,7 @@ class Runtime:
             self.save_config(config)
             self.vault.update(lambda v: v.pop('pending_registration', None))
             self.verified.pop(session['venue'], None)
+            self.note_restored_access(session['venue'])
             return {'ok': True, 'message': 'Привязка отправлена. Вернитесь в приложение и нажмите «Проверить доступ».'}
 
     def tick_loop(self):

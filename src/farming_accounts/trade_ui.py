@@ -14,7 +14,7 @@ from .vault import Vault, VaultError, state_directory
 
 STATE_NAMES = {'NOT_CONFIGURED': 'Настройте доступ и стратегию', 'IDLE': 'Остановлен', 'WAITING': 'Ожидание рынка',
                'OPENING_SPOT': 'Покупка spot', 'OPENING_HEDGE': 'Формирование хеджа', 'HEDGED': 'Хедж удерживается',
-               'CLOSING': 'Закрытие обеих сторон', 'CLOSED': 'Цикл завершён', 'RECOVERY': 'Сверка исполнения', 'HALTED': 'Требуется проверка'}
+               'CLOSING': 'Закрытие обеих сторон', 'CLOSED': 'Цикл завершён', 'RECOVERY': 'Сверка прежнего ордера', 'HALTED': 'Остановлено · нужна сверка'}
 
 
 def cycle_label(cycle):
@@ -266,6 +266,8 @@ class TradingPanel:
             status_name = {'ACK': 'принят', 'PENDING': 'ожидает исполнения', 'UNKNOWN': 'результат сверяется',
                            'FILLED': 'исполнен', 'CANCELLED': 'отменён', 'REJECTED': 'отклонён',
                            'EXPIRED': 'истёк срок'}.get(order['status'], order['status'])
+            if state in ('HALTED', 'RECOVERY'):
+                status_name = 'последний известный статус: ' + status_name + '; требуется сверка'
             number = ' · ID ' + order['exchange_id'] if order.get('exchange_id') else ''
             details.append(f"{'Nado' if venue == 'nado' else 'Lighter'}: {status_name} · {order['quantity']} {order['asset']} по {order['limit_price']} · исполнено {order.get('filled_quantity') or '0'}{number}")
         self.order_detail.configure(text='\n'.join(details) if details else 'Ордеров текущей попытки нет.')
@@ -275,6 +277,8 @@ class TradingPanel:
                       else 'Хедж не был открыт; удержание не запускалось. ' + cycle.get('message', '')
                       if cycle.get('outcome') else 'Хедж не был открыт; удержание не запускалось.')
         if reason:
+            if execution.get('running') is False and state not in ('CLOSED', 'IDLE', 'NOT_CONFIGURED'):
+                reason = 'Новые циклы остановлены. ' + reason
             self.message.configure(text=reason)
         self.table.delete(*self.table.get_children())
         for item in self.data.get('history', ()):

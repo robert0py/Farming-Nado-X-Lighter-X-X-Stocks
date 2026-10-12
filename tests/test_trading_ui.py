@@ -75,6 +75,16 @@ class TradingDesktopTests(unittest.TestCase):
         row = self.panel.table.item(self.panel.table.get_children()[0], 'values')
         self.assertEqual(row[1], 'Цикл завершён')
 
+    def test_stopped_recovery_shows_stop_success_and_labels_order_as_last_known_status(self):
+        self.panel.data = {'error': 'Ключ Nado не совпадает с linked signer',
+            'execution': {'running': False, 'state': 'HALTED', 'cycle': {'id': 'saved', 'state': 'HALTED', 'asset': 'SPY'}},
+            'orders': [{'venue': 'nado', 'status': 'PENDING', 'quantity': '0.14', 'asset': 'wSPYx',
+                        'limit_price': '780', 'filled_quantity': '0', 'exchange_id': '0x' + 'ab' * 32}]}
+        self.panel.render()
+        self.assertIn('Новые циклы остановлены', self.panel.message.cget('text'))
+        self.assertIn('linked signer', self.panel.message.cget('text'))
+        self.assertIn('последний', self.panel.order_detail.cget('text'))
+
     def test_dismissed_dialog_callback_does_not_stop_status_updates(self):
         self.panel.client = Mock()
         def dismissed(_):

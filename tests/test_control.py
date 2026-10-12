@@ -250,6 +250,125 @@ class ControlTests(unittest.TestCase):
         return {'command_id': 'd' * 32, 'revision': 1, 'venue': 'nado', 'credentials': {
             'owner': '0x' + '22' * 20, 'subaccount': 'default', 'private_key': '0x' + '33' * 32}}
 
+    def test_stop_is_durable_without_keys_or_engine_and_keeps_unknown_order(self):
+        self.recovery_configuration()
+        self.runtime.journal.set('running', True)
+        self.runtime.error = 'Nado linked signer не совпадает'
+        with patch.object(self.runtime, 'build_engine', side_effect=TradingError('Ключ отсутствует')) as factory:
+            response = self.client.request('/stop', {})
+        factory.assert_not_called()
+        self.assertFalse(self.runtime.journal.get('running'))
+        self.assertEqual(self.runtime.journal.active_cycle()['state'], 'HALTED')
+        self.assertFalse(response['execution']['running'])
+        self.assertEqual(response['execution']['state'], 'HALTED')
+        self.assertIn('linked signer', response['error'])
+
+    def test_close_request_without_keys_does_not_claim_positions_closed(self):
+        self.recovery_configuration()
+        with patch.object(self.runtime, 'build_engine', side_effect=TradingError('Ключ отсутствует')) as factory:
+            response = self.client.request('/close', {})
+        factory.assert_not_called()
+        self.assertFalse(self.runtime.journal.get('running'))
+        self.assertTrue(self.runtime.journal.get('close_requested'))
+        self.assertEqual(response['execution']['state'], 'RECOVERY')
+        self.assertNotEqual(self.runtime.journal.active_cycle()['state'], 'CLOSED')
+
+    def test_saved_key_can_be_relinked_in_stopped_recovery_without_discarding_cycle(self):
+        self.recovery_configuration()
+        original = self.runtime.journal.active_cycle()
+        helper = Mock()
+        helper.link_typed_data.return_value = {'typed_data': {'message': {'nonce': 7}},
+                                              'signer_address': '0x' + '33' * 20}
+        with patch('farming_accounts.trading.nado.NadoRegistration', return_value=helper):
+            result = self.client.request('/relink/nado', {'revision': 1})
+        token = result['wallet_url'].split('#')[1]
+        self.assertEqual(self.runtime.journal.active_cycle(), original)
+        helper.submit_link.assert_not_called()
+        self.runtime.wallet(token, '0x' + '11' * 65)
+        helper.submit_link.assert_called_once()
+        self.assertFalse(self.runtime.journal.get('running', False))
+        self.assertEqual(self.runtime.journal.active_cycle()['state'], 'HALTED')
+        self.assertEqual(self.runtime.config()['nado']['private_key'], '0x' + '11' * 32)
+
+    def test_recovery_registration_cannot_change_account_or_run_during_active_strategy(self):
+        value = self.recovery_configuration()
+        with patch('farming_accounts.trading.nado.NadoRegistration') as helper:
+            with self.assertRaises(ControlError):
+                self.client.request('/register/nado', {'revision': 1, 'credentials': {
+                    'owner': value['credentials']['owner'], 'subaccount': 'other'}})
+            self.runtime.journal.set('running', True)
+            with self.assertRaises(ControlError):
+                self.client.request('/relink/nado', {'revision': 1})
+        helper.assert_not_called()
+
+    def test_recovery_wallet_signature_rechecks_stop_before_exchange_write(self):
+        self.recovery_configuration()
+        helper = Mock()
+        helper.link_typed_data.return_value = {'typed_data': {'message': {'nonce': 7}},
+                                              'signer_address': '0x' + '33' * 20}
+        with patch('farming_accounts.trading.nado.NadoRegistration', return_value=helper):
+            result = self.client.request('/relink/nado', {'revision': 1})
+        self.runtime.journal.set('running', True)
+        with self.assertRaises(TradingError):
+            self.runtime.wallet(result['wallet_url'].split('#')[1], '0x' + '11' * 65)
+        helper.submit_link.assert_not_called()
+
+    def test_pending_key_recovery_verifies_same_account_without_closing_cycle(self):
+        value = self.recovery_configuration()
+        self.runtime.vault.update(lambda data: data.update(pending_registration={
+            'venue': 'nado', 'credentials': value['credentials']}))
+        gateway = Mock()
+        with patch.object(self.runtime, 'gateway', return_value=gateway):
+            result = self.client.request('/recover-registration', {})
+        self.assertTrue(result['ok'])
+        gateway.verify.assert_called_once()
+        self.assertEqual(self.runtime.journal.active_cycle()['state'], 'HALTED')
+        self.assertFalse(self.runtime.journal.get('running', False))
+
+    def test_recovery_link_rejects_changed_revision_before_accepting_wallet_signature(self):
+        self.recovery_configuration()
+        helper = Mock()
+        helper.link_typed_data.return_value = {'typed_data': {'message': {'nonce': 7}},
+                                              'signer_address': '0x' + '33' * 20}
+        with patch('farming_accounts.trading.nado.NadoRegistration', return_value=helper):
+            result = self.client.request('/relink/nado', {'revision': 1})
+        self.runtime.vault.update(lambda data: data['trading'].update(revision=2))
+        with self.assertRaisesRegex(TradingError, 'Настройки изменились'):
+            self.runtime.wallet(result['wallet_url'].split('#')[1], '0x' + '11' * 65)
+        helper.submit_link.assert_not_called()
+
+    def test_stop_and_key_repair_preserve_partial_and_unknown_order_evidence(self):
+        from decimal import Decimal
+        from farming_accounts.trading.domain import Instrument, OrderIntent, OrderObservation
+        self.recovery_configuration()
+        instrument = Instrument('nado', 'SPY', 117, 'wSPYx', 'spot', Decimal('.002'),
+                                Decimal('.01'), Decimal(0), Decimal(100), Decimal(1))
+        intent = OrderIntent('uncertain-fixture', 'recovery-fixture', 'nado', instrument, 'buy',
+                             Decimal('.14'), Decimal(780), False, 7, 1800000900, True)
+        self.runtime.journal.put_intent(intent, 'open_spot')
+        self.runtime.journal.observe(OrderObservation(intent.client_id, 'PENDING', Decimal('.01'), Decimal(780),
+                                    exchange_id='0x' + 'ab' * 32))
+        self.runtime.journal.mark_uncertain(intent.client_id)
+        evidence = self.runtime.journal.orders(intent.cycle_id)
+        self.client.request('/stop', {})
+        helper = Mock()
+        helper.link_typed_data.return_value = {'typed_data': {'message': {'nonce': 7}},
+                                              'signer_address': '0x' + '33' * 20}
+        with patch('farming_accounts.trading.nado.NadoRegistration', return_value=helper):
+            link = self.client.request('/relink/nado', {'revision': 1})
+        self.runtime.wallet(link['wallet_url'].split('#')[1], '0x' + '11' * 65)
+        self.assertEqual(self.runtime.journal.orders(intent.cycle_id), evidence)
+        self.assertEqual(self.runtime.journal.db.execute('SELECT uncertain FROM orders').fetchone()[0], 1)
+        self.assertEqual(self.runtime.journal.active_cycle()['state'], 'HALTED')
+
+    def test_recovery_cannot_change_case_sensitive_subaccount_or_journal_account(self):
+        value = self.recovery_configuration()
+        with self.assertRaises(TradingError):
+            self.runtime.key_mutable('nado', value['credentials'] | {'subaccount': 'DEFAULT'})
+        self.runtime.journal.set('account_identity', {'nado': {'owner': '0x' + '44' * 20, 'subaccount': 'default'}})
+        with self.assertRaises(TradingError):
+            self.runtime.key_mutable('nado', value['credentials'])
+
     def test_revoked_key_can_be_replaced_only_for_same_account_after_verification(self):
         value = self.recovery_configuration()
         gateway = Mock()
