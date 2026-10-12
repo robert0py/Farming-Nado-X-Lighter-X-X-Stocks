@@ -8,7 +8,7 @@ import time
 import uuid
 
 from .domain import (Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, Strategy, TradingError,
-                     TradingGateway, UnknownExecution, quantize)
+                     TradingGateway, UnknownExecution, maker_opening_price, quantize)
 from .journal import Journal, encoded
 
 
@@ -171,7 +171,8 @@ class Engine:
 
     def _opening_size(self, instrument: Instrument, book: Book, strategy: Strategy) -> Decimal:
         maker = strategy.nado_post_only
-        cap = quantize(book.bid if maker else book.ask * (1 + strategy.max_slippage_bps / 10000), instrument.price_tick)
+        cap = (maker_opening_price(instrument, book) if maker else
+               quantize(book.ask * (1 + strategy.max_slippage_bps / 10000), instrument.price_tick))
         if (not maker and cap < book.ask) or cap <= 0:
             raise TradingError("Ценовой шаг не позволяет соблюсти установленное проскальзывание.")
         quantity = quantize(strategy.notional_per_leg / cap, instrument.quantity_step)
@@ -340,7 +341,8 @@ class Engine:
         factor = strategy.max_slippage_bps / 10000
         maker = instrument.venue.casefold() == 'nado' and strategy.nado_post_only
         if maker:
-            limit = quantize(book.bid if side == 'buy' else book.ask, instrument.price_tick, upward=side == 'sell')
+            limit = (maker_opening_price(instrument, book) if side == 'buy' and not reduce_only else
+                     quantize(book.bid if side == 'buy' else book.ask, instrument.price_tick, upward=side == 'sell'))
         else:
             limit = quantize(book.ask * (1 + factor), instrument.price_tick) if side == "buy" else quantize(
                 book.bid * (1 - factor), instrument.price_tick, upward=True)

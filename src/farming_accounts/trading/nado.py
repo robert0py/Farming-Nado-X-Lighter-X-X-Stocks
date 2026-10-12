@@ -23,7 +23,7 @@ from urllib.request import Request, build_opener
 from ..models import AccountError, nado_subaccount, wallet_address
 from ..transport import MAX_RESPONSE, NoRedirects
 from .domain import (Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError,
-                     TradingError, UnknownExecution)
+                     TradingError, UnknownExecution, maker_price_needs_refresh)
 
 X18 = Decimal(10**18)
 VENUE = "nado"
@@ -978,9 +978,17 @@ class NadoGateway:
                 # Any balance change makes us cancel only our remaining amount
                 # immediately; positive fills still require archive proof.
                 placed = float(record.get('submitted_at', intent.expiry - 90))
-                wait = 20 if intent.reduce_only else MAKER_REPRICE_SECONDS
                 due = (record.get('cancel_requested') is True or actual != baseline
-                       or self.clock() >= placed + wait or self.clock() >= intent.expiry)
+                       or self.clock() >= intent.expiry or
+                       intent.reduce_only and self.clock() >= placed + 20)
+                if (record.get('cancel_state') is None and not due and not intent.reduce_only and
+                        self.clock() >= placed + MAKER_REPRICE_SECONDS):
+                    try:
+                        due = maker_price_needs_refresh(intent.instrument, self.book(intent.instrument), intent.limit_price)
+                    except (TradingError, AccountError, TimeoutError):
+                        # Missing/stale quotes cannot justify cancelling a live
+                        # order. Reconcile again with no new writes or fake fill.
+                        return None
                 if record.get('cancel_state') is None and due:
                     record = self._cancel_maker(intent, digest, record)
                 else:

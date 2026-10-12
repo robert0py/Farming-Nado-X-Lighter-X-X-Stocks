@@ -387,13 +387,68 @@ class EngineTests(unittest.TestCase):
         replacement = self.nado.requests[-1]
         self.assertEqual(len(self.nado.requests), 2)
         self.assertNotEqual(replacement.client_id, first.client_id)
-        self.assertEqual(replacement.limit_price, D(597))
+        self.assertEqual(replacement.limit_price, D(598))
         self.assertTrue(replacement.post_only)
         self.assertLessEqual(replacement.quantity * replacement.limit_price, self.strategy.notional_per_leg)
         self.assertEqual(self.engine.status()['cycle']['id'], identity)
         self.assertIsNone(self.engine.status()['cycle']['deadline'])
         self.assertEqual(len(self.journal.history()), 1)
         self.assertEqual(self.lighter.requests, [])
+
+    def test_maker_opening_uses_two_basis_points_from_midpoint_and_exact_budget(self):
+        self.nado.items = tuple(replace(i, price_tick=D('.01'), quantity_step=D('.001'))
+                                for i in self.nado.items)
+        self.lighter.items = tuple(replace(i, quantity_step=D('.001'), min_qty=D('.001'))
+                                   for i in self.lighter.items)
+        self.engine.strategy = replace(self.strategy, nado_post_only=True, notional_per_leg=D('1199.76'))
+        self.nado.book = lambda instrument: Book(D('599.90'), D('600.10'), self.clock())
+        self.nado.responses.append('PENDING')
+        self.engine.start()
+        self.engine.tick()
+        intent = self.nado.requests[0]
+        self.assertEqual(intent.limit_price, D('599.88'))
+        self.assertEqual(intent.quantity, D(2))
+        self.assertEqual(intent.quantity * intent.limit_price, D('1199.76'))
+        self.assertTrue(intent.post_only)
+        self.assertEqual(self.lighter.requests, [])
+
+    def test_maker_replacements_follow_percentage_up_and_down_after_cancel_proof(self):
+        self.nado.items = tuple(replace(i, price_tick=D('.01'), quantity_step=D('.001'))
+                                for i in self.nado.items)
+        self.lighter.items = tuple(replace(i, quantity_step=D('.001'), min_qty=D('.001'))
+                                   for i in self.lighter.items)
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.book = lambda instrument: Book(D('589.90'), D('590.10'), self.clock())
+        self.nado.responses.extend(['PENDING'] * 3)
+        self.engine.start()
+        self.engine.tick()
+        identity = self.engine.status()['cycle']['id']
+        for market, expected in ((D(600), D('599.88')), (D(500), D('499.90'))):
+            previous = self.nado.requests[-1]
+            self.clock.value += 90
+            self.nado.lookup_results[previous.client_id] = OrderObservation(previous.client_id, 'CANCELLED', D(0))
+            self.nado.book = lambda instrument: Book(market - D('.1'), market + D('.1'), self.clock())
+            self.engine.tick()
+            intent = self.nado.requests[-1]
+            self.assertEqual(intent.limit_price, expected)
+            self.assertTrue(intent.post_only)
+            self.assertLessEqual(intent.quantity * intent.limit_price, self.strategy.notional_per_leg)
+            self.assertEqual(self.engine.status()['cycle']['id'], identity)
+            self.assertIsNone(self.engine.status()['cycle']['deadline'])
+        self.assertEqual(len(self.nado.requests), 3)
+        self.assertEqual(self.lighter.requests, [])
+
+    def test_maker_percentage_rounds_down_to_tick_without_crossing_wide_spread(self):
+        self.nado.items = tuple(replace(i, price_tick=D('.05')) for i in self.nado.items)
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.book = lambda instrument: Book(D(590), D(610), self.clock())
+        self.nado.responses.append('PENDING')
+        self.engine.start()
+        self.engine.tick()
+        intent = self.nado.requests[0]
+        self.assertEqual(intent.limit_price, D('599.85'))
+        self.assertLess(intent.limit_price, D(610))
+        self.assertLessEqual(intent.quantity * intent.limit_price, self.strategy.notional_per_leg)
 
     def test_rejected_maker_close_keeps_actual_spot_and_halts_without_repeating(self):
         self.engine.strategy = replace(self.strategy, nado_post_only=True)

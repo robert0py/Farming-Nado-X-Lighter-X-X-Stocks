@@ -6,7 +6,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from test_nado_trading import FakeSigner, FakeStream, FakeTransport, NOW, OWNER, SENDER, raw
-from farming_accounts.trading.domain import OrderIntent, OrderObservation, UnknownExecution
+from farming_accounts.trading.domain import Book, OrderIntent, OrderObservation, TradingError, UnknownExecution
 from farming_accounts.trading.journal import Journal
 from farming_accounts.trading.nado import NadoGateway
 
@@ -86,6 +86,7 @@ class MakerTests(unittest.TestCase):
         self.gateway = NadoGateway(OWNER, approved_assets=('SPY',), transport=self.transport,
                                    signer=self.signer, clock=lambda: NOW, stream_factory=NoFillStream)
         self.gateway.journal = self.journal
+        self.gateway.book = lambda instrument: Book(D(104), D(105), self.gateway.clock())
         instrument = self.gateway.instruments()[0]
         self.intent = OrderIntent('maker', 'cycle', 'nado', instrument, 'buy', D(1), D(104), False,
                                   ((NOW + 90) * 1000 << 20) | 7, NOW + 900, post_only=True)
@@ -99,6 +100,11 @@ class MakerTests(unittest.TestCase):
 
     def cancels(self):
         return [body['cancel_orders'] for kind, body in self.transport.calls if kind == 'execute' and 'cancel_orders' in body]
+
+    def replace_unsent_intent(self, **changes):
+        self.journal.observe(OrderObservation(self.intent.client_id, 'REJECTED', D(0)))
+        self.intent = replace(self.intent, client_id='price-distance', **changes)
+        self.journal.put_intent(self.intent, 'open_spot')
 
     def expired_archive(self, *, head_time=None, own_time=None):
         self.gateway.submit(self.intent)
@@ -177,6 +183,44 @@ class MakerTests(unittest.TestCase):
         self.assertEqual(len(self.cancels()), 1)
         self.assertEqual(sum(kind == 'execute' and 'place_order' in body
                              for kind, body in self.transport.calls), 1)
+
+    def test_close_or_equal_percentage_keeps_same_maker_order_until_distance_grows(self):
+        # A buy at 599.88 is exactly 0.02% from midpoint 600.
+        self.replace_unsent_intent(limit_price=D('599.88'))
+        self.gateway.submit(self.intent)
+        self.gateway.clock = lambda: NOW + 90
+        self.gateway.book = lambda instrument: Book(D('599.90'), D('600.10'), self.gateway.clock())
+        self.assertEqual(self.gateway.lookup(self.intent).status, 'PENDING')
+        # The distance is smaller by more than 0.001 percentage point: preserve queue.
+        self.gateway.book = lambda instrument: Book(D('599.89'), D('600.09'), self.gateway.clock())
+        self.gateway.clock = lambda: NOW + 180
+        self.assertEqual(self.gateway.lookup(self.intent).status, 'PENDING')
+        self.assertEqual(self.cancels(), [])
+        self.gateway.book = lambda instrument: Book(D('600.90'), D('601.10'), self.gateway.clock())
+        self.gateway.clock = lambda: NOW + 181
+        self.assertEqual(self.gateway.lookup(self.intent).status, 'CANCELLED')
+        self.assertEqual(len(self.cancels()), 1)
+
+    def test_tick_rounding_does_not_cancel_an_order_already_at_target_price(self):
+        self.transport.metadata['wSPYx']['price_increment_x18'] = raw('.05')
+        self.replace_unsent_intent(limit_price=D('599.85'),
+                                  instrument=replace(self.intent.instrument, price_tick=D('.05')))
+        self.gateway.submit(self.intent)
+        self.gateway.clock = lambda: NOW + 90
+        self.gateway.book = lambda instrument: Book(D('599.90'), D('600.10'), self.gateway.clock())
+        self.assertEqual(self.gateway.lookup(self.intent).status, 'PENDING')
+        self.assertEqual(self.cancels(), [])
+
+    def test_unavailable_quote_does_not_cancel_or_replace_resting_order(self):
+        self.gateway.submit(self.intent)
+        self.gateway.clock = lambda: NOW + 90
+        def unavailable(instrument):
+            raise TradingError('fixture stale book')
+        self.gateway.book = unavailable
+        self.assertIsNone(self.gateway.lookup(self.intent))
+        self.assertEqual(self.cancels(), [])
+        self.assertEqual(len([body for kind, body in self.transport.calls
+                              if kind == 'execute' and 'place_order' in body]), 1)
 
     def test_restart_keeps_same_unfilled_maker_without_resubmission(self):
         self.gateway.submit(self.intent)

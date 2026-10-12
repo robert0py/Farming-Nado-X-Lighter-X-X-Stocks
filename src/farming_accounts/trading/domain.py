@@ -1,7 +1,7 @@
 """Trading contracts: quantities are native units; multiplier gives underlying units."""
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_UP, localcontext
 from typing import Protocol
 
 
@@ -121,3 +121,32 @@ def quantize(value: Decimal, step: Decimal, *, upward: bool = False) -> Decimal:
     if not value.is_finite() or not step.is_finite() or step <= 0 or value < 0:
         raise TradingError("Площадка вернула некорректный размер или шаг инструмента.")
     return (value / step).to_integral_value(rounding=ROUND_UP if upward else ROUND_DOWN) * step
+
+
+NADO_MAKER_DISTANCE = Decimal('0.0002')  # 0.02% of the fresh spot midpoint.
+
+
+def _maker_midpoint(book: Book) -> Decimal:
+    if (not book.bid.is_finite() or not book.ask.is_finite() or
+            book.bid <= 0 or book.ask < book.bid):
+        raise TradingError('Нет корректной рыночной цены для maker-заявки Nado.')
+    return (book.bid + book.ask) / 2
+
+
+def maker_opening_price(instrument: Instrument, book: Book) -> Decimal:
+    with localcontext() as context:
+        context.prec = 96
+        price = quantize(_maker_midpoint(book) * (1 - NADO_MAKER_DISTANCE), instrument.price_tick)
+        if price <= 0 or price >= book.ask:
+            raise TradingError('Шаг цены не позволяет выставить maker-покупку Nado.')
+        return price
+
+
+def maker_price_needs_refresh(instrument: Instrument, book: Book, current_price: Decimal) -> bool:
+    with localcontext() as context:
+        context.prec = 96
+        midpoint = _maker_midpoint(book)
+        # Equality preserves queue priority. A coarse tick must not cause
+        # repeated cancellations whose replacement has exactly the same price.
+        return (abs(current_price - midpoint) > midpoint * NADO_MAKER_DISTANCE and
+                maker_opening_price(instrument, book) != current_price)
