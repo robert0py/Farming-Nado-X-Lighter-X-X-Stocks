@@ -157,13 +157,26 @@ class MakerTests(unittest.TestCase):
     def test_unfilled_maker_remains_resting_until_reprice_interval(self):
         result = self.gateway.submit(self.intent)
         self.assertEqual(result.status, 'PENDING')
-        self.gateway.clock = lambda: NOW + 299
+        self.gateway.clock = lambda: NOW + 89
         self.assertEqual(self.gateway.lookup(self.intent).status, 'PENDING')
         self.assertEqual(self.cancels(), [])
-        self.gateway.clock = lambda: NOW + 300
+        self.gateway.clock = lambda: NOW + 90
         result = self.gateway.lookup(self.intent)
         self.assertEqual((result.status, result.filled_quantity), ('CANCELLED', D(0)))
         self.assertEqual(len(self.cancels()), 1)
+
+    def test_timed_reprice_with_lost_cancel_reply_never_repeats_cancel_after_restart(self):
+        self.gateway.submit(self.intent)
+        self.transport.cancel_error = True
+        self.gateway.clock = lambda: NOW + 90
+        self.assertIsNone(self.gateway.lookup(self.intent))
+        gateway = NadoGateway(OWNER, approved_assets=('SPY',), transport=self.transport,
+                              signer=self.signer, clock=lambda: NOW + 180,
+                              stream_factory=NoFillStream, journal=self.journal)
+        self.assertIsNone(gateway.lookup(self.intent))
+        self.assertEqual(len(self.cancels()), 1)
+        self.assertEqual(sum(kind == 'execute' and 'place_order' in body
+                             for kind, body in self.transport.calls), 1)
 
     def test_restart_keeps_same_unfilled_maker_without_resubmission(self):
         self.gateway.submit(self.intent)

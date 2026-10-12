@@ -136,7 +136,7 @@ class StrategyDialog:
 
         first = inner.winfo_children()[0]
         label(inner, 'Сумма и время одного цикла', bold=True, size=14).pack(anchor='w', before=first)
-        label(inner, 'Nado: maker post-only, ожидание до 20 секунд и отмена остатка. Lighter: хедж фактического исполнения с ограничением цены. Защита рассчитывается автоматически; исполнение и отсутствие потерь не гарантированы.',
+        label(inner, 'Nado: лимитная maker-покупка по лучшей цене покупки в стакане. Если за 90 секунд исполнения нет, бот подтверждает отмену и обновляет цену. Lighter: встречная позиция только на подтверждённый объём покупки. Защита рассчитывается автоматически; исполнение и отсутствие потерь не гарантированы.',
               color=MUTED, size=9, wraplength=840, anchor='w', justify='left').pack(fill='x', pady=(5, 8), before=first)
         grid = tk.Frame(inner, bg=PANEL)
         grid.pack(fill='x', before=first)

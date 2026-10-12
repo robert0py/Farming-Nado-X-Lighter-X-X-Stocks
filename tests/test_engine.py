@@ -367,6 +367,34 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(intent.quantity, D(8))
         self.assertLessEqual(intent.quantity * intent.limit_price, self.strategy.notional_per_leg)
 
+    def test_reprice_waits_for_cancel_proof_then_follows_fresh_bid_in_same_cycle(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True, hold_seconds=43200)
+        self.nado.book = lambda instrument: Book(D(590), D(592), self.clock())
+        self.nado.responses.extend(['PENDING', 'PENDING'])
+        self.engine.start()
+        self.engine.tick()
+        first = self.nado.requests[0]
+        identity = self.engine.status()['cycle']['id']
+        self.nado.book = lambda instrument: Book(D(597), D(600), self.clock())
+        self.clock.value += 90
+        # Cancellation has not been proven: no replacement, hedge or hold timer.
+        self.nado.lookup_results[first.client_id] = None
+        self.engine.tick()
+        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(self.engine.status()['state'], 'RECOVERY')
+        self.nado.lookup_results[first.client_id] = OrderObservation(first.client_id, 'CANCELLED', D(0))
+        self.engine.tick()
+        replacement = self.nado.requests[-1]
+        self.assertEqual(len(self.nado.requests), 2)
+        self.assertNotEqual(replacement.client_id, first.client_id)
+        self.assertEqual(replacement.limit_price, D(597))
+        self.assertTrue(replacement.post_only)
+        self.assertLessEqual(replacement.quantity * replacement.limit_price, self.strategy.notional_per_leg)
+        self.assertEqual(self.engine.status()['cycle']['id'], identity)
+        self.assertIsNone(self.engine.status()['cycle']['deadline'])
+        self.assertEqual(len(self.journal.history()), 1)
+        self.assertEqual(self.lighter.requests, [])
+
     def test_rejected_maker_close_keeps_actual_spot_and_halts_without_repeating(self):
         self.engine.strategy = replace(self.strategy, nado_post_only=True)
         self.hedge()

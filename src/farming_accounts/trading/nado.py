@@ -34,7 +34,7 @@ AUTH_FIELDS = [("sender", "bytes32"), ("expiration", "uint64")]
 CANCEL_FIELDS = [("sender", "bytes32"), ("productIds", "uint32[]"), ("digests", "bytes32[]"), ("nonce", "uint64")]
 QUERY_TYPES = {"contracts", "linked_signer", "nonces", "subaccount_info", "market_liquidity",
                "fee_rates", "max_order_size", "subaccount_orders", "order"}
-MAKER_REPRICE_SECONDS = 300
+MAKER_REPRICE_SECONDS = 90
 
 # Only exchange-defined numeric codes become user-facing diagnostics. The raw
 # response can contain reflected request data and must never enter the journal.
