@@ -263,6 +263,36 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(response['execution']['state'], 'HALTED')
         self.assertIn('linked signer', response['error'])
 
+    def test_shutdown_stops_worker_even_with_unclosed_cycle_and_preserves_it(self):
+        self.recovery_configuration()
+        before = self.runtime.journal.active_cycle()
+        self.runtime.journal.set('running', True)
+        result = self.client.request('/shutdown', {})
+        self.assertTrue(result['ok'])
+        self.assertTrue(self.runtime.stopped.is_set())
+        self.assertTrue(self.runtime.journal.get('worker_suspended'))
+        self.assertFalse(self.runtime.journal.get('running'))
+        self.assertEqual(self.runtime.journal.active_cycle(), before)
+
+    def test_worker_restart_keeps_execution_suspended_until_explicit_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Runtime(Path(directory))
+            first.journal.save_cycle({'id': 'preserved', 'state': 'HEDGED'})
+            first.command('/shutdown', {'command_id': 'f' * 32})
+            first.journal.close()
+            restarted = Runtime(Path(directory))
+            try:
+                self.assertEqual(restarted.status()['execution']['state'], 'PAUSED')
+                self.assertEqual(restarted.journal.active_cycle()['state'], 'HEDGED')
+                self.assertFalse(restarted.journal.get('running'))
+                restarted.stopped = Mock()
+                restarted.stopped.wait.side_effect = [False, True]
+                with patch.object(restarted, 'build_engine') as factory:
+                    restarted.tick_loop()
+                factory.assert_not_called()
+            finally:
+                restarted.journal.close()
+
     def test_close_request_without_keys_does_not_claim_positions_closed(self):
         self.recovery_configuration()
         with patch.object(self.runtime, 'build_engine', side_effect=TradingError('Ключ отсутствует')) as factory:

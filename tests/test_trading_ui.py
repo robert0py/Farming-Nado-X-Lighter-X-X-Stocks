@@ -29,6 +29,33 @@ class TradingDesktopTests(unittest.TestCase):
         self.assertEqual(self.panel.table.get_children(), ())
         self.assertTrue(all(str(button.cget('state')) == 'disabled' for button in self.panel.buttons))
 
+    def test_stop_button_during_status_poll_is_queued_and_sent_once(self):
+        self.panel.client = Mock()
+        self.panel.busy = True
+        self.panel.render_buttons()
+        button = next(b for b in self.panel.buttons if b.control_path == '/stop')
+        self.assertEqual(str(button.cget('state')), 'normal')
+        with patch.object(self.root, 'after', return_value='queued-control') as schedule:
+            self.panel.request('/stop', {})
+            self.panel.request('/stop', {})
+            self.assertEqual(len(self.panel.control_waits), 1)
+            schedule.assert_called_once()
+            pending = schedule.call_args.args[1]
+        self.panel.busy = False
+        pending()
+        self.assertEqual(len(self.panel.executor.tasks), 1)
+        self.panel.executor.run_one()
+        self.panel.client.request.assert_called_once_with('/stop', {})
+
+    def test_shutdown_callback_shows_process_off_without_clearing_history(self):
+        self.panel.client = Mock()
+        cycle = {'id': 'saved', 'state': 'HEDGED', 'asset': 'SPY', 'hedged_at': 1800000000}
+        self.panel.disconnected({'ok': True, 'execution': {'state': 'PAUSED', 'running': False, 'cycle': cycle}, 'history': [cycle]})
+        self.assertIsNone(self.panel.client)
+        self.assertIn('выключен', self.panel.worker_label.cget('text'))
+        self.assertIn('сохраняются', self.panel.message.cget('text'))
+        self.assertEqual(len(self.panel.table.get_children()), 1)
+
     def test_status_poll_is_throttled_and_never_starts_trading(self):
         self.panel.client = Mock()
         self.panel.results.put(({'ok': True, 'execution': {'state': 'IDLE'}, 'history': []}, None, None))

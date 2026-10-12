@@ -80,6 +80,7 @@ class Runtime:
         # Local durable control must work even when no gateway can be built.
         self.journal.set('running', False)
         if closing:
+            self.journal.set('worker_suspended', False)
             self.journal.set('close_requested', True)
             cycle = self.journal.active_cycle()
             if cycle and cycle['state'] == 'HALTED':
@@ -148,6 +149,9 @@ class Runtime:
                 'running': self.journal.get('running', False),
                 'close_requested': self.journal.get('close_requested', False), 'cycle': cycle,
                 'waiting_reason': self.journal.get('waiting_reason')}
+            state['suspended'] = self.journal.get('worker_suspended', False)
+            if state['suspended']:
+                state['state'] = 'PAUSED'
             orders = {}
             if cycle:
                 for action, intent, observation in self.journal.orders(cycle['id']):
@@ -207,6 +211,8 @@ class Runtime:
             return response
 
     def _command(self, route, value):
+        if self.stopped.is_set() and route != '/shutdown':
+            raise TradingError('Процесс выключается. Подключите его заново кнопкой «Этот ПК» после завершения остановки.')
         if route == '/registration-options/lighter':
             inputs = dict(value.get('credentials', {}))
             cycle = self.journal.active_cycle()
@@ -298,10 +304,12 @@ class Runtime:
                 if closer:
                     closer()
         if route == '/shutdown':
-            self.mutable()
+            self.journal.set('running', False)
+            self.journal.set('worker_suspended', True)
+            self.stopped.set()
             if self.shutdown:
                 threading.Thread(target=self.shutdown, daemon=True).start()
-            return {'ok': True, 'message': 'Worker остановлен. Открытых циклов нет.'}
+            return self.status() | {'message': 'Процесс выключен. Ордера и позиции на биржах не закрываются этой кнопкой; журнал сохранён для восстановления.'}
         if route == '/preflight':
             self.mutable()
             self.check_points()
@@ -313,6 +321,7 @@ class Runtime:
         if route == '/start':
             self.check_points()
             self.build_engine().start()
+            self.journal.set('worker_suspended', False)
             return {'ok': True, 'message': 'Стратегия запущена. Worker продолжает работать после закрытия приложения.'}
         if route == '/stop':
             return self.request_stop()
@@ -381,6 +390,8 @@ class Runtime:
                 raise TradingError('Сессия привязки истекла или уже использована. Создайте новую в приложении.')
             if signature is None:
                 return {'ok': True, 'challenge': session['public']}
+            if self.stopped.is_set():
+                raise TradingError('Процесс выключается. Создайте новую ссылку после повторного подключения.')
             if not re.fullmatch(r'0x[a-fA-F0-9]{130}', signature):
                 raise TradingError('Кошелёк вернул некорректную подпись.')
             self.key_mutable(session['venue'], session['credentials'])
@@ -402,6 +413,8 @@ class Runtime:
     def tick_loop(self):
         while not self.stopped.wait(10):
             with self.lock:
+                if self.journal.get('worker_suspended', False):
+                    continue
                 config = self.config()
                 if not config.get('strategy') or not config.get('nado') or not config.get('lighter'):
                     continue
@@ -557,8 +570,9 @@ def main(argv=None):
         runtime.stopped.set()
         thread.join(timeout=80)
         server.server_close()
-        runtime.discard_engine()
-        runtime.journal.close()
+        with runtime.lock:
+            runtime.discard_engine()
+            runtime.journal.close()
 
 
 if __name__ == '__main__':

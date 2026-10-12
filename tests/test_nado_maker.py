@@ -100,6 +100,45 @@ class MakerTests(unittest.TestCase):
     def cancels(self):
         return [body['cancel_orders'] for kind, body in self.transport.calls if kind == 'execute' and 'cancel_orders' in body]
 
+    def expired_archive(self, *, head_time=None, own_time=None):
+        self.gateway.submit(self.intent)
+        self.transport.orders = []
+        self.gateway.clock = lambda: NOW + 1000
+        self.transport.reconciliation_matches = lambda sender=None, product_id=None, idx=None: (
+            {'matches': [{'digest': '0x' + 'ee' * 32, 'submission_idx': '100', 'isolated': False}],
+             'txs': [{'submission_idx': '100', 'timestamp': str(head_time or NOW + 999)}]}
+            if sender is None else
+            {'matches': [{'digest': '0x' + 'dd' * 32, 'submission_idx': '5', 'isolated': False,
+                          'order': {'sender': SENDER}}],
+             'txs': [{'submission_idx': '5', 'timestamp': str(own_time or NOW - 100)}]})
+
+    def test_expired_zero_maker_requires_archive_coverage_and_unchanged_principal(self):
+        self.expired_archive()
+        result = self.gateway.lookup(self.intent)
+        self.assertEqual((result.status, result.filled_quantity), ('EXPIRED', D(0)))
+        self.assertEqual(self.cancels(), [])
+        self.assertIsNotNone(self.journal.get('expiredproof:' + self.intent.client_id))
+
+    def test_expired_maker_is_unknown_with_stale_archive_or_recent_account_activity(self):
+        self.expired_archive(head_time=NOW + 800)
+        self.assertIsNone(self.gateway.lookup(self.intent))
+        self.transport.reconciliation_matches = lambda **kwargs: {'matches': [], 'txs': []}
+        self.assertIsNone(self.gateway.lookup(self.intent))
+
+    def test_expired_maker_cannot_hide_recent_account_activity(self):
+        self.expired_archive(own_time=NOW + 5)
+        self.assertIsNone(self.gateway.lookup(self.intent))
+
+    def test_expired_zero_proof_cannot_erase_previously_observed_partial_fill(self):
+        self.expired_archive()
+        self.journal.observe(OrderObservation(self.intent.client_id, 'PENDING', D('.01'), D(104)))
+        self.assertIsNone(self.gateway.lookup(self.intent))
+
+    def test_expired_zero_proof_rejects_changed_principal_even_with_covered_archive(self):
+        self.expired_archive()
+        self.transport.base = D('.01')
+        self.assertIsNone(self.gateway.lookup(self.intent))
+
     def test_cancel_ack_proves_zero_fill_and_passive_signed_flags(self):
         pending = self.gateway.submit(self.intent)
         self.assertEqual((pending.status, pending.filled_quantity), ('PENDING', D(0)))

@@ -266,6 +266,12 @@ class NadoTransport:
         return self._request('/archive/v1', body={'matches': {'subaccounts': [sender],
                             'product_ids': [product_id], 'idx': str(last_idx), 'limit': 100, 'isolated': False}})
 
+    def reconciliation_matches(self, sender=None, product_id=None, idx=None):
+        parameters = {'limit': 1, 'isolated': False}
+        if sender is not None:
+            parameters.update(subaccounts=[sender], product_ids=[product_id], idx=str(idx))
+        return self._request('/archive/v1', body={'matches': parameters})
+
     def archive_event(self, sender, product_id, idx):
         return self._request('/archive/v1', body={'events': {'subaccounts': [sender],
                             'product_ids': [product_id], 'idx': str(idx), 'limit': {'raw': 1}, 'desc': True,
@@ -898,6 +904,60 @@ class NadoGateway:
         self.journal.set('balanceproof:' + intent.client_id, proof)
         return proof
 
+    def _expired_unfilled(self, intent, digest, record):
+        """Prove zero from signed expiry, covered history AND unchanged principal.
+
+        An empty order archive alone proves nothing. The latest global match
+        must show that the indexer has passed expiry; the latest account match
+        at that same index must precede submission. Any later account activity,
+        prior positive fill, open order or principal change leaves it unknown.
+        """
+        reader = getattr(self.transport, 'reconciliation_matches', None)
+        if (reader is None or self.clock() < intent.expiry + 5 or
+                record.get('baseline_normalized') is None or record.get('submitted_at') is None):
+            return None
+        if record.get('filled') is not None and Decimal(record['filled']) != 0:
+            return None
+        for _, saved, observation in self.journal.orders(intent.cycle_id):
+            if saved.client_id == intent.client_id and observation and observation.filled_quantity > 0:
+                return None
+        baseline = _integer(record['baseline_normalized'], maximum=2**127 - 1)
+        if self.open_orders(intent.instrument) or int(self.capture_position(intent.instrument)['normalized']) != baseline:
+            return None
+        def latest(result):
+            rows = _list(_obj(result).get('matches'))
+            transactions = _list(result.get('txs'))
+            if not rows:
+                return None
+            index = max(_integer(_obj(row).get('submission_idx')) for row in rows)
+            txs = [tx for tx in transactions if _integer(_obj(tx).get('submission_idx')) == index]
+            if len(txs) != 1:
+                raise UnknownExecution('Nado не подтвердил время последнего архивного исполнения.')
+            timestamp = _integer(txs[0].get('timestamp'), minimum=1)
+            if timestamp > self.clock() + 5:
+                raise UnknownExecution('Архив Nado вернул время из будущего.')
+            return index, timestamp, rows
+        head = latest(reader())
+        if head is None or head[1] < intent.expiry + 5:
+            return None
+        own = latest(reader(sender=self.sender, product_id=intent.instrument.id, idx=head[0]))
+        submitted = float(record['submitted_at'])
+        if not 0 < submitted <= intent.expiry:
+            raise UnknownExecution('В журнале Nado неверное время отправки maker-ордера.')
+        if own is not None:
+            if own[0] > head[0] or own[1] > head[1] or any(str(_obj(_obj(row).get('order')).get('sender', '')).lower() != self.sender
+                                     or row.get('isolated') is not False for row in own[2]):
+                raise UnknownExecution('Архив сверки Nado относится к другому аккаунту.')
+            if own[1] >= int(submitted):
+                return None
+        if self.open_orders(intent.instrument) or int(self.capture_position(intent.instrument)['normalized']) != baseline:
+            return None
+        self.journal.set('expiredproof:' + intent.client_id, {
+            'digest': digest, 'expires': intent.expiry, 'head_index': str(head[0]), 'head_time': head[1],
+            'latest_account_match': None if own is None else [str(own[0]), own[1]],
+            'normalized': str(baseline)})
+        return OrderObservation(intent.client_id, 'EXPIRED', Decimal(0), exchange_id=digest)
+
     def lookup(self, intent):
         message, _, digest = self._order(intent)
         record = self.journal.get('maker:' + intent.client_id) if intent.post_only and self.journal else None
@@ -938,7 +998,7 @@ class NadoGateway:
             return None
         rows = _list(_obj(self.transport.archive_orders(digest)).get("orders"))
         if not rows:
-            return None
+            return self._expired_unfilled(intent, digest, record) if record else None
         if len(rows) != 1:
             raise UnknownExecution("Nado вернул неоднозначную историю ордера.")
         item = _obj(rows[0])

@@ -13,6 +13,7 @@ from .vault import Vault, VaultError, state_directory
 
 
 STATE_NAMES = {'NOT_CONFIGURED': 'Настройте доступ и стратегию', 'IDLE': 'Остановлен', 'WAITING': 'Ожидание рынка',
+               'PAUSED': 'Процесс исполнения выключен',
                'OPENING_SPOT': 'Покупка spot', 'OPENING_HEDGE': 'Формирование хеджа', 'HEDGED': 'Хедж удерживается',
                'CLOSING': 'Закрытие обеих сторон', 'CLOSED': 'Цикл завершён', 'RECOVERY': 'Сверка прежнего ордера', 'HALTED': 'Остановлено · нужна сверка'}
 
@@ -38,6 +39,8 @@ class TradingPanel:
         self.dialogs = []
         self.fields = {}
         self.buttons = []
+        self.control_waits = {}
+        self.active_control = None
         worker = tk.Frame(parent, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
         worker.pack(fill='x')
         self.worker_label = label(worker, 'Процесс торговли не подключён', bold=True, size=12)
@@ -105,6 +108,8 @@ class TradingPanel:
 
     def button(self, parent, title, command, *, primary=False):
         button = ttk.Button(parent, text=title, command=command, style='Primary.TButton' if primary else 'TButton')
+        button.control_path = {'Остановить новые циклы': '/stop', 'Закрыть хедж и остановить': '/close',
+                               'Выключить процесс': '/shutdown'}.get(title)
         self.buttons.append(button)
         return button
 
@@ -130,6 +135,18 @@ class TradingPanel:
             if on_error:
                 on_error('Сначала подключите процесс торговли кнопкой «Этот ПК».')
             return
+        if path in ('/stop', '/close', '/shutdown') and self.busy:
+            if path not in self.control_waits and path != self.active_control:
+                def pending():
+                    self.control_waits.pop(path, None)
+                    if not self.closed and self.client is not None:
+                        self.request(path, value, callback, on_error)
+                self.control_waits[path] = self.app.root.after(100, pending)
+                self.message.configure(text='Команда остановки принята интерфейсом. Дожидаюсь ответа процесса; команда не потеряется.')
+                self.render_buttons()
+            return
+        if path in ('/stop', '/close', '/shutdown'):
+            self.active_control = path
         self.message.configure(text='Выполняю команду…')
         self.work(lambda: self.client.request(path, value), callback, on_error)
 
@@ -145,10 +162,15 @@ class TradingPanel:
             self.render()
         self.work(connect, connected)
 
-    def disconnected(self, _):
+    def disconnected(self, result):
         self.client = None
-        self.worker_label.configure(text='Процесс торговли отключён')
-        self.render_buttons()
+        for timer in self.control_waits.values():
+            self.app.root.after_cancel(timer)
+        self.control_waits.clear()
+        if isinstance(result, dict) and 'execution' in result:
+            self.data = result
+        self.worker_label.configure(text='Процесс торговли выключен')
+        self.render()
 
     def remote_dialog(self):
         dialog, content = self.dialog('Подключить VPS', 660, 310)
@@ -235,7 +257,11 @@ class TradingPanel:
 
     def render_buttons(self):
         for button in self.buttons:
-            button.configure(state='normal' if self.client is not None and not self.busy else 'disabled')
+            control = button.control_path
+            enabled = self.client is not None and (not self.busy or control is not None)
+            if control and (control in self.control_waits or control == self.active_control):
+                enabled = False
+            button.configure(state='normal' if enabled else 'disabled')
 
     def render(self):
         from .app import GREEN, MUTED
@@ -266,12 +292,14 @@ class TradingPanel:
             status_name = {'ACK': 'принят', 'PENDING': 'ожидает исполнения', 'UNKNOWN': 'результат сверяется',
                            'FILLED': 'исполнен', 'CANCELLED': 'отменён', 'REJECTED': 'отклонён',
                            'EXPIRED': 'истёк срок'}.get(order['status'], order['status'])
-            if state in ('HALTED', 'RECOVERY'):
+            if state in ('HALTED', 'RECOVERY', 'PAUSED'):
                 status_name = 'последний известный статус: ' + status_name + '; требуется сверка'
             number = ' · ID ' + order['exchange_id'] if order.get('exchange_id') else ''
             details.append(f"{'Nado' if venue == 'nado' else 'Lighter'}: {status_name} · {order['quantity']} {order['asset']} по {order['limit_price']} · исполнено {order.get('filled_quantity') or '0'}{number}")
         self.order_detail.configure(text='\n'.join(details) if details else 'Ордеров текущей попытки нет.')
         reason = self.data.get('error') or cycle.get('message') or execution.get('waiting_reason')
+        if state == 'PAUSED':
+            reason = 'Процесс выключен. Позиции на биржах сохраняются. Нажмите «Этот ПК», затем выберите запуск или закрытие прежнего хеджа.'
         if cycle.get('state') == 'CLOSED' and cycle.get('hedged_at') is None and not self.data.get('error'):
             reason = ('Ордер отклонён площадкой. ' + cycle.get('message', '') if cycle.get('outcome') == 'REJECTED'
                       else 'Хедж не был открыт; удержание не запускалось. ' + cycle.get('message', '')
@@ -298,6 +326,7 @@ class TradingPanel:
             except queue.Empty:
                 break
             self.busy = False
+            self.active_control = None
             if error:
                 self.message.configure(text=error)
                 self.app.log('Торговля', error, error=True)
@@ -333,6 +362,9 @@ class TradingPanel:
 
     def close(self):
         self.closed = True
+        for timer in self.control_waits.values():
+            self.app.root.after_cancel(timer)
+        self.control_waits.clear()
         self.app.root.after_cancel(self.refresh_id)
         for dialog in self.dialogs:
             if dialog.winfo_exists():
