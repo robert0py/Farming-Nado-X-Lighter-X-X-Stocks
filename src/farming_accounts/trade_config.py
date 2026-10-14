@@ -8,8 +8,8 @@ from .models import wallet_address, account_index, nado_subaccount, AccountError
 from .trading.domain import Strategy, TradingError
 
 
-DECIMAL_FIELDS = ('notional_per_leg', 'max_slippage_bps', 'residual_notional', 'margin_reserve', 'max_loss_quote')
-INTEGER_FIELDS = ('max_unhedged_seconds', 'quote_max_age_seconds', 'hold_seconds')
+DECIMAL_FIELDS = ('notional_per_leg', 'max_slippage_bps', 'residual_notional', 'margin_reserve', 'max_loss_quote', 'nado_maker_distance_percent')
+INTEGER_FIELDS = ('max_unhedged_seconds', 'quote_max_age_seconds', 'hold_seconds', 'nado_maker_reprice_seconds')
 
 
 def lighter_registration_inputs(value: dict) -> dict:
@@ -79,6 +79,9 @@ def canonical_strategy(value: dict) -> dict:
 
 def strategy(value: dict, *, clock=time.time) -> Strategy:
     value = canonical_strategy(value)
+    value = dict(value)
+    value.setdefault('nado_maker_distance_percent', '0.02')
+    value.setdefault('nado_maker_reprice_seconds', 90)
     try:
         values = {name: Decimal(str(value[name])) for name in DECIMAL_FIELDS}
         values.update({name: int(str(value.get(name, 43200 if name == 'hold_seconds' else '')))

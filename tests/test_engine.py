@@ -75,6 +75,117 @@ class GatewayFixture:
 
 
 class EngineTests(unittest.TestCase):
+    def test_zero_percent_maker_price_uses_midpoint_without_taking_ask(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True, nado_maker_distance_percent=D(0))
+        self.nado.items = tuple(replace(i, price_tick=D('.01')) for i in self.nado.items)
+        self.nado.book = lambda instrument: Book(D('199.90'), D('200.10'), self.clock())
+        self.nado.responses.append('PENDING')
+        self.engine.start()
+        self.engine.tick()
+        intent = self.nado.requests[0]
+        self.assertEqual(intent.limit_price, D(200))
+        self.assertLess(intent.limit_price, D('200.10'))
+        self.assertTrue(intent.post_only)
+
+    def test_preparation_read_failure_on_second_leg_waits_without_falsely_closing_spot(self):
+        from farming_accounts.trading.domain import PreSubmissionReadUnavailable
+        self.lighter.responses.append(PreSubmissionReadUnavailable('fixture unavailable nonce'))
+        self.engine.start()
+        self.engine.tick()
+        self.engine.tick()
+        self.assertTrue(self.engine.status()['running'])
+        self.assertEqual(self.engine.status()['state'], 'WAITING_API')
+        self.assertEqual(self.nado.positions[1], D(10))
+        self.assertEqual(self.lighter.positions[101], D(0))
+        for _ in range(2):
+            self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'HEDGED')
+
+    def test_retryable_preparation_failure_has_no_fill_and_retries_same_task(self):
+        from farming_accounts.trading.domain import PreSubmissionReadUnavailable
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.responses.append(PreSubmissionReadUnavailable('fixture read before POST'))
+        self.engine.start()
+        self.engine.tick()
+        identity = self.engine.status()['cycle']['id']
+        self.assertTrue(self.engine.status()['running'])
+        self.assertEqual(self.engine.status()['state'], 'WAITING_API')
+        self.assertEqual(self.journal.orders(identity)[0][2].status, 'NOT_SUBMITTED')
+        self.assertEqual(self.lighter.requests, [])
+        self.engine.tick()
+        self.assertEqual(self.engine.status()['cycle']['id'], identity)
+        self.assertEqual(len(self.nado.requests), 2)
+
+    def test_read_failure_after_submit_never_becomes_a_zero_submission_proof(self):
+        from farming_accounts.trading.domain import ReadUnavailable
+        self.nado.responses.append(ReadUnavailable('fixture failed read AFTER POST'))
+        self.engine.start()
+        for _ in range(4):
+            self.engine.tick()
+        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(self.engine.status()['state'], 'RECOVERY')
+        self.assertIsNone(self.journal.orders(self.engine.status()['cycle']['id'])[0][2])
+        self.assertEqual(self.lighter.requests, [])
+
+    def test_hours_of_zero_expired_maker_attempts_continue_until_fill_without_hold_timer(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True, hold_seconds=43200)
+        self.nado.responses.extend(['EXPIRED'] * 25)
+        self.engine.start()
+        self.engine.tick()
+        identity = self.engine.status()['cycle']['id']
+        for _ in range(24):
+            self.clock.value += 900
+            self.engine.tick()
+            self.assertTrue(self.engine.status()['running'])
+            self.assertEqual(self.engine.status()['cycle']['id'], identity)
+            self.assertIsNone(self.engine.status()['cycle']['deadline'])
+        self.assertEqual(self.lighter.requests, [])
+        self.clock.value += 900
+        for _ in range(3):
+            self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'HEDGED')
+        self.assertEqual(self.engine.status()['cycle']['deadline'], self.clock() + 43200)
+
+    def test_custom_maker_settings_are_snapshotted_and_long_wait_fits_expiry(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True,
+                                       nado_maker_distance_percent=D('0.1'), nado_maker_reprice_seconds=1800)
+        self.nado.items = tuple(replace(i, price_tick=D('.01')) for i in self.nado.items)
+        self.nado.responses.append('PENDING')
+        self.engine.start()
+        self.engine.tick()
+        intent = self.nado.requests[0]
+        self.assertEqual(intent.limit_price, D('199.80'))
+        self.assertGreater(intent.expiry, self.clock() + 1800)
+        self.engine.strategy = replace(self.engine.strategy, nado_maker_distance_percent=D('0.2'))
+        self.assertEqual(self.engine._strategy(self.engine.status()['cycle']).nado_maker_distance_percent, D('0.1'))
+
+    def test_transient_lighter_read_after_twenty_minutes_keeps_task_and_same_order(self):
+        from farming_accounts.trading.lighter import LighterVenue
+        from test_lighter_trading import credentials
+        adapter = LighterVenue(credentials(), clock=self.clock)
+        self.engine.strategy = replace(self.strategy, nado_post_only=True)
+        self.nado.responses.append('PENDING')
+        self.engine.start()
+        self.engine.tick()
+        identity = self.engine.status()['cycle']['id']
+        original = self.lighter.instruments
+        async def unavailable():
+            raise TimeoutError('fixture connection timed out')
+        try:
+            self.clock.value += 1200
+            self.lighter.instruments = lambda: adapter._run(unavailable)
+            self.engine.tick()
+            self.assertTrue(self.engine.status()['running'])
+            self.assertEqual(len(self.nado.requests), 1)
+            self.assertEqual(self.lighter.requests, [])
+            self.lighter.instruments = original
+            self.engine.tick()
+            self.assertEqual(self.engine.status()['state'], 'OPENING_SPOT')
+            self.assertEqual(self.engine.status()['cycle']['id'], identity)
+            self.assertIsNone(self.engine.status()['cycle']['deadline'])
+        finally:
+            adapter.close()
+
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.path = Path(self.temp.name) / "state.sqlite3"

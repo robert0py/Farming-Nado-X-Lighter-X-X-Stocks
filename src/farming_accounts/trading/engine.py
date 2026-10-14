@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 
-from .domain import (Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, Strategy, TradingError,
+from .domain import (Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable, Strategy, TradingError,
                      TradingGateway, UnknownExecution, maker_opening_price, quantize)
 from .journal import Journal, encoded
 
@@ -49,9 +49,10 @@ class Engine:
         self._valid_instrument(instrument)
         result = self._gateway(instrument.venue).book(instrument)
         if (not result.bid.is_finite() or not result.ask.is_finite() or
-                result.bid <= 0 or result.ask < result.bid or
-                not 0 <= self.clock() - result.timestamp <= strategy.quote_max_age_seconds):
-            raise TradingError("Стакан недоступен, устарел или содержит некорректные цены.")
+                result.bid <= 0 or result.ask < result.bid):
+            raise TradingError("Стакан содержит некорректные цены.")
+        if not 0 <= self.clock() - result.timestamp <= strategy.quote_max_age_seconds:
+            raise ReadUnavailable('Котировка устарела. Дождёмся свежего стакана перед исполнением.')
         return result
 
     def _baseline(self, pair, books, strategy):
@@ -74,7 +75,9 @@ class Engine:
         raw = dict(cycle["strategy"])
         raw["assets"] = tuple(raw["assets"])
         raw["points_verified_assets"] = tuple(raw["points_verified_assets"])
-        for key in ("notional_per_leg", "max_slippage_bps", "residual_notional", "margin_reserve", "max_loss_quote"):
+        raw.setdefault('nado_maker_distance_percent', '0.02')
+        raw.setdefault('nado_maker_reprice_seconds', 90)
+        for key in ("notional_per_leg", "max_slippage_bps", "residual_notional", "margin_reserve", "max_loss_quote", 'nado_maker_distance_percent'):
             raw[key] = Decimal(raw[key])
         return Strategy(**raw)
 
@@ -171,7 +174,7 @@ class Engine:
 
     def _opening_size(self, instrument: Instrument, book: Book, strategy: Strategy) -> Decimal:
         maker = strategy.nado_post_only
-        cap = (maker_opening_price(instrument, book) if maker else
+        cap = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent) if maker else
                quantize(book.ask * (1 + strategy.max_slippage_bps / 10000), instrument.price_tick))
         if (not maker and cap < book.ask) or cap <= 0:
             raise TradingError("Ценовой шаг не позволяет соблюсти установленное проскальзывание.")
@@ -313,6 +316,9 @@ class Engine:
                 cycle['unhedged_since'] = self.journal.completion_time(cycle['id']) or self.clock()
             self._transition(cycle, 'OPENING_HEDGE', 'Покупка Nado исполнена; открываем встречную позицию на подтверждённый объём.')
             return
+        if result.status == 'NOT_SUBMITTED':
+            self._transition(cycle, 'OPENING_SPOT', 'Данные API снова доступны; продолжаем прежнюю задачу открытия.')
+            return
         if result.status == 'REJECTED':
             code, reason = self._rejection(intent)
             if intent.post_only and code == 2008:
@@ -336,12 +342,12 @@ class Engine:
                quantity: Decimal, action: str, *, reduce_only: bool) -> None:
         strategy = self._strategy(cycle)
         if not 0 <= self.clock() - book.timestamp <= strategy.quote_max_age_seconds:
-            raise TradingError("Котировка устарела перед отправкой ордера.")
+            raise ReadUnavailable("Котировка устарела перед отправкой ордера. Ожидаем свежие данные.")
         quantity = quantize(quantity, instrument.quantity_step)
         factor = strategy.max_slippage_bps / 10000
         maker = instrument.venue.casefold() == 'nado' and strategy.nado_post_only
         if maker:
-            limit = (maker_opening_price(instrument, book) if side == 'buy' and not reduce_only else
+            limit = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent) if side == 'buy' and not reduce_only else
                      quantize(book.bid if side == 'buy' else book.ask, instrument.price_tick, upward=side == 'sell'))
         else:
             limit = quantize(book.ask * (1 + factor), instrument.price_tick) if side == "buy" else quantize(
@@ -352,13 +358,13 @@ class Engine:
         if limit <= 0 or (not maker and ((side == "buy" and limit < book.ask) or (side == "sell" and limit > book.bid))):
             raise TradingError("Ценовой шаг не позволяет соблюсти установленное проскальзывание.")
         if not instrument.tradable and not reduce_only:
-            raise TradingError("Площадка сейчас запрещает исполнение этого инструмента.")
+            raise ReadUnavailable("Рынок временно не принимает новые позиции. Продолжим проверку доступности.")
         if self._gateway(instrument.venue).open_orders(instrument):
             raise TradingError("На инструменте обнаружен активный ордер; повторное исполнение запрещено.")
         if not reduce_only and self._gateway(instrument.venue).available() < quantity * limit + strategy.margin_reserve:
             raise TradingError("Недостаточно средств с установленным резервом.")
         sequence = len(self.journal.orders(cycle["id"])) + 1
-        expiry = int(self.clock()) + (900 if maker and not reduce_only else 90)
+        expiry = int(self.clock()) + (max(900, strategy.nado_maker_reprice_seconds + 60) if maker and not reduce_only else 90)
         receive_until = int(self.clock()) + 90
         intent = OrderIntent(uuid.uuid5(uuid.NAMESPACE_URL, f"{cycle['id']}:{sequence}:{instrument.venue}").hex,
                              cycle["id"], instrument.venue, instrument, side, quantity, limit, reduce_only,
@@ -381,6 +387,10 @@ class Engine:
                 self.journal.set("running", False)
                 _, reason = self._rejection(intent)
                 self._transition(cycle, "HALTED", "Площадка не исполнила закрытие в пределах цены. Требуется проверка остатка; повторов нет. " + reason)
+        except PreSubmissionReadUnavailable:
+            # Adapter guarantees its read/preparation failed BEFORE any POST.
+            self.journal.observe(OrderObservation(intent.client_id, 'NOT_SUBMITTED', Decimal(0)), observed_at=self.clock())
+            raise
         except PreSubmissionError as error:
             self.journal.observe(OrderObservation(intent.client_id, "REJECTED", Decimal(0)), observed_at=self.clock())
             if reduce_only:
@@ -457,6 +467,8 @@ class Engine:
                 for index, (action, intent, observation) in enumerate(self.journal.orders(cycle['id'])):
                     if index < cycle.get('retry_budget_start', 0):
                         continue
+                    if observation and observation.status == 'NOT_SUBMITTED':
+                        continue
                     code, _ = self._rejection(intent)
                     maker_wait = (action == 'open_spot' and intent.post_only and observation and
                                   observation.terminal and observation.filled_quantity == 0 and
@@ -481,7 +493,7 @@ class Engine:
                 if cycle["attempts"] == 0 and not self.journal.get("running", False):
                     self._closed(cycle, 'NOT_OPENED', "Открытие остановлено до отправки ордеров.")
                     return self.status()
-                if cycle["state"] == "OPENING_SPOT" and cycle["attempts"] == 0 and not closing:
+                if cycle["attempts"] == 0 and not closing:
                     cycle['target_spot'] = str(self._opening_size(spot, spot_book, strategy))
                     self._write(cycle, spot, spot_book, "buy", Decimal(cycle["target_spot"]), "open_spot", reduce_only=False)
                     if cycle["state"] not in ('RECOVERY', 'CLOSED', 'HALTED'):
@@ -512,7 +524,7 @@ class Engine:
                 if closing:
                     empty_closes = sum(1 for index, (action, intent, obs) in enumerate(self.journal.orders(cycle['id']))
                                        if index >= cycle.get('retry_budget_start', 0)
-                                       if action == 'close_spot' and intent.post_only and obs and obs.terminal and obs.filled_quantity == 0)
+                                       if action == 'close_spot' and intent.post_only and obs and obs.status in ('CANCELLED', 'EXPIRED') and obs.filled_quantity == 0)
                     if empty_closes >= 3:
                         raise TradingError('Maker-закрытие трижды отменено без исполнения. Остаток сохранён; проверьте рынок и запросите закрытие снова.')
                     self._transition(cycle, "CLOSING", "Контролируемое закрытие обеих сторон.")
@@ -530,7 +542,7 @@ class Engine:
                 if cycle["unhedged_since"] is None:
                     cycle["unhedged_since"] = self.journal.completion_time(cycle['id']) or self.clock()
                 expired = self.clock() - cycle["unhedged_since"] >= strategy.max_unhedged_seconds
-                failed_hedge = any(action == "open_perp" and obs and obs.terminal and obs.filled_quantity == 0
+                failed_hedge = any(action == "open_perp" and obs and obs.terminal and obs.status != 'NOT_SUBMITTED' and obs.filled_quantity == 0
                                    for action, _, obs in self.journal.orders(cycle["id"]))
                 if expired or failed_hedge:
                     self.journal.set("running", False)
@@ -544,6 +556,8 @@ class Engine:
                     else:
                         try:
                             self._write(cycle, perp, perp_book, "sell", hedge_quantity, "open_perp", reduce_only=False)
+                        except ReadUnavailable:
+                            raise
                         except TradingError:
                             self.journal.set("running", False)
                             self._transition(cycle, "CLOSING", "Встречную позицию нельзя открыть в пределах лимитов; закрытие подтверждённого остатка.")
@@ -553,6 +567,9 @@ class Engine:
                 elif residual < 0:
                     correction = quantize(-residual / perp.multiplier, perp.quantity_step)
                     self._write(cycle, perp, perp_book, "buy", correction, "correct_perp", reduce_only=True)
+                return self.status()
+            except ReadUnavailable as error:
+                self._transition(cycle, 'WAITING_API', str(error) + ' Задача сохранена; повторяем чтение и сверку без дублирования ордеров.')
                 return self.status()
             except TradingError as error:
                 self.journal.set("running", False)

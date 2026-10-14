@@ -12,9 +12,14 @@ from .trading.domain import TradingError
 
 
 POINTS_URL = 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado'
+BASIC_FIELDS = ('notional_per_leg', 'hold_hours', 'nado_maker_distance_percent', 'nado_maker_reprice_seconds')
 FIELDS = (
     ('notional_per_leg', 'Сумма покупки на Nado, USDT0',
      'Укажите свой бюджет одной spot-покупки на Nado. На Lighter бот рассчитает short на сопоставимое количество того же базового актива с учётом множителей и округления. Стоимость short может отличаться. Минимумы бирж показаны у активов; ещё нужны резерв и полное обеспечение short на Lighter.'),
+    ('nado_maker_distance_percent', 'Расстояние лимитки от рыночной цены, %',
+     'Введите процент напрямую: 0,1 означает 0,1%, а не 10%. Покупка рассчитывается ниже середины стакана Nado (между bid и ask). При цене 600 и расстоянии 0,1% лимит — 599,40. Можно указать 0%: цена будет в середине стакана с округлением по шагу биржи и сохранением maker post-only. Близкая заявка сохраняет очередь; перестановка нужна только при большем расстоянии.'),
+    ('nado_maker_reprice_seconds', 'Через сколько секунд проверять лимитку',
+     'Введите целое число от 1 до 86400 секунд. Это время ожидания каждой новой заявки перед проверкой расстояния, а не срок всей задачи. После него бот проверяет заявку при каждой сверке (примерно раз в 10 секунд плюс задержки API). Если расстояние не больше выбранного процента, заявка остаётся. Задача продолжается до исполнения, вашей остановки или ограничения риска.'),
     ('slippage_percent', 'Допустимое проскальзывание, %',
      'Введите выбранный вами процент отклонения цены исполнения от проверенных цен стакана. Чем меньше значение, тем чаще ордер может не исполниться. Это ограничение цены ордера, оно не гарантирует исполнение обеих сторон. Проценты вводятся напрямую, без перевода в bps.'),
     ('residual_notional', 'Допустимый непокрытый остаток, USDT0',
@@ -136,7 +141,7 @@ class StrategyDialog:
 
         first = inner.winfo_children()[0]
         label(inner, 'Сумма и время одного цикла', bold=True, size=14).pack(anchor='w', before=first)
-        label(inner, 'Nado: maker-покупка на 0,02% ниже середины стакана (между bid и ask). Через 90 секунд бот проверяет расстояние: близкую заявку сохраняет, при расстоянии больше 0,02% подтверждает отмену и обновляет цену. Lighter: встречная позиция только на подтверждённый объём покупки. Защита рассчитывается автоматически; исполнение и отсутствие потерь не гарантированы.',
+        label(inner, 'Выберите расстояние лимитки и время ожидания ниже. Nado: maker post-only; близкая заявка сохраняется, далёкая обновляется после подтверждения отмены. Временные сбои API не отменяют задачу. Lighter: встречная позиция только на подтверждённый объём покупки. Исполнение и отсутствие потерь не гарантированы.',
               color=MUTED, size=9, wraplength=840, anchor='w', justify='left').pack(fill='x', pady=(5, 8), before=first)
         grid = tk.Frame(inner, bg=PANEL)
         grid.pack(fill='x', before=first)
@@ -149,7 +154,7 @@ class StrategyDialog:
         saved = panel.data.get('strategy') or {}
         basic_index, advanced_index = 0, 0
         for index, (key, title, help_text) in enumerate(FIELDS):
-            basic = key in ('notional_per_leg', 'hold_hours')
+            basic = key in BASIC_FIELDS
             target = grid if basic else self.advanced_grid
             row, column = divmod(basic_index if basic else advanced_index, 2)
             basic_index += int(basic)
@@ -166,6 +171,8 @@ class StrategyDialog:
             self.entries[key] = entry = ttk.Entry(frame)
             entry.pack(fill='x', pady=(5, 0))
             value = saved.get(key, '')
+            if key in ('nado_maker_distance_percent', 'nado_maker_reprice_seconds'):
+                value = saved.get(key, '0.02' if key == 'nado_maker_distance_percent' else 90)
             if key == 'slippage_percent':
                 value = Decimal(str(saved['max_slippage_bps'])) / 100 if 'max_slippage_bps' in saved else ''
             elif key == 'hold_hours':
@@ -311,14 +318,14 @@ class StrategyDialog:
             return
         value = {'mode': 'manual' if self.advanced.get() else 'automatic', 'nado_post_only': True, 'preserve_spot_dust': True}
         for key, title, _ in FIELDS:
-            if not self.advanced.get() and key not in ('notional_per_leg', 'hold_hours'):
+            if not self.advanced.get() and key not in BASIC_FIELDS:
                 continue
             raw = self.entries[key].get().strip().replace(',', '.')
             try:
                 number = Decimal(raw)
                 if not number.is_finite():
                     raise ValueError()
-                if key in ('hold_hours', 'max_unhedged_seconds', 'quote_max_age_seconds'):
+                if key in ('hold_hours', 'max_unhedged_seconds', 'quote_max_age_seconds', 'nado_maker_reprice_seconds'):
                     number *= 3600 if key == 'hold_hours' else 1
                     if number != number.to_integral_value() or number <= 0:
                         raise ValueError()

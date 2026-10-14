@@ -18,7 +18,7 @@ import time
 from typing import Callable
 from urllib.parse import urlsplit
 
-from .domain import Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, TradingError, UnknownExecution
+from .domain import Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable, TradingError, UnknownExecution
 
 
 RH_URL = "https://api.rh.lighter.xyz"
@@ -186,6 +186,13 @@ the durable engine must only call lookup(), including after a process restart.
 
     venue = "lighter"
 
+    @staticmethod
+    def _temporary_read_error(error):
+        import aiohttp
+        return (isinstance(error, (TimeoutError, OSError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError))
+                or getattr(error, 'status', None) in (405, 408, 429)
+                or isinstance(getattr(error, 'status', None), int) and 500 <= error.status < 600)
+
     def __init__(self, credentials: LighterCredentials, *, sdk_module=None, clock: Callable[[], float] = time.time,
                  session_factory=None):
         self.credentials = credentials
@@ -210,7 +217,7 @@ the durable engine must only call lookup(), including after a process restart.
             if self._closed:
                 raise TradingError("Соединение Lighter закрыто.")
             if self._clock() < self._cooldown_until:
-                raise TradingError("Lighter ограничил запросы. Дождитесь завершения паузы.")
+                raise ReadUnavailable("Lighter ограничил запросы. Дождитесь завершения паузы.")
             try:
                 return self._loop.run_until_complete(asyncio.wait_for(factory(), REQUEST_TIMEOUT))
             except TradingError:
@@ -220,6 +227,8 @@ the durable engine must only call lookup(), including after a process restart.
                     self._cooldown_until = self._clock() + 60
                 if writing:
                     raise UnknownExecution("Статус отправки Lighter неизвестен. Повтор запрещён до сверки исполнения.") from None
+                if self._temporary_read_error(exc):
+                    raise ReadUnavailable('Временно недоступны данные Lighter; повторяем чтение после восстановления связи.') from None
                 raise TradingError("Не удалось получить проверенные данные Lighter. Повторите чтение позднее.") from None
 
     async def _ensure_client(self):
@@ -338,7 +347,7 @@ the durable engine must only call lookup(), including after a process restart.
         ))
         bids, asks = _items(data.get("bids")), _items(data.get("asks"))
         if not bids or not asks:
-            raise TradingError("В стакане Lighter отсутствует встречная ликвидность.")
+            raise ReadUnavailable("В стакане Lighter временно отсутствует встречная ликвидность.")
         bid, ask = _data(bids[0]), _data(asks[0])
         bid_price, ask_price = _number(bid.get("price")), _number(ask.get("price"))
         if bid_price <= 0 or ask_price <= 0 or bid_price > ask_price:
@@ -416,11 +425,32 @@ the durable engine must only call lookup(), including after a process restart.
             except Exception as error:
                 if index in self._submitted or index in self._observed_ids:
                     raise UnknownExecution("Исполнение Lighter не подтверждено. Повтор отправки запрещён до сверки.") from None
+                if isinstance(error, ReadUnavailable):
+                    raise PreSubmissionReadUnavailable(str(error)) from None
                 if isinstance(error, TradingError):
                     raise PreSubmissionError(str(error)) from None
                 raise PreSubmissionError("Ордер Lighter не был отправлен: не удалось завершить предварительную проверку.") from None
 
     async def _submit(self, intent):
+        try:
+            prepared = await self._prepare_submit(intent)
+        except Exception as error:
+            if self._temporary_read_error(error):
+                if getattr(error, 'status', None) in (405, 429):
+                    self._cooldown_until = self._clock() + 60
+                raise PreSubmissionReadUnavailable('Предварительное чтение Lighter временно недоступно. Ордер не отправлен.') from None
+            raise
+        if isinstance(prepared, OrderObservation):
+            return prepared
+        index, tx_type, payload, tx_hash = prepared
+        self._submitted[index] = intent.client_id
+        # A failure below is uncertain execution, never a retryable preparation.
+        data = _response(await self._client.tx_api.send_tx(
+            tx_type=tx_type, tx_info=payload, _request_timeout=REQUEST_TIMEOUT,
+        ))
+        return OrderObservation(intent.client_id, "ACK", Decimal(0), exchange_id=data.get("tx_hash") or tx_hash)
+
+    async def _prepare_submit(self, intent):
         self._validate_intent(intent)
         index = client_order_index(intent.client_id)
         if index in self._submitted:
@@ -456,12 +486,7 @@ the durable engine must only call lookup(), including after a process restart.
         )
         if error or tx_type != 14 or not payload or not tx_hash:
             raise TradingError("Signer Lighter отклонил параметры ордера.")
-        self._submitted[index] = intent.client_id
-        # No SDK high-level write helper or logger: exactly one bounded POST.
-        data = _response(await self._client.tx_api.send_tx(
-            tx_type=tx_type, tx_info=payload, _request_timeout=REQUEST_TIMEOUT,
-        ))
-        return OrderObservation(intent.client_id, "ACK", Decimal(0), exchange_id=data.get("tx_hash") or tx_hash)
+        return index, tx_type, payload, tx_hash
 
     def lookup(self, intent: OrderIntent) -> OrderObservation | None:
         self._instrument(intent.instrument)

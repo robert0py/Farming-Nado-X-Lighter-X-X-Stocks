@@ -439,6 +439,16 @@ class NadoLifecycleTests(unittest.TestCase):
 
 
 class NadoTransportTests(unittest.TestCase):
+    def test_temporary_read_failure_is_retryable_and_never_reflects_request_secrets(self):
+        from farming_accounts.trading.domain import ReadUnavailable
+        class Opener:
+            def open(self, request, timeout):
+                raise URLError('fixture-sensitive-content')
+        transport = NadoTransport(opener=Opener())
+        with self.assertRaises(ReadUnavailable) as caught:
+            transport.query({'type': 'contracts'})
+        self.assertNotIn('fixture-sensitive-content', str(caught.exception))
+
     def test_uncertain_transport_write_no_retry_or_raw_error(self):
         class Opener:
             calls = 0

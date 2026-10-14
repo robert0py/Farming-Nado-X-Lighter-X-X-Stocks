@@ -171,6 +171,23 @@ class MakerTests(unittest.TestCase):
         self.assertEqual((result.status, result.filled_quantity), ('CANCELLED', D(0)))
         self.assertEqual(len(self.cancels()), 1)
 
+    def test_saved_custom_distance_and_wait_control_cancellation(self):
+        self.gateway.submit(self.intent)
+        cycle = self.journal.active_cycle()
+        cycle['strategy'] = {'nado_maker_distance_percent': '0.2', 'nado_maker_reprice_seconds': 120}
+        self.journal.save_cycle(cycle)
+        self.gateway.clock = lambda: NOW + 119
+        self.assertEqual(self.gateway.lookup(self.intent).status, 'PENDING')
+        self.assertEqual(self.cancels(), [])
+        self.gateway.clock = lambda: NOW + 120
+        self.gateway.book = lambda instrument: Book(D(104), D('104.3'), self.gateway.clock())
+        self.assertEqual(self.gateway.lookup(self.intent).status, 'PENDING')
+        self.assertEqual(self.cancels(), [])
+        self.gateway.clock = lambda: NOW + 121
+        self.gateway.book = lambda instrument: Book(D(104), D(105), self.gateway.clock())
+        self.assertEqual(self.gateway.lookup(self.intent).status, 'CANCELLED')
+        self.assertEqual(len(self.cancels()), 1)
+
     def test_timed_reprice_with_lost_cancel_reply_never_repeats_cancel_after_restart(self):
         self.gateway.submit(self.intent)
         self.transport.cancel_error = True

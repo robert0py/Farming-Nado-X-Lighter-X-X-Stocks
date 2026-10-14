@@ -13,8 +13,16 @@ class UnknownExecution(TradingError):
     """A write may have reached the exchange; only reconciliation is allowed."""
 
 
+class ReadUnavailable(TradingError):
+    """A transient read failure; preserve the task and reconcile on the next tick."""
+
+
 class PreSubmissionError(TradingError):
     """The adapter proves it failed before any trading POST was attempted."""
+
+
+class PreSubmissionReadUnavailable(PreSubmissionError, ReadUnavailable):
+    """A retryable read failure with proof that no trading POST was attempted."""
 
 
 @dataclass(frozen=True)
@@ -68,7 +76,7 @@ class OrderObservation:
 
     @property
     def terminal(self) -> bool:
-        return self.status in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+        return self.status in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "NOT_SUBMITTED"}
 
 
 class TradingGateway(Protocol):
@@ -96,18 +104,25 @@ class Strategy:
     points_verified_assets: tuple[str, ...] = ()
     nado_post_only: bool = False
     preserve_spot_dust: bool = False
+    nado_maker_distance_percent: Decimal = Decimal('0.02')
+    nado_maker_reprice_seconds: int = 90
 
     def validate(self) -> None:
         if any(not isinstance(value, bool) for value in (self.nado_post_only, self.preserve_spot_dust)):
             raise TradingError('Некорректный режим исполнения стратегии.')
         amounts = (self.notional_per_leg, self.max_slippage_bps, self.residual_notional,
-                   self.margin_reserve, self.max_loss_quote)
+                   self.margin_reserve, self.max_loss_quote, self.nado_maker_distance_percent)
         if not self.assets or len(set(self.assets)) != len(self.assets):
             raise TradingError("Выберите неповторяющийся список разрешённых активов.")
         if any(not isinstance(x, Decimal) or not x.is_finite() or x < 0 for x in amounts):
             raise TradingError("Лимиты стратегии должны быть конечными неотрицательными числами.")
         if self.notional_per_leg <= 0 or self.max_loss_quote <= 0:
             raise TradingError("Размер позиции и лимит убытка должны быть больше нуля.")
+        if self.nado_maker_distance_percent >= 100:
+            raise TradingError('Расстояние лимитной покупки должно быть от 0% до менее 100%.')
+        if (isinstance(self.nado_maker_reprice_seconds, bool) or not isinstance(self.nado_maker_reprice_seconds, int)
+                or not 1 <= self.nado_maker_reprice_seconds <= 86400):
+            raise TradingError('Время до проверки ордера: целое число от 1 до 86400 секунд.')
         if self.max_slippage_bps >= 10000 or self.residual_notional >= self.notional_per_leg:
             raise TradingError("Предел проскальзывания или остаточной экспозиции слишком велик.")
         if any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in
@@ -123,9 +138,6 @@ def quantize(value: Decimal, step: Decimal, *, upward: bool = False) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_UP if upward else ROUND_DOWN) * step
 
 
-NADO_MAKER_DISTANCE = Decimal('0.0002')  # 0.02% of the fresh spot midpoint.
-
-
 def _maker_midpoint(book: Book) -> Decimal:
     if (not book.bid.is_finite() or not book.ask.is_finite() or
             book.bid <= 0 or book.ask < book.bid):
@@ -133,20 +145,23 @@ def _maker_midpoint(book: Book) -> Decimal:
     return (book.bid + book.ask) / 2
 
 
-def maker_opening_price(instrument: Instrument, book: Book) -> Decimal:
+def maker_opening_price(instrument: Instrument, book: Book, distance_percent: Decimal = Decimal('0.02')) -> Decimal:
     with localcontext() as context:
         context.prec = 96
-        price = quantize(_maker_midpoint(book) * (1 - NADO_MAKER_DISTANCE), instrument.price_tick)
+        if not distance_percent.is_finite() or not 0 <= distance_percent < 100:
+            raise TradingError('Некорректное расстояние maker-заявки Nado.')
+        price = quantize(_maker_midpoint(book) * (1 - distance_percent / 100), instrument.price_tick)
         if price <= 0 or price >= book.ask:
             raise TradingError('Шаг цены не позволяет выставить maker-покупку Nado.')
         return price
 
 
-def maker_price_needs_refresh(instrument: Instrument, book: Book, current_price: Decimal) -> bool:
+def maker_price_needs_refresh(instrument: Instrument, book: Book, current_price: Decimal,
+                             distance_percent: Decimal = Decimal('0.02')) -> bool:
     with localcontext() as context:
         context.prec = 96
         midpoint = _maker_midpoint(book)
         # Equality preserves queue priority. A coarse tick must not cause
         # repeated cancellations whose replacement has exactly the same price.
-        return (abs(current_price - midpoint) > midpoint * NADO_MAKER_DISTANCE and
-                maker_opening_price(instrument, book) != current_price)
+        return (abs(current_price - midpoint) > midpoint * distance_percent / 100 and
+                maker_opening_price(instrument, book, distance_percent) != current_price)

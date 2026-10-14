@@ -171,8 +171,11 @@ class Journal:
             if quantity > 0 and (observation.average_price is None or
                                  not observation.average_price.is_finite() or observation.average_price <= 0):
                 raise TradingError("Площадка не подтвердила фактическую цену исполнения.")
-            if observation.status not in {"ACK", "PENDING", "FILLED", "CANCELLED", "REJECTED", "EXPIRED"}:
+            if observation.status not in {"ACK", "PENDING", "FILLED", "CANCELLED", "REJECTED", "EXPIRED", "NOT_SUBMITTED"}:
                 raise TradingError("Неизвестное состояние ордера.")
+            if observation.status == 'NOT_SUBMITTED' and (quantity != 0 or observation.exchange_id is not None
+                    or old is not None and old.status != 'NOT_SUBMITTED'):
+                raise TradingError('Нельзя объявить известный или исполненный ордер неотправленным.')
             timestamp = observed_at if observed_at is not None else time.time()
             if observation.filled_at is not None and (not math.isfinite(observation.filled_at) or
                                                       not 0 <= observation.filled_at <= timestamp + 5):

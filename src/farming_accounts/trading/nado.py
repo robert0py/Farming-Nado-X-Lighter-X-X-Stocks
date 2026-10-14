@@ -22,7 +22,7 @@ from urllib.request import Request, build_opener
 
 from ..models import AccountError, nado_subaccount, wallet_address
 from ..transport import MAX_RESPONSE, NoRedirects
-from .domain import (Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError,
+from .domain import (Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable,
                      TradingError, UnknownExecution, maker_price_needs_refresh)
 
 X18 = Decimal(10**18)
@@ -212,7 +212,7 @@ class NadoTransport:
 
     def _request(self, path, *, params=None, body=None, write=False):
         if time.monotonic() < self.cooldown:
-            raise TradingError("Nado ограничил запросы. Дождитесь окончания паузы API.")
+            raise ReadUnavailable("Nado ограничил запросы. Дождитесь окончания паузы API.")
         url = self.base + path
         if params is not None:
             url += "?" + urlencode(params)
@@ -238,11 +238,13 @@ class NadoTransport:
             error.close()
             if write:
                 raise UnknownExecution("Ответ на запись Nado не подтверждён. Нужна сверка, повтор запрещён.") from None
+            if status in (405, 408, 429) or 500 <= status < 600:
+                raise ReadUnavailable(f'Nado временно не выполнил чтение API (HTTP {status}).') from None
             raise TradingError(f"Nado не выполнил чтение API (HTTP {status}).") from None
         except (URLError, TimeoutError, socket.timeout, ssl.SSLError, OSError, ValueError, EOFError):
             if write:
                 raise UnknownExecution("Связь после записи Nado потеряна. Нужна сверка, повтор запрещён.") from None
-            raise TradingError("Не удалось прочитать API Nado.") from None
+            raise ReadUnavailable("Временно не удалось прочитать API Nado.") from None
         except TradingError:
             if write:
                 raise UnknownExecution("Формат ответа на запись Nado не подтверждён. Повтор запрещён.") from None
@@ -369,8 +371,10 @@ class NadoLifecycle:
                 self._control({"method": "subscribe", "id": request_id, "stream":
                                {"type": kind, "subaccount": self.sender, "product_id": self.instrument.id}})
             return self
-        except Exception:
+        except Exception as error:
             self.__exit__(None, None, None)
+            if isinstance(error, (TimeoutError, OSError)):
+                raise ReadUnavailable('Временно недоступен поток исполнений Nado. Ордер не отправлен.') from None
             raise TradingError("Не удалось подключить подтверждение исполнений Nado. Ордер не отправлен.") from None
 
     def _control(self, request):
@@ -611,12 +615,16 @@ class NadoGateway:
                 if price <= 0 or qty <= 0 or price % instrument.price_tick != 0:
                     raise TradingError("Nado вернул недопустимую ликвидность.")
                 levels.append((price, qty))
-            if not levels or levels != sorted(levels, reverse=descending):
-                raise TradingError("Стакан Nado пуст или неправильно отсортирован.")
+            if not levels:
+                raise ReadUnavailable('В стакане Nado временно нет ликвидности.')
+            if levels != sorted(levels, reverse=descending):
+                raise TradingError("Стакан Nado неправильно отсортирован.")
             sides.append(levels[0])
         timestamp = _integer(data.get("timestamp"), minimum=1) / 1_000_000_000
-        if sides[0][0] >= sides[1][0] or timestamp > self.clock() + 5 or self.clock() - timestamp > 15:
-            raise TradingError("Стакан Nado устарел или содержит пересечение цен.")
+        if timestamp > self.clock() + 5 or self.clock() - timestamp > 15:
+            raise ReadUnavailable('Стакан Nado устарел; повторяем чтение.')
+        if sides[0][0] >= sides[1][0]:
+            raise TradingError("Стакан Nado содержит пересечение цен.")
         return Book(sides[0][0], sides[1][0], timestamp, sides[0][1], sides[1][1])
 
     def position(self, instrument):
@@ -732,6 +740,8 @@ class NadoGateway:
                                                                  'baseline_normalized': baseline_snapshot['normalized'],
                                                                  'baseline_multiplier': baseline_snapshot['multiplier'],
                                                                  'submitted_at': self.clock(), 'cancel_state': None})
+            except ReadUnavailable as error:
+                raise PreSubmissionReadUnavailable(str(error)) from None
             except Exception as error:
                 message = str(error) if isinstance(error, TradingError) else "Подготовка Nado не выполнена. Ордер не отправлен."
                 raise PreSubmissionError(message) from None
@@ -978,13 +988,16 @@ class NadoGateway:
                 # Any balance change makes us cancel only our remaining amount
                 # immediately; positive fills still require archive proof.
                 placed = float(record.get('submitted_at', intent.expiry - 90))
+                cycle_strategy = (self.journal.active_cycle() or {}).get('strategy', {})
+                reprice_seconds = int(cycle_strategy.get('nado_maker_reprice_seconds', MAKER_REPRICE_SECONDS))
+                distance_percent = Decimal(str(cycle_strategy.get('nado_maker_distance_percent', '0.02')))
                 due = (record.get('cancel_requested') is True or actual != baseline
                        or self.clock() >= intent.expiry or
                        intent.reduce_only and self.clock() >= placed + 20)
                 if (record.get('cancel_state') is None and not due and not intent.reduce_only and
-                        self.clock() >= placed + MAKER_REPRICE_SECONDS):
+                        self.clock() >= placed + reprice_seconds):
                     try:
-                        due = maker_price_needs_refresh(intent.instrument, self.book(intent.instrument), intent.limit_price)
+                        due = maker_price_needs_refresh(intent.instrument, self.book(intent.instrument), intent.limit_price, distance_percent)
                     except (TradingError, AccountError, TimeoutError):
                         # Missing/stale quotes cannot justify cancelling a live
                         # order. Reconcile again with no new writes or fake fill.

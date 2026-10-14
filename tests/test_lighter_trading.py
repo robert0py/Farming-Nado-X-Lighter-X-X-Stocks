@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from farming_accounts.trading.domain import OrderIntent, PreSubmissionError, TradingError, UnknownExecution
+from farming_accounts.trading.domain import OrderIntent, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable, TradingError, UnknownExecution
 from farming_accounts.trading.lighter import (
     LighterCredentials, LighterRegistration, LighterVenue, RH_CHAIN_ID, RH_URL,
     _RhSession, client_order_index, generate_api_key,
@@ -352,6 +352,27 @@ class LighterAdapterTests(unittest.TestCase):
             self.adapter.available()
         self.sdk.now += 61
         self.assertEqual(self.adapter.available(), Decimal("25.500000"))
+
+    def test_temporary_read_failure_can_recover_but_unauthorized_read_remains_fatal(self):
+        self.sdk.api_error = TimeoutError(PRIVATE)
+        with self.assertRaises(ReadUnavailable) as caught:
+            self.adapter.available()
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.sdk.api_error = None
+        self.assertEqual(self.adapter.available(), Decimal('25.500000'))
+        self.sdk.api_error = type('ApiException', (Exception,), {'status': 401})(PRIVATE)
+        with self.assertRaises(TradingError) as caught:
+            self.adapter.available()
+        self.assertNotIsInstance(caught.exception, ReadUnavailable)
+
+    def test_preparation_network_failure_proves_no_post_and_allows_fresh_preparation(self):
+        self.sdk.nonce_error = TimeoutError(PRIVATE)
+        with self.assertRaises(PreSubmissionReadUnavailable):
+            self.adapter.submit(self.intent)
+        self.assertEqual(self.sdk.posts, [])
+        self.sdk.nonce_error = None
+        self.adapter.submit(self.intent)
+        self.assertEqual(len(self.sdk.posts), 1)
 
     def test_event_loop_can_be_called_serially_from_distinct_threads(self):
         values = []

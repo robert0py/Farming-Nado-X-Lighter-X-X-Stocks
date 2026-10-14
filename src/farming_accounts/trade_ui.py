@@ -13,6 +13,7 @@ from .vault import Vault, VaultError, state_directory
 
 
 STATE_NAMES = {'NOT_CONFIGURED': 'Настройте доступ и стратегию', 'IDLE': 'Остановлен', 'WAITING': 'Ожидание рынка',
+               'WAITING_API': 'Ожидание API · задача продолжается',
                'PAUSED': 'Процесс исполнения выключен',
                'OPENING_SPOT': 'Покупка spot', 'OPENING_HEDGE': 'Формирование хеджа', 'HEDGED': 'Хедж удерживается',
                'CLOSING': 'Закрытие обеих сторон', 'CLOSED': 'Цикл завершён', 'RECOVERY': 'Сверка прежнего ордера', 'HALTED': 'Остановлено · нужна сверка'}
@@ -272,7 +273,7 @@ class TradingPanel:
             self.fields[venue].configure(text='Доступ подтверждён' if verified else 'Ключ сохранён · нужна проверка' if value.get('key_saved') else 'Торговый доступ не настроен', fg=GREEN if verified else MUTED)
         settings = self.data.get('strategy')
         if settings:
-            self.summary.configure(text=f"{', '.join(settings['assets'])} · покупка Nado до {settings['notional_per_leg']} USDT0 · удержание {settings['hold_seconds'] / 3600:g} ч")
+            self.summary.configure(text=f"{', '.join(settings['assets'])} · покупка Nado до {settings['notional_per_leg']} USDT0 · удержание {settings['hold_seconds'] / 3600:g} ч · лимитка {settings.get('nado_maker_distance_percent', '0.02')}% · проверка через {settings.get('nado_maker_reprice_seconds', 90)} с")
         execution = self.data.get('execution', {})
         cycle = execution.get('cycle') or {}
         state = execution.get('state', 'NOT_CONFIGURED')
@@ -291,8 +292,8 @@ class TradingPanel:
         for venue, order in latest.items():
             status_name = {'ACK': 'принят', 'PENDING': 'ожидает исполнения', 'UNKNOWN': 'результат сверяется',
                            'FILLED': 'исполнен', 'CANCELLED': 'отменён', 'REJECTED': 'отклонён',
-                           'EXPIRED': 'истёк срок'}.get(order['status'], order['status'])
-            if state in ('HALTED', 'RECOVERY', 'PAUSED'):
+                           'EXPIRED': 'истёк срок', 'NOT_SUBMITTED': 'не отправлен · ожидаем API'}.get(order['status'], order['status'])
+            if state in ('HALTED', 'RECOVERY', 'PAUSED', 'WAITING_API') and order['status'] != 'NOT_SUBMITTED':
                 status_name = 'последний известный статус: ' + status_name + '; требуется сверка'
             number = ' · ID ' + order['exchange_id'] if order.get('exchange_id') else ''
             details.append(f"{'Nado' if venue == 'nado' else 'Lighter'}: {status_name} · {order['quantity']} {order['asset']} по {order['limit_price']} · исполнено {order.get('filled_quantity') or '0'}{number}")

@@ -76,6 +76,26 @@ class StrategyFormTests(unittest.TestCase):
         self.assertEqual(settings['hold_seconds'], 43200)
         self.assertNotIn('max_slippage_bps', settings)
 
+    def test_basic_form_saves_custom_maker_percent_and_wait_without_advanced_fields(self):
+        form = self.load_form()
+        self.assertEqual(form.entries['nado_maker_distance_percent'].get(), '0.02')
+        self.assertEqual(form.entries['nado_maker_reprice_seconds'].get(), '90')
+        form.entries['notional_per_leg'].insert(0, '200')
+        for key, value in (('nado_maker_distance_percent', '0,1'), ('nado_maker_reprice_seconds', '120')):
+            form.entries[key].delete(0, 'end')
+            form.entries[key].insert(0, value)
+        for var in form.selected.values():
+            var.set(True)
+        form.selection_changed()
+        form.verified.set(True)
+        form.save()
+        self.panel.executor.run_one()
+        settings = self.panel.client.request.call_args.args[1]['strategy']
+        self.assertEqual(settings['nado_maker_distance_percent'], '0.1')
+        self.assertEqual(settings['nado_maker_reprice_seconds'], 120)
+        self.assertNotIn('max_slippage_bps', settings)
+
+
     def test_loads_without_saved_strategy_and_never_starts_or_guesses_money(self):
         form = self.load_form()
         self.panel.client.request.assert_called_once_with('/markets', None)
