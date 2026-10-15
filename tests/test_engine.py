@@ -104,6 +104,7 @@ class EngineTests(unittest.TestCase):
         self.nado.capture_position = Mock(return_value={'amount': '.01', 'normalized': '100', 'multiplier': str(10**18)})
         preview = self.engine.reconcile_manual_close()
         self.assertEqual(self.journal.active_cycle()['state'], 'HALTED')
+        self.assertEqual(self.journal.orders(cycle['id'])[0][2].filled_quantity, intent.quantity)
         with self.assertRaises(TradingError):
             self.engine.reconcile_manual_close(acknowledge=True, cycle_id=cycle['id'], normalized='changed')
         self.engine.reconcile_manual_close(acknowledge=True, cycle_id=cycle['id'], normalized=preview['normalized'])

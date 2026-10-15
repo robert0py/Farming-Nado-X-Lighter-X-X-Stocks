@@ -206,3 +206,13 @@ class Journal:
     def events(self, limit: int = 100) -> list[dict]:
         with self._mutex:
             return [dict(row) for row in self.db.execute("SELECT * FROM transitions ORDER BY id DESC LIMIT ?", (limit,))]
+
+    def halt_reason(self, cycle: dict) -> str:
+        if cycle.get('halt_reason'):
+            return cycle['halt_reason']
+        operational = ('Доступ ', 'Новые циклы остановлены.', 'Запрошена ', 'Запрошен ')
+        for event in self.events(500):
+            if (event.get('cycle_id') == cycle['id'] and event.get('state') == 'HALTED' and
+                    event.get('message') and not event['message'].startswith(operational)):
+                return event['message']
+        return cycle.get('message', '')

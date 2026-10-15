@@ -163,9 +163,7 @@ class Runtime:
             config = self.config()
             cycle = self.journal.active_cycle()
             if cycle and cycle.get('state') == 'HALTED' and not cycle.get('halt_reason'):
-                event = next((event for event in self.journal.events(100)
-                              if event.get('cycle_id') == cycle['id'] and event.get('state') == 'HALTED'), None)
-                cycle['halt_reason'] = event['message'] if event else cycle.get('message', '')
+                cycle['halt_reason'] = self.journal.halt_reason(cycle)
             state = self.engine.status() if self.engine else {
                 'state': cycle['state'] if cycle else 'IDLE' if config.get('strategy') else 'NOT_CONFIGURED',
                 'running': self.journal.get('running', False),
@@ -196,6 +194,10 @@ class Runtime:
                                    'exchange_id': observation.exchange_id if observation else None,
                                    'expiry': intent.expiry}
                     pricing = self.journal.get('pricing:' + intent.client_id)
+                    diagnostic = self.journal.get('reconciliation:' + intent.client_id)
+                    if (cycle.get('state') in ('HALTED', 'RECOVERY') and observation and not observation.terminal and
+                            isinstance(diagnostic, dict) and diagnostic.get('message')):
+                        state['cycle']['halt_reason'] = diagnostic['message']
                     if isinstance(pricing, dict):
                         orders[intent.venue]['pricing'] = {key: pricing[key] for key in (
                             'reference_midpoint', 'reference_timestamp', 'distance_percent', 'actual_distance_percent',

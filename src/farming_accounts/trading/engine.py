@@ -98,6 +98,12 @@ class Engine:
                 raise TradingError('На Nado остаётся торгуемая позиция; небольшим остатком после ручного закрытия она не является.')
             preview = {'cycle_id': cycle['id'], 'symbol': spot.symbol, 'remaining': str(amount),
                        'normalized': snapshot['normalized'], 'sold': proof['sold'], 'min_notional': str(spot.min_notional)}
+            self.journal.observe(observed, observed_at=self.clock())
+            self.journal.set('reconciliation:' + intent.client_id, {'message':
+                f'Nado подтвердил покупку {observed.filled_quantity} {spot.symbol}. После неё отдельными ордерами продано '
+                f'{proof["sold"]}; текущий остаток {amount} {spot.symbol}. На Lighter нет позиции и ордеров этого актива. '
+                'Первоначальный объём покупки уже не соответствует текущему остатку; новый short на него не открывается.',
+                'checked_at': self.clock()})
             if not acknowledge:
                 return preview
             if cycle_id != cycle['id'] or normalized != snapshot['normalized']:
@@ -183,9 +189,7 @@ class Engine:
             current = self.journal.active_cycle()
             if current and current["state"] == "HALTED":
                 if not current.get('halt_reason'):
-                    event = next((event for event in self.journal.events(100)
-                                  if event.get('cycle_id') == current['id'] and event.get('state') == 'HALTED'), None)
-                    current['halt_reason'] = event['message'] if event else current.get('message', '')
+                    current['halt_reason'] = self.journal.halt_reason(current)
                 self._verified = False
                 self._transition(current, 'RECOVERY', 'Повторный запуск: проверяем прежние ордера и позиции на биржах. '
                                  'Новый ордер не отправляется до подтверждения прежнего результата.')

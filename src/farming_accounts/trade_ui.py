@@ -385,6 +385,10 @@ class TradingPanel:
                  else 'после открытия обеих сторон' if state in ('OPENING_SPOT', 'OPENING_HEDGE') else '—')
         self.cycle_detail.configure(text=f"Nado spot: {cycle.get('spot_quantity', '—')} · Lighter: {cycle.get('perp_quantity', '—')} · остаточная экспозиция: {cycle.get('residual_notional', '—')} · осталось: {timer}")
         pnl = cycle.get('pnl_quote')
+        uncertain = state in ('HALTED', 'RECOVERY', 'WAITING_API') or state == 'PAUSED' and cycle.get('state') != 'CLOSED'
+        if uncertain:
+            self.cycle_detail.configure(text='Текущие позиции и непокрытый остаток уточняются по биржам · осталось: ' + timer)
+            pnl = None
         self.pnl.configure(text=f"Оценка PnL: {pnl if pnl is not None else '—'} · без funding и курса USDT0/USDG")
         latest = {}
         for order in self.data.get('orders', ()):

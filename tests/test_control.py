@@ -31,7 +31,7 @@ class ControlTests(unittest.TestCase):
         cycle = {'id': 'old', 'state': 'HALTED', 'message': 'Nado: конкретная ошибка исполнения'}
         self.runtime.journal.save_cycle(cycle, message=cycle['message'])
         cycle['message'] = 'Доступ восстановлен'
-        self.runtime.journal.save_cycle(cycle)
+        self.runtime.journal.save_cycle(cycle, message='Доступ nado восстановлен. Новые циклы остановлены.')
         self.assertEqual(self.client.request('/status')['execution']['cycle']['halt_reason'], 'Nado: конкретная ошибка исполнения')
 
     def test_status_remains_available_while_exchange_operation_holds_runtime_lock(self):

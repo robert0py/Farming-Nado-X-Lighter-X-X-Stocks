@@ -249,6 +249,8 @@ class TradingDesktopTests(unittest.TestCase):
         self.assertIn('Nado: неподтверждённая цена', message)
         self.assertNotIn('из-за риска', message)
         self.assertNotIn('устраните', message)
+        self.assertIn('уточняются', self.panel.cycle_detail.cget('text'))
+        self.assertIn('PnL: —', self.panel.pnl.cget('text'))
 
     def key_form(self, venue='nado'):
         self.root.deiconify()
