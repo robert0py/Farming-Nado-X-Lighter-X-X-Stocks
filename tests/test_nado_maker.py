@@ -73,6 +73,12 @@ class NoFillStream(FakeStream):
 
 class MakerTests(unittest.TestCase):
     def test_configured_percent_reaches_signed_initial_and_replacement_orders(self):
+        self.check_signed_prices('distance', '599.40', '609.39')
+
+    def test_closest_ask_reaches_signed_initial_and_replacement_orders(self):
+        self.check_signed_prices('closest_ask', '600.09', '610.09')
+
+    def check_signed_prices(self, mode, initial_price, replacement_price):
         from test_engine import GatewayFixture
         from farming_accounts.trading.domain import Strategy
         from farming_accounts.trading.engine import Engine
@@ -86,19 +92,34 @@ class MakerTests(unittest.TestCase):
         lighter.items = tuple(replace(i, quantity_step=D('.001'), min_qty=D('.001')) for i in lighter.items)
         settings = Strategy(('SPY', 'QQQ'), D(200), D(5), D(1), 90, D(10), D(10), 30,
                             points_verified_assets=('SPY', 'QQQ'), nado_post_only=True,
-                            nado_maker_distance_percent=D('.1'), nado_maker_reprice_seconds=90)
+                            nado_maker_distance_percent=D('.1'), nado_maker_reprice_seconds=90,
+                            nado_maker_price_mode=mode)
         engine = Engine(self.journal, self.gateway, lighter, settings, clock=lambda: clock[0])
         engine.start()
         engine.tick()
-        self.assertEqual(self.transport.pending['order']['priceX18'], raw('599.40'))
+        self.assertEqual(self.transport.pending['order']['priceX18'], raw(initial_price))
         self.assertEqual(int(self.transport.pending['order']['appendix']) & (3 << 9), 3 << 9)
         clock[0] += 100
         market[0] = D(610)
         engine.tick()
-        self.assertEqual(self.transport.pending['order']['priceX18'], raw('609.39'))
+        self.assertEqual(self.transport.pending['order']['priceX18'], raw(replacement_price))
         self.assertEqual(len(self.cancels()), 1)
         self.assertEqual(len([b for k,b in self.transport.calls if k == 'execute' and 'place_order' in b]), 2)
         self.assertEqual(lighter.requests, [])
+
+    def test_closest_mode_keeps_queue_when_ask_is_unchanged_and_waits_before_update(self):
+        self.replace_unsent_intent(limit_price=D('104.99'))
+        cycle = self.journal.active_cycle()
+        cycle['strategy'] = {'nado_maker_price_mode': 'closest_ask', 'nado_maker_reprice_seconds': 120}
+        self.journal.save_cycle(cycle)
+        self.gateway.submit(self.intent)
+        for seconds in (90, 120, 240):
+            self.gateway.clock = lambda: NOW + seconds
+            self.assertEqual(self.gateway.lookup(self.intent).status, 'PENDING')
+        self.assertEqual(self.cancels(), [])
+        self.gateway.book = lambda instrument: Book(D(104), D(106), self.gateway.clock())
+        self.assertEqual(self.gateway.lookup(self.intent).status, 'CANCELLED')
+        self.assertEqual(len(self.cancels()), 1)
 
     def setUp(self):
         self.temp = TemporaryDirectory()

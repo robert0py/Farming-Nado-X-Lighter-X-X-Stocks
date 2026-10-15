@@ -166,7 +166,8 @@ class Runtime:
                     pricing = self.journal.get('pricing:' + intent.client_id)
                     if isinstance(pricing, dict):
                         orders[intent.venue]['pricing'] = {key: pricing[key] for key in (
-                            'reference_midpoint', 'reference_timestamp', 'distance_percent', 'actual_distance_percent') if key in pricing}
+                            'reference_midpoint', 'reference_timestamp', 'distance_percent', 'actual_distance_percent',
+                            'price_mode', 'reference_ask', 'price_tick') if key in pricing}
             return {'ok': True, 'version': __version__, 'worker': 'running', 'revision': config.get('revision', 0),
                     'credentials': public_credentials(config), 'verified': self.verified,
                     'pending_registration': self.vault.load().get('pending_registration', {}).get('venue'),
@@ -273,7 +274,7 @@ class Runtime:
             self.save_config(config)
             saved = self.config()
             return {'ok': True, 'strategy': saved['strategy'], 'revision': saved['revision'],
-                    'message': f"Стратегия сохранена: отступ Nado {saved['strategy'].get('nado_maker_distance_percent', '0.02')}%, проверка через {saved['strategy'].get('nado_maker_reprice_seconds', 90)} с. Для торговли нужен отдельный запуск."}
+                    'message': f"Стратегия сохранена: Nado maker, проверка через {saved['strategy'].get('nado_maker_reprice_seconds', 90)} с. Для торговли нужен отдельный запуск."}
         if route == '/verify':
             cycle = self.journal.active_cycle()
             if cycle and cycle['state'] in ('OPENING_SPOT', 'OPENING_HEDGE', 'CLOSING'):

@@ -111,7 +111,8 @@ class ControlTests(unittest.TestCase):
                                                      exchange_id='0x' + 'ab' * 32))
         self.runtime.journal.set('maker:progress', {'baseline': 'private-baseline', 'signature': 'private-signature'})
         self.runtime.journal.set('pricing:progress', {'reference_midpoint': '781.5', 'reference_timestamp': 1800000000,
-            'distance_percent': '0.1', 'actual_distance_percent': '0.1', 'signature': 'private-signature'})
+            'distance_percent': '0.1', 'actual_distance_percent': '0.1', 'signature': 'private-signature',
+            'price_mode': 'closest_ask', 'reference_ask': '782', 'price_tick': '.01'})
         status = self.client.request('/status')
         self.assertEqual(len(status['orders']), 1)
         self.assertEqual(len(self.runtime.journal.orders('current')), 21)
@@ -120,6 +121,9 @@ class ControlTests(unittest.TestCase):
         self.assertEqual(status['orders'][0]['filled_quantity'], '0')
         self.assertEqual(status['orders'][0]['pricing']['distance_percent'], '0.1')
         self.assertEqual(status['orders'][0]['pricing']['reference_midpoint'], '781.5')
+        self.assertEqual(status['orders'][0]['pricing']['price_mode'], 'closest_ask')
+        self.assertEqual(status['orders'][0]['pricing']['reference_ask'], '782')
+        self.assertEqual(status['orders'][0]['pricing']['price_tick'], '.01')
         self.assertNotIn('private-', str(status))
         self.assertNotIn('nonce', status['orders'][0])
 

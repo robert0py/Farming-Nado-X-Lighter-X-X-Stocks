@@ -106,10 +106,15 @@ class Strategy:
     preserve_spot_dust: bool = False
     nado_maker_distance_percent: Decimal = Decimal('0.02')
     nado_maker_reprice_seconds: int = 90
+    nado_maker_price_mode: str = 'distance'
 
     def validate(self) -> None:
+        if self.nado_maker_price_mode not in ('distance', 'closest_ask'):
+            raise TradingError('Выберите режим цены Nado: ближайший maker или процентный отступ.')
         if any(not isinstance(value, bool) for value in (self.nado_post_only, self.preserve_spot_dust)):
             raise TradingError('Некорректный режим исполнения стратегии.')
+        if self.nado_maker_price_mode == 'closest_ask' and not self.nado_post_only:
+            raise TradingError('Ближайший maker требует включённый Nado post-only.')
         amounts = (self.notional_per_leg, self.max_slippage_bps, self.residual_notional,
                    self.margin_reserve, self.max_loss_quote, self.nado_maker_distance_percent)
         if not self.assets or len(set(self.assets)) != len(self.assets):
@@ -145,23 +150,36 @@ def _maker_midpoint(book: Book) -> Decimal:
     return (book.bid + book.ask) / 2
 
 
-def maker_opening_price(instrument: Instrument, book: Book, distance_percent: Decimal = Decimal('0.02')) -> Decimal:
+def maker_opening_price(instrument: Instrument, book: Book, distance_percent: Decimal = Decimal('0.02'),
+                        *, mode: str = 'distance') -> Decimal:
     with localcontext() as context:
         context.prec = 96
         if not distance_percent.is_finite() or not 0 <= distance_percent < 100:
             raise TradingError('Некорректное расстояние maker-заявки Nado.')
-        price = quantize(_maker_midpoint(book) * (1 - distance_percent / 100), instrument.price_tick)
+        midpoint = _maker_midpoint(book)
+        if mode == 'closest_ask':
+            if book.bid >= book.ask:
+                raise TradingError('Стакан Nado пересечён: ожидаем корректные цены.')
+            # Greatest valid tick strictly below ask, including non-aligned ask.
+            price = quantize(book.ask, instrument.price_tick, upward=True) - instrument.price_tick
+        elif mode == 'distance':
+            price = quantize(midpoint * (1 - distance_percent / 100), instrument.price_tick)
+        else:
+            raise TradingError('Неизвестный режим цены maker-заявки Nado.')
         if price <= 0 or price >= book.ask:
             raise TradingError('Шаг цены не позволяет выставить maker-покупку Nado.')
         return price
 
 
 def maker_price_needs_refresh(instrument: Instrument, book: Book, current_price: Decimal,
-                             distance_percent: Decimal = Decimal('0.02')) -> bool:
+                             distance_percent: Decimal = Decimal('0.02'), *, mode: str = 'distance') -> bool:
     with localcontext() as context:
         context.prec = 96
+        target = maker_opening_price(instrument, book, distance_percent, mode=mode)
+        if mode == 'closest_ask':
+            return target != current_price
         midpoint = _maker_midpoint(book)
         # Equality preserves queue priority. A coarse tick must not cause
         # repeated cancellations whose replacement has exactly the same price.
         return (abs(current_price - midpoint) > midpoint * distance_percent / 100 and
-                maker_opening_price(instrument, book, distance_percent) != current_price)
+                target != current_price)

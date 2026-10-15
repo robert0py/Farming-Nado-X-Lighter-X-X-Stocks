@@ -317,7 +317,9 @@ class TradingPanel:
         if settings:
             prefix = ('Сохранено и подтверждено: ' if self.confirmed_strategy_revision is not None and
                       self.confirmed_strategy_revision == self.data.get('revision') else 'Сохранённая стратегия: ')
-            self.summary.configure(text=prefix + f"{', '.join(settings['assets'])} · покупка Nado до {settings['notional_per_leg']} USDT0 · удержание {settings['hold_seconds'] / 3600:g} ч · отступ Nado {settings.get('nado_maker_distance_percent', '0.02')}% · проверка через {settings.get('nado_maker_reprice_seconds', 90)} с")
+            price_description = ('Nado: ближайший maker, на шаг ниже ask' if settings.get('nado_maker_price_mode') == 'closest_ask'
+                                 else f"отступ Nado {settings.get('nado_maker_distance_percent', '0.02')}%")
+            self.summary.configure(text=prefix + f"{', '.join(settings['assets'])} · покупка Nado до {settings['notional_per_leg']} USDT0 · удержание {settings['hold_seconds'] / 3600:g} ч · {price_description} · проверка через {settings.get('nado_maker_reprice_seconds', 90)} с")
         execution = self.data.get('execution', {})
         cycle = execution.get('cycle') or {}
         state = execution.get('state', 'NOT_CONFIGURED')
@@ -343,7 +345,10 @@ class TradingPanel:
             details.append(f"{'Nado' if venue == 'nado' else 'Lighter'}: {status_name} · {order['quantity']} {order['asset']} по {order['limit_price']} · исполнено {order.get('filled_quantity') or '0'}{number}")
             pricing = order.get('pricing')
             if venue == 'nado' and order.get('action') == 'open_spot' and pricing:
-                details.append(f"Расчёт этой заявки: середина стакана Nado {pricing['reference_midpoint']} USDT0 · выбранный отступ {pricing['distance_percent']}% · лимит {order['limit_price']}. Это цены на момент расчёта; текущий рынок может измениться.")
+                if pricing.get('price_mode') == 'closest_ask':
+                    details.append(f"Ближайший maker: лучшая продажа {pricing['reference_ask']} USDT0 · шаг {pricing['price_tick']} · лимит покупки {order['limit_price']}. Post-only: только добавление ликвидности. Это цены на момент расчёта; текущий рынок может измениться.")
+                else:
+                    details.append(f"Расчёт этой заявки: середина стакана Nado {pricing['reference_midpoint']} USDT0 · выбранный отступ {pricing['distance_percent']}% · лимит {order['limit_price']}. Это цены на момент расчёта; текущий рынок может измениться.")
         self.order_detail.configure(text='\n'.join(details) if details else 'Ордеров текущей попытки нет.')
         reason = self.data.get('error') or progress
         if state == 'PAUSED':

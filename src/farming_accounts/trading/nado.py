@@ -991,13 +991,15 @@ class NadoGateway:
                 cycle_strategy = (self.journal.active_cycle() or {}).get('strategy', {})
                 reprice_seconds = int(cycle_strategy.get('nado_maker_reprice_seconds', MAKER_REPRICE_SECONDS))
                 distance_percent = Decimal(str(cycle_strategy.get('nado_maker_distance_percent', '0.02')))
+                price_mode = cycle_strategy.get('nado_maker_price_mode', 'distance')
                 due = (record.get('cancel_requested') is True or actual != baseline
                        or self.clock() >= intent.expiry or
                        intent.reduce_only and self.clock() >= placed + 20)
                 if (record.get('cancel_state') is None and not due and not intent.reduce_only and
                         self.clock() >= placed + reprice_seconds):
                     try:
-                        due = maker_price_needs_refresh(intent.instrument, self.book(intent.instrument), intent.limit_price, distance_percent)
+                        due = maker_price_needs_refresh(intent.instrument, self.book(intent.instrument), intent.limit_price,
+                                                       distance_percent, mode=price_mode)
                     except (TradingError, AccountError, TimeoutError):
                         # Missing/stale quotes cannot justify cancelling a live
                         # order. Reconcile again with no new writes or fake fill.

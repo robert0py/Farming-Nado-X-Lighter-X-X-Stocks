@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from farming_accounts.app import Application
-from farming_accounts.strategy_ui import HelpIcon
+from farming_accounts.strategy_ui import HelpIcon, PRICE_MODES
 from farming_accounts.trading.markets import matched_markets
 from farming_accounts.control import ControlError
 from test_app import ControlledExecutor
@@ -40,6 +40,8 @@ class StrategyFormTests(unittest.TestCase):
 
     def test_edited_distance_cannot_be_silently_lost_with_window_close(self):
         form = self.load_form()
+        form.price_mode.set('Процентный отступ · maker')
+        form.update_actions()
         entry = form.entries['nado_maker_distance_percent']
         entry.delete(0, 'end')
         entry.insert(0, '0,1')
@@ -109,6 +111,8 @@ class StrategyFormTests(unittest.TestCase):
         return form
 
     def fill(self, form):
+        form.price_mode.set('Процентный отступ · maker')
+        form.update_actions()
         if hasattr(form, 'advanced'):
             form.advanced.set(True)
             form.toggle_advanced()
@@ -144,6 +148,8 @@ class StrategyFormTests(unittest.TestCase):
 
     def test_basic_form_saves_custom_maker_percent_and_wait_without_advanced_fields(self):
         form = self.load_form()
+        form.price_mode.set('Процентный отступ · maker')
+        form.update_actions()
         self.assertEqual(form.entries['nado_maker_distance_percent'].get(), '0.02')
         self.assertEqual(form.entries['nado_maker_reprice_seconds'].get(), '90')
         form.entries['notional_per_leg'].insert(0, '200')
@@ -160,6 +166,30 @@ class StrategyFormTests(unittest.TestCase):
         self.assertEqual(settings['nado_maker_distance_percent'], '0.1')
         self.assertEqual(settings['nado_maker_reprice_seconds'], 120)
         self.assertNotIn('max_slippage_bps', settings)
+
+    def test_closest_maker_is_offered_without_applying_old_percentage(self):
+        form = self.load_form()
+        self.assertEqual(PRICE_MODES[form.price_mode.get()], 'closest_ask')
+        self.assertEqual(str(form.entries['nado_maker_distance_percent'].cget('state')), 'disabled')
+        form.entries['notional_per_leg'].insert(0, '200')
+        for var in form.selected.values():
+            var.set(True)
+        form.selection_changed()
+        form.verified.set(True)
+        form.save()
+        self.panel.executor.run_one()
+        self.assertEqual(self.panel.client.request.call_args.args[1]['strategy']['nado_maker_price_mode'], 'closest_ask')
+
+    def test_mode_change_is_tracked_and_saved_mode_is_restored(self):
+        self.panel.data = {'strategy': {'nado_maker_price_mode': 'distance', 'assets': ['SPY', 'QQQ']}}
+        form = self.load_form()
+        self.assertEqual(PRICE_MODES[form.price_mode.get()], 'distance')
+        self.assertEqual(str(form.entries['nado_maker_distance_percent'].cget('state')), 'normal')
+        form.price_mode.set('Ближе к исполнению · maker')
+        form.update_actions()
+        form.close()
+        self.assertTrue(form.window.winfo_exists())
+        self.assertIn('не сохранены', form.status.cget('text'))
 
 
     def test_loads_without_saved_strategy_and_never_starts_or_guesses_money(self):

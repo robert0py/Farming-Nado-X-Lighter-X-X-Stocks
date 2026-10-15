@@ -11,6 +11,15 @@ from farming_accounts.trading.domain import TradingError
 
 
 class AutomaticStrategyTests(unittest.TestCase):
+    def test_price_mode_survives_validation_and_unknown_mode_is_rejected(self):
+        value = {'mode': 'automatic', 'assets': ['SPY', 'QQQ'], 'notional_per_leg': '200',
+                 'points_evidence': {'url': 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado',
+                                     'confirmed_at': time.time(), 'account_enrolled': True, 'assets': ['SPY', 'QQQ']}}
+        self.assertEqual(strategy(value).nado_maker_price_mode, 'distance')
+        self.assertEqual(strategy(dict(value, nado_maker_price_mode='closest_ask')).nado_maker_price_mode, 'closest_ask')
+        with self.assertRaises(TradingError):
+            strategy(dict(value, nado_maker_price_mode='market'))
+
     def test_invalid_maker_percent_or_wait_is_rejected_without_silent_defaults(self):
         value = {'mode': 'automatic', 'assets': ['SPY', 'QQQ'], 'notional_per_leg': '200',
                  'points_evidence': {'url': 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado',

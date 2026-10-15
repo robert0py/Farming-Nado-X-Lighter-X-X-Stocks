@@ -12,14 +12,15 @@ from .trading.domain import TradingError
 
 
 POINTS_URL = 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado'
+PRICE_MODES = {'Ближе к исполнению · maker': 'closest_ask', 'Процентный отступ · maker': 'distance'}
 BASIC_FIELDS = ('notional_per_leg', 'hold_hours', 'nado_maker_distance_percent', 'nado_maker_reprice_seconds')
 FIELDS = (
     ('notional_per_leg', 'Сумма покупки на Nado, USDT0',
      'Укажите свой бюджет одной spot-покупки на Nado. На Lighter бот рассчитает short на сопоставимое количество того же базового актива с учётом множителей и округления. Стоимость short может отличаться. Минимумы бирж показаны у активов; ещё нужны резерв и полное обеспечение short на Lighter.'),
-    ('nado_maker_distance_percent', 'Расстояние лимитки от рыночной цены, %',
+    ('nado_maker_distance_percent', 'Отступ от середины стакана, % (процентный режим)',
      'Введите процент напрямую: 0,1 означает 0,1%, а не 10%. Покупка рассчитывается ниже середины стакана Nado (между bid и ask). При цене 600 и расстоянии 0,1% лимит — 599,40. Можно указать 0%: цена будет в середине стакана с округлением по шагу биржи и сохранением maker post-only. Близкая заявка сохраняет очередь; перестановка нужна только при большем расстоянии.'),
     ('nado_maker_reprice_seconds', 'Через сколько секунд проверять лимитку',
-     'Введите целое число от 1 до 86400 секунд. Первая лимитка отправляется после обязательной проверки аккаунтов и рынка, без ожидания этого интервала. Отсчёт начинается только после отправки каждой новой заявки. Затем бот проверяет расстояние при каждой сверке (примерно раз в 10 секунд плюс задержки API). Если расстояние не больше выбранного процента, заявка остаётся. Это не срок всей задачи: она продолжается до исполнения, вашей остановки или ограничения риска.'),
+     'Первая лимитка отправляется после проверки аккаунтов и рынка без ожидания этого интервала. Затем, через указанное время (1–86400 секунд), бот проверяет цену при каждой сверке. В ближайшем maker-режиме цена следует за лучшей продажей, оставаясь на ближайшем шаге ниже неё; при неизменной цене ордер сохраняется. В процентном режиме перестановка нужна только при превышении отступа. Это не срок всей задачи: она продолжается до исполнения, остановки или ограничения риска.'),
     ('slippage_percent', 'Допустимое проскальзывание, %',
      'Введите выбранный вами процент отклонения цены исполнения от проверенных цен стакана. Чем меньше значение, тем чаще ордер может не исполниться. Это ограничение цены ордера, оно не гарантирует исполнение обеих сторон. Проценты вводятся напрямую, без перевода в bps.'),
     ('residual_notional', 'Допустимый непокрытый остаток, USDT0',
@@ -146,8 +147,16 @@ class StrategyDialog:
 
         first = inner.winfo_children()[0]
         label(inner, 'Сумма и время одного цикла', bold=True, size=14).pack(anchor='w', before=first)
-        label(inner, 'Выберите расстояние лимитки и время ожидания ниже. Nado: maker post-only; близкая заявка сохраняется, далёкая обновляется после подтверждения отмены. Временные сбои API не отменяют задачу. Lighter: встречная позиция только на подтверждённый объём покупки. Исполнение и отсутствие потерь не гарантированы.',
+        label(inner, 'Nado: лимитная покупка post-only. Ближайший maker ставит цену на шаг ниже лучшей продажи; если рынок изменился, обновление — после подтверждённой отмены. При сдвиге рынка post-only защищает от taker-исполнения. Lighter открывается только на подтверждённый объём покупки.',
               color=MUTED, size=9, wraplength=840, anchor='w', justify='left').pack(fill='x', pady=(5, 8), before=first)
+        saved = panel.data.get('strategy') or {}
+        self.original_price_mode = next((title for title, code in PRICE_MODES.items()
+                                        if code == saved.get('nado_maker_price_mode', 'closest_ask')), next(iter(PRICE_MODES)))
+        label(inner, 'Как ставить лимитную покупку Nado', size=10).pack(anchor='w', before=first)
+        self.price_mode = tk.StringVar(dialog, value=self.original_price_mode)
+        self.mode_choice = ttk.Combobox(inner, textvariable=self.price_mode, values=tuple(PRICE_MODES), state='readonly')
+        self.mode_choice.pack(fill='x', pady=(5, 8), before=first)
+        self.mode_choice.bind('<<ComboboxSelected>>', lambda _: self.update_actions())
         grid = tk.Frame(inner, bg=PANEL)
         grid.pack(fill='x', before=first)
         self.advanced = tk.BooleanVar(dialog, value=False)
@@ -187,6 +196,7 @@ class StrategyDialog:
             entry.bind('<<Paste>>', lambda _: self.window.after_idle(self.update_actions))
         self.original_inputs = {key: entry.get() for key, entry in self.entries.items()}
         self.saved_distance = str(saved.get('nado_maker_distance_percent', '0.02')) if saved else None
+        self.saved_price_mode = saved.get('nado_maker_price_mode', 'distance') if saved else None
         label(inner, 'Подтверждение программы xPoints', bold=True, size=13).pack(anchor='w', pady=(15, 7))
         self.verified = tk.BooleanVar(dialog, value=False)
         self.points_check = tk.Checkbutton(footer, text='Я проверил участие аккаунта и выбранных spot xStocks в действующей программе xPoints',
@@ -230,14 +240,21 @@ class StrategyDialog:
             check.configure(state='normal' if self.ready and not self.pending and row['can_select'] else 'disabled')
         for entry in self.entries.values():
             entry.configure(state='disabled' if self.pending else 'normal')
+        self.mode_choice.configure(state='disabled' if self.pending else 'readonly')
+        closest = PRICE_MODES.get(self.price_mode.get()) == 'closest_ask'
+        self.entries['nado_maker_distance_percent'].configure(state='disabled' if self.pending or closest else 'normal')
         current = self.entries['nado_maker_distance_percent'].get().strip()
         state = 'Есть несохранённые изменения.' if self.is_dirty() else 'Нет несохранённых изменений.'
         required = ' Для сохранения отметьте подтверждение xPoints ниже.' if not self.verified.get() else ''
         saved = f'Сохранённый отступ: {self.saved_distance}%.' if self.saved_distance is not None else 'Стратегия ещё не сохранена.'
-        self.change_notice.configure(text=f'{saved} Введённый отступ: {current}%. {state}{required}')
+        if self.saved_price_mode == 'closest_ask':
+            saved = 'Сохранённый режим: ближайший maker.'
+        chosen = 'Ближайший maker: на шаг ниже лучшей продажи; процентный отступ не применяется.' if closest else f'Введённый отступ: {current}%.'
+        self.change_notice.configure(text=f'{saved} {chosen} {state}{required}')
 
     def is_dirty(self):
         return (any(entry.get() != self.original_inputs.get(key, '') for key, entry in self.entries.items())
+                or self.price_mode.get() != self.original_price_mode
                 or self.ready and self.chosen_assets() != self.original_assets or self.advanced.get())
 
     def selection_changed(self):
@@ -337,7 +354,8 @@ class StrategyDialog:
         if not set(assets) <= {row['asset'] for row in self.markets if row['can_select']}:
             self.status.configure(text='Выбран недоступный рынок. Обновите список и выберите подходящие активы.')
             return
-        value = {'mode': 'manual' if self.advanced.get() else 'automatic', 'nado_post_only': True, 'preserve_spot_dust': True}
+        value = {'mode': 'manual' if self.advanced.get() else 'automatic', 'nado_post_only': True, 'preserve_spot_dust': True,
+                 'nado_maker_price_mode': PRICE_MODES.get(self.price_mode.get(), '')}
         for key, title, _ in FIELDS:
             if not self.advanced.get() and key not in BASIC_FIELDS:
                 continue

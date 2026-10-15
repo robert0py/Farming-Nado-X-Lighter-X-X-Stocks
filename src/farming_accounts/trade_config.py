@@ -99,6 +99,7 @@ def strategy(value: dict, *, clock=time.time) -> Strategy:
                 proof.get('url') != 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado'):
             raise TradingError('Подтвердите участие аккаунта и выбранных активов в действующей программе xPoints.')
         result = Strategy(assets=assets, points_verified_assets=tuple(proof.get('assets', ())),
+                          nado_maker_price_mode=value.get('nado_maker_price_mode', 'distance'),
                           nado_post_only=value.get('nado_post_only', False),
                           preserve_spot_dust=value.get('preserve_spot_dust', False), **values)
         result.validate()

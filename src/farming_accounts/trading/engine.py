@@ -178,7 +178,7 @@ class Engine:
 
     def _opening_size(self, instrument: Instrument, book: Book, strategy: Strategy) -> Decimal:
         maker = strategy.nado_post_only
-        cap = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent) if maker else
+        cap = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent, mode=strategy.nado_maker_price_mode) if maker else
                quantize(book.ask * (1 + strategy.max_slippage_bps / 10000), instrument.price_tick))
         if (not maker and cap < book.ask) or cap <= 0:
             raise TradingError("Ценовой шаг не позволяет соблюсти установленное проскальзывание.")
@@ -351,7 +351,7 @@ class Engine:
         factor = strategy.max_slippage_bps / 10000
         maker = instrument.venue.casefold() == 'nado' and strategy.nado_post_only
         if maker:
-            limit = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent) if side == 'buy' and not reduce_only else
+            limit = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent, mode=strategy.nado_maker_price_mode) if side == 'buy' and not reduce_only else
                      quantize(book.bid if side == 'buy' else book.ask, instrument.price_tick, upward=side == 'sell'))
         else:
             limit = quantize(book.ask * (1 + factor), instrument.price_tick) if side == "buy" else quantize(
@@ -377,6 +377,8 @@ class Engine:
         if maker and side == 'buy' and not reduce_only:
             midpoint = (book.bid + book.ask) / 2
             self.journal.set('pricing:' + intent.client_id, {
+                'price_mode': strategy.nado_maker_price_mode, 'reference_ask': str(book.ask),
+                'price_tick': str(instrument.price_tick),
                 'reference_midpoint': str(midpoint), 'reference_timestamp': book.timestamp,
                 'distance_percent': str(strategy.nado_maker_distance_percent),
                 'actual_distance_percent': str((midpoint - limit) / midpoint * 100)})

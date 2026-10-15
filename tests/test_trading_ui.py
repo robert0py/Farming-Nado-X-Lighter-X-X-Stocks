@@ -11,6 +11,19 @@ from test_app import ControlledExecutor
 
 
 class TradingDesktopTests(unittest.TestCase):
+    def test_closest_maker_card_uses_ask_and_does_not_claim_percentage_mode(self):
+        self.panel.data = {'execution': {'state': 'OPENING_SPOT', 'running': True, 'cycle': {'asset': 'SPY'}},
+            'orders': [{'venue': 'nado', 'status': 'PENDING', 'quantity': '.14', 'asset': 'wSPYx',
+                'limit_price': '599.99', 'filled_quantity': '0', 'action': 'open_spot',
+                'pricing': {'price_mode': 'closest_ask', 'reference_ask': '600', 'price_tick': '0.01'}}]}
+        self.panel.render()
+        text = self.panel.order_detail.cget('text')
+        self.assertIn('лучшая продажа 600', text)
+        self.assertIn('шаг 0.01', text)
+        self.assertIn('599.99', text)
+        self.assertIn('Post-only', text)
+        self.assertNotIn('выбранный отступ', text)
+
     def test_order_explains_the_actual_reference_and_selected_percent(self):
         self.panel.data = {'execution': {'state': 'OPENING_SPOT', 'running': True, 'cycle': {'asset': 'SPY'}},
             'orders': [{'venue': 'nado', 'status': 'PENDING', 'quantity': '.14', 'asset': 'wSPYx',
