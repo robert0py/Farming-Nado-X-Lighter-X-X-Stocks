@@ -81,7 +81,7 @@ class Engine:
             raw[key] = Decimal(raw[key])
         return Strategy(**raw)
 
-    def preflight(self) -> dict:
+    def preflight(self, *, first_ready_only: bool = False) -> dict:
         """Verify real credentials, market units and account isolation; never submit."""
         with self._mutex, localcontext() as context:
             context.prec = 96
@@ -121,6 +121,8 @@ class Engine:
                             checker(instrument)
                     result.append({"asset": asset, "ready": True, "reason": "Пара и единицы подтверждены.",
                                    "spot_baseline": str(baseline), "nado_post_only": self.strategy.nado_post_only})
+                    if first_ready_only:
+                        break
                 except TradingError as error:
                     result.append({"asset": asset, "ready": False, "reason": str(error)})
             return {"markets": result, "nado_available": str(cash), "lighter_available": str(margin)}
@@ -130,7 +132,9 @@ class Engine:
             current = self.journal.active_cycle()
             if current and current["state"] == "HALTED":
                 raise TradingError("Текущий цикл остановлен из-за риска. Сначала устраните причину и выполните сверку.")
-            preflight = self.preflight() if not current or current["state"] == "CLOSED" else None
+            # One cycle opens one asset. Checking the rest belongs to explicit
+            # preflight, not to the critical path before the first order.
+            preflight = self.preflight(first_ready_only=True) if not current or current["state"] == "CLOSED" else None
             if preflight and not any(x["ready"] for x in preflight["markets"]):
                 reasons = '; '.join(f"{x['asset']}: {x['reason']}" for x in preflight['markets'])
                 raise TradingError("Нет готового рынка для хеджа. " + reasons)

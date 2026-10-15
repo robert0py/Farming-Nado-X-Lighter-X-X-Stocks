@@ -12,10 +12,10 @@ from .control import ControlClient, ControlError, ensure_local_worker, local_cli
 from .vault import Vault, VaultError, state_directory
 
 
-STATE_NAMES = {'NOT_CONFIGURED': 'Настройте доступ и стратегию', 'IDLE': 'Остановлен', 'WAITING': 'Ожидание рынка',
+STATE_NAMES = {'NOT_CONFIGURED': 'Настройте доступ и стратегию', 'IDLE': 'Остановлен', 'WAITING': 'Готовим ордер на Nado',
                'WAITING_API': 'Ожидание API · задача продолжается',
                'PAUSED': 'Процесс исполнения выключен',
-               'OPENING_SPOT': 'Покупка spot', 'OPENING_HEDGE': 'Формирование хеджа', 'HEDGED': 'Хедж удерживается',
+               'OPENING_SPOT': 'Выставляем лимитку на Nado', 'OPENING_HEDGE': 'Открываем short на Lighter', 'HEDGED': 'Хедж открыт · идёт удержание',
                'CLOSING': 'Закрытие обеих сторон', 'CLOSED': 'Цикл завершён', 'RECOVERY': 'Сверка прежнего ордера', 'HALTED': 'Остановлено · нужна сверка'}
 
 
@@ -25,6 +25,43 @@ def cycle_label(cycle):
     if cycle.get('state') == 'CLOSED' and cycle.get('hedged_at') is None:
         return 'Без открытия хеджа'
     return STATE_NAMES.get(cycle.get('state'), cycle.get('state', '—'))
+
+
+def execution_step(data):
+    """Explain only exchange-confirmed progress, without implying a fill."""
+    execution = data.get('execution', {})
+    cycle = execution.get('cycle') or {}
+    state = execution.get('state', 'NOT_CONFIGURED')
+    title = cycle_label(cycle) if state == 'CLOSED' else STATE_NAMES.get(state, state)
+    wait = (cycle.get('strategy') or data.get('strategy') or {}).get('nado_maker_reprice_seconds', 90)
+    if state == 'WAITING':
+        return title, (execution.get('waiting_reason') or
+            'Проверяем аккаунты, средства и рынок перед первой лимиткой Nado. '
+            f'Интервал {wait} с отсчитывается после выставления заявки.')
+    if state == 'OPENING_SPOT':
+        pending = any(o.get('venue') == 'nado' and o.get('status') == 'PENDING' and
+                      o.get('action', 'open_spot') == 'open_spot' for o in data.get('orders', ()))
+        if pending:
+            return 'Ждём исполнения лимитки на Nado', (
+                f'Лимитка Nado выставлена. Ждём покупку; через {wait} с проверяем расстояние до рынка. '
+                'После подтверждённой покупки открываем встречный short на Lighter. Таймер удержания ещё не начался.')
+        return title, ('Готовим лимитную покупку spot xStocks на Nado. '
+                       'После её исполнения открываем short на тот же актив на Lighter. Интервал перестановки не задерживает первую заявку.')
+    if state == 'OPENING_HEDGE':
+        return title, ('Spot на Nado куплен. Открываем встречный short на Lighter на подтверждённый объём покупки '
+                       'с ограничением цены. Ждём подтверждения исполнения; затем начнётся удержание хеджа.')
+    if state == 'HEDGED':
+        return title, 'Покупка Nado и short Lighter подтверждены. Удерживаем хедж до таймера и следим за ограничениями риска.'
+    if state == 'CLOSING':
+        return title, ('Закрываем short на Lighter, затем продаём купленный spot на Nado лимитным ордером. '
+                       'Ждём подтверждения обеих площадок. ' + cycle.get('message', ''))
+    if state == 'RECOVERY':
+        return title, ('Уточняем у биржи, принят ли ордер и сколько исполнено. Повторный ордер пока не отправляем. '
+                       + cycle.get('message', ''))
+    if state == 'WAITING_API':
+        return title, ('Биржа временно не отвечает. Задача сохранена: восстанавливаем связь и проверяем прежний ордер. '
+                       + cycle.get('message', ''))
+    return title, cycle.get('message') or execution.get('waiting_reason')
 
 
 class TradingPanel:
@@ -148,7 +185,11 @@ class TradingPanel:
             return
         if path in ('/stop', '/close', '/shutdown'):
             self.active_control = path
-        self.message.configure(text='Выполняю команду…')
+        if path == '/start':
+            self.message.configure(text='Проверяем доступ к Nado и Lighter, средства и рынок. Затем отправляем первую лимитку Nado. '
+                                        'Интервал перестановки начнётся после выставления, ждать его перед первым ордером не нужно.')
+        else:
+            self.message.configure(text='Выполняю команду…')
         self.work(lambda: self.client.request(path, value), callback, on_error)
 
     def connect_local(self):
@@ -277,8 +318,8 @@ class TradingPanel:
         execution = self.data.get('execution', {})
         cycle = execution.get('cycle') or {}
         state = execution.get('state', 'NOT_CONFIGURED')
-        title = cycle_label(cycle) if state == 'CLOSED' else STATE_NAMES.get(state, state)
-        self.cycle_state.configure(text=title + (' · ' + cycle['asset'] if cycle.get('asset') else ''))
+        title, progress = execution_step(self.data)
+        self.cycle_state.configure(text=title + (' · ' + cycle['asset'] if cycle.get('asset') and state != 'WAITING' else ''))
         deadline = cycle.get('deadline')
         seconds = max(0, int(deadline - time.time())) if deadline is not None else None
         timer = (f'{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}' if seconds is not None
@@ -298,10 +339,10 @@ class TradingPanel:
             number = ' · ID ' + order['exchange_id'] if order.get('exchange_id') else ''
             details.append(f"{'Nado' if venue == 'nado' else 'Lighter'}: {status_name} · {order['quantity']} {order['asset']} по {order['limit_price']} · исполнено {order.get('filled_quantity') or '0'}{number}")
         self.order_detail.configure(text='\n'.join(details) if details else 'Ордеров текущей попытки нет.')
-        reason = self.data.get('error') or cycle.get('message') or execution.get('waiting_reason')
+        reason = self.data.get('error') or progress
         if state == 'PAUSED':
             reason = 'Процесс выключен. Позиции на биржах сохраняются. Нажмите «Этот ПК», затем выберите запуск или закрытие прежнего хеджа.'
-        if cycle.get('state') == 'CLOSED' and cycle.get('hedged_at') is None and not self.data.get('error'):
+        if state == 'CLOSED' and cycle.get('hedged_at') is None and not self.data.get('error'):
             reason = ('Ордер отклонён площадкой. ' + cycle.get('message', '') if cycle.get('outcome') == 'REJECTED'
                       else 'Хедж не был открыт; удержание не запускалось. ' + cycle.get('message', '')
                       if cycle.get('outcome') else 'Хедж не был открыт; удержание не запускалось.')
@@ -354,6 +395,9 @@ class TradingPanel:
                     self.message.configure(text=result['message'])
                     self.app.log('Торговля', result['message'])
             self.render()
+            if error:
+                # A failed start must not be hidden by the last cycle's message.
+                self.message.configure(text=error)
             is_status = isinstance(result, dict) and 'execution' in result
             self.next_refresh = time.monotonic() + (5 if error or self.client is None or is_status else 0)
         if self.client is not None and not self.busy and time.monotonic() >= self.next_refresh:

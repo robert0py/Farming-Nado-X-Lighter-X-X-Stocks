@@ -75,6 +75,22 @@ class GatewayFixture:
 
 
 class EngineTests(unittest.TestCase):
+    def test_start_only_checks_until_a_ready_market_and_tick_submits_without_waiting(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True, nado_maker_reprice_seconds=100)
+        checked = []
+        original = self.nado.book
+        def book(instrument):
+            checked.append(instrument.underlying)
+            return original(instrument)
+        self.nado.book = book
+        self.nado.responses.append('PENDING')
+        self.engine.start()
+        self.assertNotIn('SPY', checked, 'Other cycle assets must not delay the first ready market')
+        self.engine.tick()
+        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(self.clock(), 1800000000)
+        self.assertIsNone(self.engine.status()['cycle']['deadline'])
+
     def test_zero_percent_maker_price_uses_midpoint_without_taking_ask(self):
         self.engine.strategy = replace(self.strategy, nado_post_only=True, nado_maker_distance_percent=D(0))
         self.nado.items = tuple(replace(i, price_tick=D('.01')) for i in self.nado.items)

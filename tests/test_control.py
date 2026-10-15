@@ -16,6 +16,42 @@ from farming_accounts.trading.domain import TradingError
 
 
 class ControlTests(unittest.TestCase):
+    def test_start_wakes_worker_and_places_first_order_without_reprice_wait(self):
+        from decimal import Decimal
+        from test_engine import GatewayFixture, TestClock
+        from farming_accounts.trading.domain import Strategy
+        from farming_accounts.trading.engine import Engine
+        clock = TestClock()
+        settings = Strategy(('AAPL', 'SPY'), Decimal(2000), Decimal(0), Decimal(1), 60,
+                            Decimal(100), Decimal(100), 5, points_verified_assets=('AAPL', 'SPY'),
+                            nado_post_only=True, nado_maker_reprice_seconds=100)
+        nado = GatewayFixture('Nado', clock, self.runtime.journal)
+        lighter = GatewayFixture('Lighter', clock, self.runtime.journal)
+        nado.responses.append('PENDING')
+        self.runtime.engine = Engine(self.runtime.journal, nado, lighter, settings, clock=clock)
+        config = {'strategy': {'assets': ['AAPL', 'SPY']}, 'nado': {'owner': 'fixture'},
+                  'lighter': {'wallet_address': 'fixture'}}
+        worker = threading.Thread(target=self.runtime.tick_loop)
+        try:
+            with patch.object(self.runtime, 'config', return_value=config), patch.object(self.runtime, 'check_points'):
+                worker.start()
+                response = self.client.request('/start', {})
+                until = time.monotonic() + 1
+                while not nado.requests and time.monotonic() < until:
+                    time.sleep(.01)
+                self.assertEqual(len(nado.requests), 1, 'First order waited for periodic worker timer')
+                self.assertEqual(clock(), 1800000000, 'Maker wait must not advance before first submission')
+                self.assertEqual(lighter.requests, [])
+                self.assertTrue(response['ok'])
+                self.client.request('/start', {})
+                time.sleep(.05)
+                self.assertEqual(len(nado.requests), 1, 'Repeated start must reconcile the same resting order')
+        finally:
+            self.runtime.stopped.set()
+            if hasattr(self.runtime, 'wakeup'):
+                self.runtime.wakeup.set()
+            worker.join(timeout=11)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.runtime = Runtime(Path(self.temp.name))
@@ -286,7 +322,8 @@ class ControlTests(unittest.TestCase):
                 self.assertEqual(restarted.journal.active_cycle()['state'], 'HEDGED')
                 self.assertFalse(restarted.journal.get('running'))
                 restarted.stopped = Mock()
-                restarted.stopped.wait.side_effect = [False, True]
+                restarted.stopped.is_set.side_effect = [False, False, True]
+                restarted.wakeup = Mock()
                 with patch.object(restarted, 'build_engine') as factory:
                     restarted.tick_loop()
                 factory.assert_not_called()

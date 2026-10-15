@@ -11,6 +11,55 @@ from test_app import ControlledExecutor
 
 
 class TradingDesktopTests(unittest.TestCase):
+    def test_start_error_is_not_overwritten_by_previous_closed_cycle(self):
+        self.panel.data = {'execution': {'state': 'CLOSED', 'running': False, 'cycle': {
+            'state': 'CLOSED', 'hedged_at': None, 'message': 'Прежнее открытие остановлено.'}}}
+        self.panel.results.put((None, 'Недостаточно средств для нового открытия.', None))
+        self.panel.poll()
+        self.assertIn('Недостаточно средств', self.panel.message.cget('text'))
+
+    def test_start_explains_checks_and_first_order_without_claiming_submission(self):
+        self.panel.client = Mock()
+        self.panel.request('/start', {})
+        self.assertIn('Проверяем доступ', self.panel.message.cget('text'))
+        self.assertIn('первую лимитку', self.panel.message.cget('text'))
+        self.assertIn('после выставления', self.panel.message.cget('text'))
+        self.assertNotIn('принят биржей', self.panel.message.cget('text'))
+
+    def test_resting_nado_order_explains_next_short_and_reprice_wait(self):
+        self.panel.data = {'strategy': {'assets': ['SPY', 'QQQ'], 'notional_per_leg': '110',
+            'hold_seconds': 43200, 'nado_maker_reprice_seconds': 100},
+            'execution': {'state': 'OPENING_SPOT', 'running': True, 'cycle': {'asset': 'SPY'}},
+            'orders': [{'venue': 'nado', 'status': 'PENDING', 'quantity': '.14', 'asset': 'wSPYx',
+                        'limit_price': '780', 'filled_quantity': '0', 'action': 'open_spot'}]}
+        self.panel.render()
+        self.assertIn('Ждём исполнения лимитки на Nado', self.panel.cycle_state.cget('text'))
+        self.assertIn('short на Lighter', self.panel.message.cget('text'))
+        self.assertIn('100 с', self.panel.message.cget('text'))
+
+    def test_filled_spot_explains_lighter_short_without_claiming_both_positions_open(self):
+        self.panel.data = {'execution': {'state': 'OPENING_HEDGE', 'running': True,
+            'cycle': {'asset': 'SPY', 'state': 'OPENING_HEDGE', 'spot_quantity': '.14'}}}
+        self.panel.render()
+        self.assertIn('Открываем short на Lighter', self.panel.cycle_state.cget('text'))
+        self.assertIn('Nado куплен', self.panel.message.cget('text'))
+        self.assertIn('подтверждения', self.panel.message.cget('text'))
+
+    def test_start_after_a_closed_cycle_does_not_show_previous_stop_message(self):
+        self.panel.data = {'execution': {'state': 'WAITING', 'running': True, 'cycle': {
+            'asset': 'SPY', 'state': 'CLOSED', 'hedged_at': None, 'message': 'Открытие остановлено.'}}}
+        self.panel.render()
+        self.assertIn('Проверяем аккаунты', self.panel.message.cget('text'))
+        self.assertNotIn('Открытие остановлено', self.panel.message.cget('text'))
+
+    def test_unknown_submission_never_claims_a_limit_is_resting(self):
+        self.panel.data = {'execution': {'state': 'RECOVERY', 'running': True, 'cycle': {'asset': 'SPY'}},
+            'orders': [{'venue': 'nado', 'status': 'UNKNOWN', 'quantity': '.14', 'asset': 'wSPYx',
+                        'limit_price': '780', 'filled_quantity': None}]}
+        self.panel.render()
+        self.assertIn('Уточняем у биржи', self.panel.message.cget('text'))
+        self.assertNotIn('Лимитка Nado выставлена', self.panel.message.cget('text'))
+
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()

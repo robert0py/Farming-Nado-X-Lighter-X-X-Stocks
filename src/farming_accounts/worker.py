@@ -35,6 +35,7 @@ class Runtime:
         self.challenges = {}
         self.origin = ''
         self.stopped = threading.Event()
+        self.wakeup = threading.Event()
         self.shutdown = None
 
     def config(self):
@@ -307,6 +308,7 @@ class Runtime:
             self.journal.set('running', False)
             self.journal.set('worker_suspended', True)
             self.stopped.set()
+            self.wakeup.set()
             if self.shutdown:
                 threading.Thread(target=self.shutdown, daemon=True).start()
             return self.status() | {'message': 'Процесс выключен. Ордера и позиции на биржах не закрываются этой кнопкой; журнал сохранён для восстановления.'}
@@ -322,11 +324,16 @@ class Runtime:
             self.check_points()
             self.build_engine().start()
             self.journal.set('worker_suspended', False)
-            return {'ok': True, 'message': 'Стратегия запущена. Worker продолжает работать после закрытия приложения.'}
+            self.wakeup.set()
+            return self.status() | {'message': 'Запуск принят. Переходим к первому ордеру без ожидания интервала перестановки.'}
         if route == '/stop':
-            return self.request_stop()
+            response = self.request_stop()
+            self.wakeup.set()
+            return response
         if route == '/close':
-            return self.request_stop(closing=True)
+            response = self.request_stop(closing=True)
+            self.wakeup.set()
+            return response
         if route in ('/register/nado', '/register/lighter', '/relink/nado'):
             venue = route.rsplit('/', 1)[1]
             if route == '/relink/nado' and not config.get('nado', {}).get('private_key'):
@@ -411,7 +418,11 @@ class Runtime:
             return {'ok': True, 'message': 'Привязка отправлена. Вернитесь в приложение и нажмите «Проверить доступ».'}
 
     def tick_loop(self):
-        while not self.stopped.wait(10):
+        while not self.stopped.is_set():
+            self.wakeup.wait(10)
+            self.wakeup.clear()
+            if self.stopped.is_set():
+                break
             with self.lock:
                 if self.journal.get('worker_suspended', False):
                     continue
@@ -568,6 +579,7 @@ def main(argv=None):
         server.serve_forever(poll_interval=0.25)
     finally:
         runtime.stopped.set()
+        runtime.wakeup.set()
         thread.join(timeout=80)
         server.server_close()
         with runtime.lock:
