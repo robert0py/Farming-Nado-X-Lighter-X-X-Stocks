@@ -17,6 +17,72 @@ from test_markets import metadata
 
 
 class StrategyFormTests(unittest.TestCase):
+    def test_market_refresh_does_not_forget_unsaved_asset_changes(self):
+        self.panel.data = {'strategy': {'assets': ['SPY', 'QQQ']}}
+        form = self.load_form()
+        form.selected['QQQ'].set(False)
+        form.selection_changed()
+        form.refresh()
+        self.panel.executor.run_one()
+        result, error, callback, failed = self.panel.results.get_nowait()
+        self.panel.busy = False
+        callback(result)
+        form.close()
+        self.assertTrue(form.window.winfo_exists(), 'Refreshing markets discarded the dirty selection baseline')
+
+    def test_discard_cannot_hide_a_pending_strategy_save(self):
+        form = self.load_form()
+        self.fill(form)
+        form.save()
+        form.close(discard=True)
+        self.assertTrue(form.window.winfo_exists())
+        self.assertIn('подтверждения сохранения', form.status.cget('text'))
+
+    def test_edited_distance_cannot_be_silently_lost_with_window_close(self):
+        form = self.load_form()
+        entry = form.entries['nado_maker_distance_percent']
+        entry.delete(0, 'end')
+        entry.insert(0, '0,1')
+        form.close()
+        self.assertTrue(form.window.winfo_exists(), 'Window close silently discarded the new distance')
+        self.assertIn('не сохранены', form.status.cget('text'))
+        self.assertEqual(self.panel.executor.tasks, [])
+
+    def test_saved_distance_is_confirmed_before_form_closes(self):
+        form = self.load_form()
+        self.fill(form)
+        entry = form.entries['nado_maker_distance_percent']
+        entry.delete(0, 'end')
+        entry.insert(0, '0,1')
+        self.panel.client.request.return_value = {'ok': True, 'strategy': {'nado_maker_distance_percent': '0.01',
+            'nado_maker_reprice_seconds': 90}, 'revision': 1}
+        form.save()
+        self.panel.executor.run_one()
+        result, error, callback, failed = self.panel.results.get_nowait()
+        self.panel.busy = False
+        callback(result)
+        self.assertTrue(form.window.winfo_exists(), 'A mismatched saved value was accepted')
+        self.assertIn('не подтвердил', form.status.cget('text'))
+
+    def test_successful_save_updates_panel_with_persisted_percent_before_closing(self):
+        form = self.load_form()
+        self.fill(form)
+        entry = form.entries['nado_maker_distance_percent']
+        entry.delete(0, 'end')
+        entry.insert(0, '0,1')
+        self.panel.client.request.side_effect = lambda path, value: {'ok': True,
+            'strategy': value['strategy'], 'revision': 8}
+        form.save()
+        self.panel.executor.run_one()
+        result, error, callback, failed = self.panel.results.get_nowait()
+        self.panel.busy = False
+        callback(result)
+        self.assertFalse(form.window.winfo_exists())
+        self.assertEqual(self.panel.data['strategy']['nado_maker_distance_percent'], '0.1')
+        self.assertEqual(self.panel.data['revision'], 8)
+        self.assertIn('Сохранено и подтверждено', self.panel.summary.cget('text'))
+        self.assertIn('0.1%', self.panel.summary.cget('text'))
+
     def setUp(self):
         self.root = tk.Tk()
         self.root.withdraw()

@@ -16,6 +16,19 @@ from farming_accounts.trading.domain import TradingError
 
 
 class ControlTests(unittest.TestCase):
+    def test_strategy_response_reads_back_exact_persisted_distance_and_revision(self):
+        value = {'mode': 'automatic', 'assets': ['SPY', 'QQQ'], 'notional_per_leg': '110',
+            'nado_maker_distance_percent': '0.1', 'nado_maker_reprice_seconds': 100,
+            'points_evidence': {'url': 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado',
+                'confirmed_at': time.time(), 'account_enrolled': True, 'assets': ['SPY', 'QQQ']}}
+        self.runtime.vault.update(lambda v: v.update(trading={'revision': 2,
+            'nado': {'owner': 'fixture', 'subaccount': 'default'}, 'lighter': {'account_index': 7}}))
+        result = self.client.request('/strategy', {'revision': 2, 'strategy': value})
+        self.assertEqual(result['strategy'], self.runtime.config()['strategy'])
+        self.assertEqual(result['strategy']['nado_maker_distance_percent'], '0.1')
+        self.assertEqual(result['revision'], 3)
+        self.assertFalse(self.runtime.journal.get('running', False))
+
     def test_start_wakes_worker_and_places_first_order_without_reprice_wait(self):
         from decimal import Decimal
         from test_engine import GatewayFixture, TestClock
@@ -97,12 +110,16 @@ class ControlTests(unittest.TestCase):
         self.runtime.journal.observe(OrderObservation('progress', 'PENDING', Decimal(0),
                                                      exchange_id='0x' + 'ab' * 32))
         self.runtime.journal.set('maker:progress', {'baseline': 'private-baseline', 'signature': 'private-signature'})
+        self.runtime.journal.set('pricing:progress', {'reference_midpoint': '781.5', 'reference_timestamp': 1800000000,
+            'distance_percent': '0.1', 'actual_distance_percent': '0.1', 'signature': 'private-signature'})
         status = self.client.request('/status')
         self.assertEqual(len(status['orders']), 1)
         self.assertEqual(len(self.runtime.journal.orders('current')), 21)
         self.assertEqual(status['orders'][0]['status'], 'PENDING')
         self.assertEqual(status['orders'][0]['exchange_id'], '0x' + 'ab' * 32)
         self.assertEqual(status['orders'][0]['filled_quantity'], '0')
+        self.assertEqual(status['orders'][0]['pricing']['distance_percent'], '0.1')
+        self.assertEqual(status['orders'][0]['pricing']['reference_midpoint'], '781.5')
         self.assertNotIn('private-', str(status))
         self.assertNotIn('nonce', status['orders'][0])
 

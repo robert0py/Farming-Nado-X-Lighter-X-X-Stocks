@@ -70,6 +70,7 @@ class TradingPanel:
         self.app, self.parent = app, parent
         self.client = None
         self.data = {}
+        self.confirmed_strategy_revision = None
         self.busy, self.closed = False, False
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='worker-control')
         self.results = queue.Queue()
@@ -314,7 +315,9 @@ class TradingPanel:
             self.fields[venue].configure(text='Доступ подтверждён' if verified else 'Ключ сохранён · нужна проверка' if value.get('key_saved') else 'Торговый доступ не настроен', fg=GREEN if verified else MUTED)
         settings = self.data.get('strategy')
         if settings:
-            self.summary.configure(text=f"{', '.join(settings['assets'])} · покупка Nado до {settings['notional_per_leg']} USDT0 · удержание {settings['hold_seconds'] / 3600:g} ч · лимитка {settings.get('nado_maker_distance_percent', '0.02')}% · проверка через {settings.get('nado_maker_reprice_seconds', 90)} с")
+            prefix = ('Сохранено и подтверждено: ' if self.confirmed_strategy_revision is not None and
+                      self.confirmed_strategy_revision == self.data.get('revision') else 'Сохранённая стратегия: ')
+            self.summary.configure(text=prefix + f"{', '.join(settings['assets'])} · покупка Nado до {settings['notional_per_leg']} USDT0 · удержание {settings['hold_seconds'] / 3600:g} ч · отступ Nado {settings.get('nado_maker_distance_percent', '0.02')}% · проверка через {settings.get('nado_maker_reprice_seconds', 90)} с")
         execution = self.data.get('execution', {})
         cycle = execution.get('cycle') or {}
         state = execution.get('state', 'NOT_CONFIGURED')
@@ -338,6 +341,9 @@ class TradingPanel:
                 status_name = 'последний известный статус: ' + status_name + '; требуется сверка'
             number = ' · ID ' + order['exchange_id'] if order.get('exchange_id') else ''
             details.append(f"{'Nado' if venue == 'nado' else 'Lighter'}: {status_name} · {order['quantity']} {order['asset']} по {order['limit_price']} · исполнено {order.get('filled_quantity') or '0'}{number}")
+            pricing = order.get('pricing')
+            if venue == 'nado' and order.get('action') == 'open_spot' and pricing:
+                details.append(f"Расчёт этой заявки: середина стакана Nado {pricing['reference_midpoint']} USDT0 · выбранный отступ {pricing['distance_percent']}% · лимит {order['limit_price']}. Это цены на момент расчёта; текущий рынок может измениться.")
         self.order_detail.configure(text='\n'.join(details) if details else 'Ордеров текущей попытки нет.')
         reason = self.data.get('error') or progress
         if state == 'PAUSED':

@@ -89,8 +89,10 @@ class StrategyDialog:
     def __init__(self, panel):
         from .app import PANEL, MUTED, INK, FIELD, LINE, label, set_dark_titlebar
         self.panel, self.pending, self.ready, self.wait_timer = panel, False, False, None
+        self.saving = False
         self.markets, self.selected, self.checks, self.entries = [], {}, {}, {}
         self.saved_assets = list((panel.data.get('strategy') or {}).get('assets', ()))
+        self.original_assets = list(self.saved_assets)
         root = panel.app.root
         self.window = dialog = tk.Toplevel(root)
         dialog.title('Стратегия · активы, сумма и время')
@@ -113,7 +115,10 @@ class StrategyDialog:
         footer.bind('<Configure>', lambda event: self.status.configure(wraplength=max(200, event.width - 4)))
         self.save_button = ttk.Button(footer, text='Сохранить стратегию', style='Primary.TButton', command=self.save)
         self.save_button.pack(side='right')
-        ttk.Button(footer, text='Отмена', command=self.close).pack(side='right', padx=8)
+        self.discard_button = ttk.Button(footer, text='Отменить изменения', command=lambda: self.close(discard=True))
+        self.discard_button.pack(side='right', padx=8)
+        self.change_notice = label(footer, '', color=MUTED, wraplength=820, anchor='w', justify='left', size=9)
+        self.change_notice.pack(fill='x', before=self.status, pady=(0, 6))
 
         scroll = ttk.Scrollbar(dialog, orient='vertical')
         scroll.pack(side='right', fill='y')
@@ -178,6 +183,10 @@ class StrategyDialog:
             elif key == 'hold_hours':
                 value = Decimal(str(saved.get('hold_seconds', 43200))) / 3600
             entry.insert(0, str(value))
+            entry.bind('<KeyRelease>', lambda _: self.update_actions())
+            entry.bind('<<Paste>>', lambda _: self.window.after_idle(self.update_actions))
+        self.original_inputs = {key: entry.get() for key, entry in self.entries.items()}
+        self.saved_distance = str(saved.get('nado_maker_distance_percent', '0.02')) if saved else None
         label(inner, 'Подтверждение программы xPoints', bold=True, size=13).pack(anchor='w', pady=(15, 7))
         self.verified = tk.BooleanVar(dialog, value=False)
         self.points_check = tk.Checkbutton(footer, text='Я проверил участие аккаунта и выбранных spot xStocks в действующей программе xPoints',
@@ -212,6 +221,7 @@ class StrategyDialog:
     def update_actions(self):
         enabled = self.ready and not self.pending and sum(var.get() for var in self.selected.values()) >= 2 and self.verified.get()
         self.save_button.configure(state='normal' if enabled else 'disabled')
+        self.discard_button.configure(state='disabled' if self.saving else 'normal')
         self.refresh_button.configure(state='disabled' if self.pending else 'normal')
         self.points_check.configure(state='disabled' if self.pending else 'normal')
         self.advanced_check.configure(state='disabled' if self.pending else 'normal')
@@ -220,6 +230,15 @@ class StrategyDialog:
             check.configure(state='normal' if self.ready and not self.pending and row['can_select'] else 'disabled')
         for entry in self.entries.values():
             entry.configure(state='disabled' if self.pending else 'normal')
+        current = self.entries['nado_maker_distance_percent'].get().strip()
+        state = 'Есть несохранённые изменения.' if self.is_dirty() else 'Нет несохранённых изменений.'
+        required = ' Для сохранения отметьте подтверждение xPoints ниже.' if not self.verified.get() else ''
+        saved = f'Сохранённый отступ: {self.saved_distance}%.' if self.saved_distance is not None else 'Стратегия ещё не сохранена.'
+        self.change_notice.configure(text=f'{saved} Введённый отступ: {current}%. {state}{required}')
+
+    def is_dirty(self):
+        return (any(entry.get() != self.original_inputs.get(key, '') for key, entry in self.entries.items())
+                or self.ready and self.chosen_assets() != self.original_assets or self.advanced.get())
 
     def selection_changed(self):
         self.verified.set(False)
@@ -241,12 +260,14 @@ class StrategyDialog:
         def done(result):
             if self.alive():
                 self.pending = False
+                self.saving = False
                 callback(result)
                 if self.alive():
                     self.update_actions()
         def failed(message):
             if self.alive():
                 self.pending = False
+                self.saving = False
                 self.status.configure(text=message)
                 if path == '/markets':
                     self.catalog_status.configure(text='Рынки не обновлены. Повторите запрос.')
@@ -348,9 +369,30 @@ class StrategyDialog:
                 self.status.configure(text=f"Для {row['asset']} API Nado требует покупку минимум на {row['nado_min_notional']} USDT0. Увеличьте сумму или уберите актив.")
                 return
         self.status.configure(text='Сохраняю настройки. Для торговли нужен отдельный запуск.')
-        self.send('/strategy', {'revision': self.panel.data.get('revision', 0), 'strategy': value}, lambda _: self.close())
+        def confirmed(result):
+            persisted = result.get('strategy')
+            try:
+                matched = (isinstance(persisted, dict) and result.get('revision') is not None and
+                           strategy(persisted) == strategy(value))
+            except TradingError:
+                matched = False
+            if not matched:
+                self.status.configure(text='Процесс не подтвердил сохранённые значения. Изменения остаются в форме; обновите приложение и проверьте настройки.')
+                return
+            self.panel.data.update(strategy=persisted, revision=result['revision'])
+            self.panel.confirmed_strategy_revision = result['revision']
+            self.panel.render()
+            self.close(discard=True)
+        self.saving = True
+        self.send('/strategy', {'revision': self.panel.data.get('revision', 0), 'strategy': value}, confirmed)
 
-    def close(self):
+    def close(self, *, discard=False):
+        if self.saving:
+            self.status.configure(text='Дождитесь подтверждения сохранения. Команда уже подготовлена; закрытие формы не отменяет её на сервере.')
+            return
+        if not discard and self.alive() and self.is_dirty():
+            self.status.configure(text='Изменения не сохранены. Нажмите «Сохранить стратегию» или «Отменить изменения», чтобы закрыть форму без сохранения.')
+            return
         if self.wait_timer is not None:
             self.window.after_cancel(self.wait_timer)
             self.wait_timer = None

@@ -163,6 +163,10 @@ class Runtime:
                                    'filled_quantity': str(observation.filled_quantity) if observation else None,
                                    'exchange_id': observation.exchange_id if observation else None,
                                    'expiry': intent.expiry}
+                    pricing = self.journal.get('pricing:' + intent.client_id)
+                    if isinstance(pricing, dict):
+                        orders[intent.venue]['pricing'] = {key: pricing[key] for key in (
+                            'reference_midpoint', 'reference_timestamp', 'distance_percent', 'actual_distance_percent') if key in pricing}
             return {'ok': True, 'version': __version__, 'worker': 'running', 'revision': config.get('revision', 0),
                     'credentials': public_credentials(config), 'verified': self.verified,
                     'pending_registration': self.vault.load().get('pending_registration', {}).get('venue'),
@@ -267,7 +271,9 @@ class Runtime:
             settings['points_evidence']['subaccount'] = config['nado']['subaccount']
             config['strategy'] = settings
             self.save_config(config)
-            return {'ok': True, 'message': 'Стратегия сохранена. Выполните проверку без ордеров.'}
+            saved = self.config()
+            return {'ok': True, 'strategy': saved['strategy'], 'revision': saved['revision'],
+                    'message': f"Стратегия сохранена: отступ Nado {saved['strategy'].get('nado_maker_distance_percent', '0.02')}%, проверка через {saved['strategy'].get('nado_maker_reprice_seconds', 90)} с. Для торговли нужен отдельный запуск."}
         if route == '/verify':
             cycle = self.journal.active_cycle()
             if cycle and cycle['state'] in ('OPENING_SPOT', 'OPENING_HEDGE', 'CLOSING'):

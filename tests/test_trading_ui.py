@@ -11,6 +11,18 @@ from test_app import ControlledExecutor
 
 
 class TradingDesktopTests(unittest.TestCase):
+    def test_order_explains_the_actual_reference_and_selected_percent(self):
+        self.panel.data = {'execution': {'state': 'OPENING_SPOT', 'running': True, 'cycle': {'asset': 'SPY'}},
+            'orders': [{'venue': 'nado', 'status': 'PENDING', 'quantity': '.14', 'asset': 'wSPYx',
+                'limit_price': '599.40', 'filled_quantity': '0', 'action': 'open_spot',
+                'pricing': {'reference_midpoint': '600', 'distance_percent': '0.1', 'reference_timestamp': 1800000000}}]}
+        self.panel.render()
+        text = self.panel.order_detail.cget('text')
+        self.assertIn('600 USDT0', text)
+        self.assertIn('0.1%', text)
+        self.assertIn('599.40', text)
+        self.assertIn('момент расчёта', text)
+
     def test_start_error_is_not_overwritten_by_previous_closed_cycle(self):
         self.panel.data = {'execution': {'state': 'CLOSED', 'running': False, 'cycle': {
             'state': 'CLOSED', 'hedged_at': None, 'message': 'Прежнее открытие остановлено.'}}}

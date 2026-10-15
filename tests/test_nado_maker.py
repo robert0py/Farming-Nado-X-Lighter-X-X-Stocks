@@ -72,6 +72,34 @@ class NoFillStream(FakeStream):
 
 
 class MakerTests(unittest.TestCase):
+    def test_configured_percent_reaches_signed_initial_and_replacement_orders(self):
+        from test_engine import GatewayFixture
+        from farming_accounts.trading.domain import Strategy
+        from farming_accounts.trading.engine import Engine
+        clock = [NOW]
+        market = [D(600)]
+        self.gateway.clock = lambda: clock[0]
+        self.gateway.book = lambda instrument: Book(market[0] - D('.1'), market[0] + D('.1'), clock[0])
+        self.journal.observe(OrderObservation(self.intent.client_id, 'REJECTED', D(0)))
+        self.journal.save_cycle({'id': 'cycle', 'state': 'CLOSED'})
+        lighter = GatewayFixture('Lighter', lambda: clock[0], self.journal)
+        lighter.items = tuple(replace(i, quantity_step=D('.001'), min_qty=D('.001')) for i in lighter.items)
+        settings = Strategy(('SPY', 'QQQ'), D(200), D(5), D(1), 90, D(10), D(10), 30,
+                            points_verified_assets=('SPY', 'QQQ'), nado_post_only=True,
+                            nado_maker_distance_percent=D('.1'), nado_maker_reprice_seconds=90)
+        engine = Engine(self.journal, self.gateway, lighter, settings, clock=lambda: clock[0])
+        engine.start()
+        engine.tick()
+        self.assertEqual(self.transport.pending['order']['priceX18'], raw('599.40'))
+        self.assertEqual(int(self.transport.pending['order']['appendix']) & (3 << 9), 3 << 9)
+        clock[0] += 100
+        market[0] = D(610)
+        engine.tick()
+        self.assertEqual(self.transport.pending['order']['priceX18'], raw('609.39'))
+        self.assertEqual(len(self.cancels()), 1)
+        self.assertEqual(len([b for k,b in self.transport.calls if k == 'execute' and 'place_order' in b]), 2)
+        self.assertEqual(lighter.requests, [])
+
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.journal = Journal(Path(self.temp.name) / 'state.sqlite')

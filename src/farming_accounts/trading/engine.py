@@ -374,6 +374,12 @@ class Engine:
                              cycle["id"], instrument.venue, instrument, side, quantity, limit, reduce_only,
                              (receive_until * 1000 << 20) | sequence, expiry, post_only=maker)
         self.journal.put_intent(intent, action)
+        if maker and side == 'buy' and not reduce_only:
+            midpoint = (book.bid + book.ask) / 2
+            self.journal.set('pricing:' + intent.client_id, {
+                'reference_midpoint': str(midpoint), 'reference_timestamp': book.timestamp,
+                'distance_percent': str(strategy.nado_maker_distance_percent),
+                'actual_distance_percent': str((midpoint - limit) / midpoint * 100)})
         cycle["attempts"] += 1
         self.journal.save_cycle(cycle)
         try:

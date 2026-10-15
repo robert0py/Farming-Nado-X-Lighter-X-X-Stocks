@@ -75,6 +75,30 @@ class GatewayFixture:
 
 
 class EngineTests(unittest.TestCase):
+    def test_distance_reference_is_durable_and_matches_initial_and_replacement_prices(self):
+        self.engine.strategy = replace(self.strategy, nado_post_only=True, nado_maker_distance_percent=D('.1'))
+        self.nado.items = tuple(replace(i, price_tick=D('.01')) for i in self.nado.items)
+        self.nado.book = lambda instrument: Book(D('599.90'), D('600.10'), self.clock())
+        self.nado.responses.extend(['PENDING', 'PENDING'])
+        self.engine.start()
+        self.engine.tick()
+        first = self.nado.requests[-1]
+        audit = self.journal.get('pricing:' + first.client_id)
+        self.assertIsNotNone(audit, 'Cannot audit which percentage and market price were used')
+        self.assertEqual(D(audit['reference_midpoint']), D(600))
+        self.assertEqual(D(audit['distance_percent']), D('.1'))
+        self.assertEqual(first.limit_price, D('599.40'))
+        self.clock.value += 100
+        self.nado.lookup_results[first.client_id] = OrderObservation(first.client_id, 'CANCELLED', D(0))
+        self.nado.book = lambda instrument: Book(D('609.90'), D('610.10'), self.clock())
+        self.engine.tick()
+        second = self.nado.requests[-1]
+        self.assertNotEqual(first.client_id, second.client_id)
+        self.assertEqual(second.limit_price, D('609.39'))
+        audit = self.journal.get('pricing:' + second.client_id)
+        self.assertEqual(D(audit['reference_midpoint']), D(610))
+        self.assertEqual(D(audit['distance_percent']), D('.1'))
+
     def test_start_only_checks_until_a_ready_market_and_tick_submits_without_waiting(self):
         self.engine.strategy = replace(self.strategy, nado_post_only=True, nado_maker_reprice_seconds=100)
         checked = []
