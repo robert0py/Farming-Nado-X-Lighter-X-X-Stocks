@@ -42,13 +42,13 @@ class ControlClient:
     def request(self, path: str, data: dict | None = None) -> dict:
         if path not in ('/status', '/markets', '/preflight', '/credentials', '/strategy', '/start',
                         '/stop', '/close', '/verify', '/register/nado', '/register/lighter',
-                        '/registration-options/lighter', '/relink/nado', '/recover-registration', '/shutdown'):
+                        '/registration-options/lighter', '/relink/nado', '/recover-registration', '/shutdown', '/manual-close'):
             raise ControlError('Неизвестная команда worker.')
         body = None if data is None else json.dumps(data | {'command_id': secrets.token_hex(16)}, allow_nan=False).encode()
         req = Request(self.url + path, body, method='GET' if body is None else 'POST',
                       headers={'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'})
         try:
-            with self.opener.open(req, timeout=75) as response:
+            with self.opener.open(req, timeout=5 if path == '/status' and data is None else 75) as response:
                 raw = response.read(2 * 1024 * 1024 + 1)
                 if len(raw) > 2 * 1024 * 1024:
                     raise ValueError()

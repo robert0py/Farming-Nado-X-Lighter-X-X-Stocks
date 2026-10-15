@@ -75,6 +75,60 @@ class GatewayFixture:
 
 
 class EngineTests(unittest.TestCase):
+    def test_manual_baseline_exception_requires_exact_approved_snapshot_and_subminimum_value(self):
+        from unittest.mock import Mock
+        pair = self.nado.items[0], self.lighter.items[0]
+        books = self.nado.book(pair[0]), self.lighter.book(pair[1])
+        self.nado.capture_position = Mock(return_value={'amount': '.04', 'normalized': '40', 'multiplier': str(10**18)})
+        self.nado.accepts_manual_baseline = Mock(return_value=False)
+        with self.assertRaises(TradingError):
+            self.engine._baseline(pair, books, self.strategy)
+        self.nado.accepts_manual_baseline.return_value = True
+        self.assertEqual(self.engine._baseline(pair, books, self.strategy)[0], D('.04'))
+        self.nado.capture_position.return_value['amount'] = '1'
+        with self.assertRaises(TradingError):
+            self.engine._baseline(pair, books, self.strategy)
+
+    def test_manual_sale_requires_explicit_residual_ack_and_keeps_trading_off(self):
+        from unittest.mock import Mock
+        self.engine.start()
+        self.nado.responses.append('PENDING')
+        self.engine.tick()
+        intent = self.nado.requests[0]
+        cycle = self.journal.active_cycle()
+        self.engine._transition(cycle, 'HALTED', 'Нужна сверка ручной продажи')
+        self.journal.set('running', False)
+        self.nado.manual_close_proof = Mock(return_value=(OrderObservation(intent.client_id, 'PENDING', intent.quantity, D(200)),
+            {'amount': '.01', 'normalized': '100', 'multiplier': str(10**18)},
+            {'sender': 'fixture', 'product_id': intent.instrument.id, 'sold': '9.99', 'indices': [8]}))
+        self.nado.capture_position = Mock(return_value={'amount': '.01', 'normalized': '100', 'multiplier': str(10**18)})
+        preview = self.engine.reconcile_manual_close()
+        self.assertEqual(self.journal.active_cycle()['state'], 'HALTED')
+        with self.assertRaises(TradingError):
+            self.engine.reconcile_manual_close(acknowledge=True, cycle_id=cycle['id'], normalized='changed')
+        self.engine.reconcile_manual_close(acknowledge=True, cycle_id=cycle['id'], normalized=preview['normalized'])
+        closed = self.journal.active_cycle()
+        self.assertEqual((closed['state'], closed['outcome']), ('CLOSED', 'MANUAL_CLOSE'))
+        self.assertEqual(closed['manual_residual']['remaining'], '0.01')
+        self.assertFalse(self.journal.get('running'))
+        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(self.lighter.requests, [])
+        self.assertEqual(self.journal.orders(cycle['id'])[0][2].status, 'FILLED')
+
+    def test_explicit_restart_of_halted_cycle_reconciles_same_cycle_before_any_order(self):
+        self.engine.start()
+        self.nado.responses.append('PENDING')
+        self.engine.tick()
+        cycle = self.journal.active_cycle()
+        self.engine._transition(cycle, 'HALTED', 'Конкретная причина сверки Nado')
+        self.journal.set('running', False)
+        count = len(self.nado.requests)
+        self.engine.start()
+        self.assertEqual(self.engine.status()['state'], 'RECOVERY')
+        self.assertEqual(self.journal.active_cycle()['id'], cycle['id'])
+        self.assertEqual(self.journal.active_cycle()['halt_reason'], 'Конкретная причина сверки Nado')
+        self.assertEqual(len(self.nado.requests), count)
+
     def test_distance_reference_is_durable_and_matches_initial_and_replacement_prices(self):
         self.engine.strategy = replace(self.strategy, nado_post_only=True, nado_maker_distance_percent=D('.1'))
         self.nado.items = tuple(replace(i, price_tick=D('.01')) for i in self.nado.items)

@@ -1,6 +1,6 @@
 """Single-owner hedge worker. Every external write has a durable prior intent."""
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from decimal import Decimal, localcontext
 import json
 import threading
@@ -65,10 +65,61 @@ class Engine:
         dust_limit = min(Decimal('0.1'), strategy.notional_per_leg * Decimal('0.001'))
         dust = (strategy.preserve_spot_dust and 0 <= spot < pair[0].quantity_step and
                 spot * books[0].ask <= dust_limit)
-        if (spot != 0 and not dust or self.lighter.position(pair[1]) != 0 or
+        accepted = getattr(self.nado, 'accepts_manual_baseline', None)
+        manual = bool(snapshot and accepted and accepted(pair[0], snapshot) and
+                      0 <= spot * books[0].ask < pair[0].min_notional)
+        if (spot != 0 and not (dust or manual) or self.lighter.position(pair[1]) != 0 or
                 self.nado.open_orders(pair[0]) or self.lighter.open_orders(pair[1])):
             raise TradingError('На выбранном рынке есть существующие позиции или ордера. Бот не принимает их под управление.')
         return spot, snapshot
+
+    def reconcile_manual_close(self, *, acknowledge=False, cycle_id=None, normalized=None):
+        """Read-only preview; an explicit acknowledgement transfers a proved small residual out of bot scope."""
+        with self._mutex, localcontext() as context:
+            context.prec = 96
+            cycle = self.journal.active_cycle()
+            if self.journal.get('running', False) or not cycle or cycle['state'] not in ('HALTED', 'RECOVERY'):
+                raise TradingError('Ручное закрытие проверяется только у остановленного незавершённого цикла.')
+            orders = self.journal.orders(cycle['id'])
+            candidates = [(intent, obs) for action, intent, obs in orders
+                          if action == 'open_spot' and (not obs or obs.filled_quantity > 0 or not obs.terminal)]
+            if len(candidates) != 1 or any(intent.venue.casefold() != 'nado' or action != 'open_spot'
+                                           for action, intent, obs in orders if not obs or obs.filled_quantity > 0 or not obs.terminal):
+                raise TradingError('У цикла есть другие исполнения или неподтверждённые ордера. Простое ручное закрытие неприменимо.')
+            self._verify()
+            spot, perp = self._refresh_pair(cycle)
+            if self.lighter.position(perp) != 0 or self.lighter.open_orders(perp):
+                raise TradingError('На Lighter есть позиция или ордер. Нельзя считать ручное закрытие завершённым.')
+            intent, _ = candidates[0]
+            observed, snapshot, proof = self.nado.manual_close_proof(intent)
+            amount = Decimal(snapshot['amount'])
+            book = self._book(spot, self._strategy(cycle))
+            if amount < 0 or amount * book.ask >= spot.min_notional:
+                raise TradingError('На Nado остаётся торгуемая позиция; небольшим остатком после ручного закрытия она не является.')
+            preview = {'cycle_id': cycle['id'], 'symbol': spot.symbol, 'remaining': str(amount),
+                       'normalized': snapshot['normalized'], 'sold': proof['sold'], 'min_notional': str(spot.min_notional)}
+            if not acknowledge:
+                return preview
+            if cycle_id != cycle['id'] or normalized != snapshot['normalized']:
+                raise TradingError('Остаток изменился после проверки. Повторно покажем актуальные данные перед учётом.')
+            if self.lighter.position(perp) != 0 or self.lighter.open_orders(perp):
+                raise TradingError('Lighter изменился во время проверки. Старый цикл сохранён.')
+            if (self.nado.capture_position(spot)['normalized'] != snapshot['normalized'] or self.nado.open_orders(spot)):
+                raise TradingError('Nado изменился во время проверки. Старый цикл сохранён; повторим проверку актуального остатка.')
+            receipt = proof | snapshot | {'cycle_id': cycle['id'], 'accepted_at': self.clock(), 'symbol': spot.symbol}
+            observed = replace(observed, status='FILLED')
+            cycle.update(state='CLOSED', outcome='MANUAL_CLOSE', manual_residual=preview, pnl_quote=None,
+                         updated_at=self.clock(), message=f'Ручная продажа подтверждена. Остаток {amount} {spot.symbol} '
+                         'остаётся вне следующих хеджей; его стоимость не включена в PnL бота.')
+            with self.journal.transaction() as db:
+                db.execute('UPDATE orders SET observation=?,uncertain=0,observed_at=? WHERE client_id=?',
+                           (encoded(observed), self.clock(), intent.client_id))
+                for key, value in (('manual-baseline:' + str(spot.id), receipt), ('running', False), ('close_requested', False)):
+                    db.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, encoded(value)))
+                db.execute('UPDATE cycles SET value=? WHERE id=?', (encoded(cycle), cycle['id']))
+                db.execute('INSERT INTO transitions(cycle_id,time,state,message) VALUES(?,?,?,?)',
+                           (cycle['id'], self.clock(), 'CLOSED', cycle['message']))
+            return preview
 
     @staticmethod
     def _strategy(cycle: dict) -> Strategy:
@@ -131,7 +182,13 @@ class Engine:
         with self._mutex:
             current = self.journal.active_cycle()
             if current and current["state"] == "HALTED":
-                raise TradingError("Текущий цикл остановлен из-за риска. Сначала устраните причину и выполните сверку.")
+                if not current.get('halt_reason'):
+                    event = next((event for event in self.journal.events(100)
+                                  if event.get('cycle_id') == current['id'] and event.get('state') == 'HALTED'), None)
+                    current['halt_reason'] = event['message'] if event else current.get('message', '')
+                self._verified = False
+                self._transition(current, 'RECOVERY', 'Повторный запуск: проверяем прежние ордера и позиции на биржах. '
+                                 'Новый ордер не отправляется до подтверждения прежнего результата.')
             # One cycle opens one asset. Checking the rest belongs to explicit
             # preflight, not to the critical path before the first order.
             preflight = self.preflight(first_ready_only=True) if not current or current["state"] == "CLOSED" else None
@@ -140,7 +197,8 @@ class Engine:
                 raise TradingError("Нет готового рынка для хеджа. " + reasons)
             self.journal.set("strategy", asdict(self.strategy))
             self.journal.set("running", True)
-            self.journal.set("close_requested", False)
+            if not current or current['state'] == 'CLOSED':
+                self.journal.set("close_requested", False)
             return self.status()
 
     def stop_new_cycles(self) -> dict:
@@ -173,6 +231,8 @@ class Engine:
         changed = cycle["state"] != state or cycle.get("message") != message
         if state == "CLOSING":
             cycle["closing_requested"] = True
+        if state == 'HALTED':
+            cycle['halt_reason'] = message
         cycle["state"], cycle["message"], cycle["updated_at"] = state, message, self.clock()
         self.journal.save_cycle(cycle, message=message if changed else "", time=self.clock())
 
@@ -294,7 +354,9 @@ class Engine:
                 self._transition(cycle, 'OPENING_SPOT',
                                  'Лимитный maker-ордер Nado принят. Ожидаем покупку; таймер удержания начнётся после открытия обеих сторон.')
             else:
-                self._transition(cycle, "RECOVERY", "Результат отправки не подтверждён. Только сверка, без повторных ордеров.")
+                reasons = [self.journal.get('reconciliation:' + intent.client_id) for intent, _ in pending]
+                details = ' '.join(item['message'] for item in reasons if isinstance(item, dict) and item.get('message'))
+                self._transition(cycle, "RECOVERY", details or "Биржа ещё не подтвердила окончательный результат прежнего ордера. Проверяем его статус и фактическое исполнение; повторного открытия нет.")
             return False
         return True
 
@@ -306,6 +368,10 @@ class Engine:
         return code if isinstance(code, int) else None, value.get('reason') or 'Площадка отклонила ордер без исполнения.'
 
     def _closed(self, cycle: dict, outcome: str, message: str) -> None:
+        if outcome in ('COMPLETED', 'UNWOUND'):
+            advance = getattr(self.nado, 'advance_manual_baseline', None)
+            if advance:
+                advance(cycle)
         cycle['outcome'] = outcome
         self._transition(cycle, 'CLOSED', message)
 
@@ -496,7 +562,10 @@ class Engine:
                     cycle["hedged_at"] = completed_at if completed_at is not None else self.clock()
                     cycle["deadline"] = cycle["hedged_at"] + strategy.hold_seconds
                     self.journal.save_cycle(cycle)
-                risk_close = pnl <= -strategy.max_loss_quote or self.lighter.available() < strategy.margin_reserve
+                available = self.lighter.available()
+                loss_limit = pnl <= -strategy.max_loss_quote
+                low_margin = available < strategy.margin_reserve
+                risk_close = loss_limit or low_margin
                 if risk_close:
                     self.journal.set("running", False)
                 closing = (self.journal.get("close_requested", False) or cycle["closing_requested"] or
@@ -539,7 +608,12 @@ class Engine:
                                        if action == 'close_spot' and intent.post_only and obs and obs.status in ('CANCELLED', 'EXPIRED') and obs.filled_quantity == 0)
                     if empty_closes >= 3:
                         raise TradingError('Maker-закрытие трижды отменено без исполнения. Остаток сохранён; проверьте рынок и запросите закрытие снова.')
-                    self._transition(cycle, "CLOSING", "Контролируемое закрытие обеих сторон.")
+                    reasons = []
+                    if loss_limit:
+                        reasons.append(f'Расчётный PnL {pnl} достиг порога убытка −{strategy.max_loss_quote}.')
+                    if low_margin:
+                        reasons.append(f'Свободное обеспечение Lighter {available} USDG ниже резерва {strategy.margin_reserve} USDG.')
+                    self._transition(cycle, "CLOSING", ' '.join(reasons) or cycle.get('message') or "Контролируемое закрытие обеих сторон.")
                     if perp_quantity < 0:
                         self._write(cycle, perp, perp_book, "buy", -perp_quantity, "close_perp", reduce_only=True)
                     elif spot_quantity > 0:
@@ -558,7 +632,10 @@ class Engine:
                                    for action, _, obs in self.journal.orders(cycle["id"]))
                 if expired or failed_hedge:
                     self.journal.set("running", False)
-                    self._transition(cycle, "CLOSING", "Хедж не сформирован в пределах ограничений; контролируемое закрытие.")
+                    reason = (f'Покупка Nado подтверждена, но встречная сторона не сформирована за '
+                              f'{int(self.clock() - cycle["unhedged_since"])} с; лимит {strategy.max_unhedged_seconds} с.'
+                              if expired else 'Lighter подтвердил завершение встречного ордера без исполнения.')
+                    self._transition(cycle, "CLOSING", reason + ' Закрываем подтверждённый остаток Nado.')
                     return self.status()
                 if residual > 0:
                     hedge_quantity = quantize(residual / perp.multiplier, perp.quantity_step)
@@ -570,9 +647,9 @@ class Engine:
                             self._write(cycle, perp, perp_book, "sell", hedge_quantity, "open_perp", reduce_only=False)
                         except ReadUnavailable:
                             raise
-                        except TradingError:
+                        except TradingError as error:
                             self.journal.set("running", False)
-                            self._transition(cycle, "CLOSING", "Встречную позицию нельзя открыть в пределах лимитов; закрытие подтверждённого остатка.")
+                            self._transition(cycle, "CLOSING", 'Lighter не открыл встречную позицию: ' + str(error) + ' Закрываем подтверждённый остаток Nado.')
                             return self.status()
                         if cycle["state"] != "RECOVERY":
                             self._transition(cycle, "OPENING_HEDGE", "Подтверждение встречного исполнения.")

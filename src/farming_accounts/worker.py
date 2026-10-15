@@ -1,6 +1,7 @@
 """Independent worker. All engine, vault and exchange operations serialize under one lock."""
 
 import argparse
+from copy import deepcopy
 from dataclasses import asdict
 import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +14,7 @@ import threading
 import time
 
 from . import __version__
+from .models import AccountError, nado_subaccount
 from .trade_config import credentials, public_credentials, strategy, canonical_strategy
 from .trading.domain import TradingError
 from .trading.journal import Journal, encoded
@@ -37,6 +39,8 @@ class Runtime:
         self.stopped = threading.Event()
         self.wakeup = threading.Event()
         self.shutdown = None
+        self._status_cache = None
+        self.status()
 
     def config(self):
         return self.vault.load().get('trading', {})
@@ -142,18 +146,46 @@ class Runtime:
         return self.engine
 
     def status(self):
+        # Exchange requests serialize trading, but must not block the desktop.
+        if not self.lock.acquire(blocking=False):
+            cached, timestamp = self._status_cache
+            return deepcopy(cached) | {'refreshing': True, 'status_age_seconds': max(0, time.monotonic() - timestamp)}
+        try:
+            result = self._status_locked()
+            result.update(refreshing=False, status_age_seconds=0)
+            self._status_cache = (deepcopy(result), time.monotonic())
+            return result
+        finally:
+            self.lock.release()
+
+    def _status_locked(self):
         with self.lock:
             config = self.config()
             cycle = self.journal.active_cycle()
+            if cycle and cycle.get('state') == 'HALTED' and not cycle.get('halt_reason'):
+                event = next((event for event in self.journal.events(100)
+                              if event.get('cycle_id') == cycle['id'] and event.get('state') == 'HALTED'), None)
+                cycle['halt_reason'] = event['message'] if event else cycle.get('message', '')
             state = self.engine.status() if self.engine else {
                 'state': cycle['state'] if cycle else 'IDLE' if config.get('strategy') else 'NOT_CONFIGURED',
                 'running': self.journal.get('running', False),
                 'close_requested': self.journal.get('close_requested', False), 'cycle': cycle,
                 'waiting_reason': self.journal.get('waiting_reason')}
             state['suspended'] = self.journal.get('worker_suspended', False)
+            if cycle and cycle.get('halt_reason') and state.get('cycle'):
+                state['cycle']['halt_reason'] = cycle['halt_reason']
             if state['suspended']:
                 state['state'] = 'PAUSED'
             orders = {}
+            residues = [json.loads(row[0]) for row in self.journal.db.execute(
+                "SELECT value FROM settings WHERE key LIKE 'manual-baseline:%'")]
+            if residues:
+                try:
+                    owner = config.get('nado', {})
+                    sender = nado_subaccount(owner.get('owner', ''), owner.get('subaccount', 'default'))
+                    residues = [row for row in residues if row.get('sender') == sender]
+                except AccountError:
+                    residues = []
             if cycle:
                 for action, intent, observation in self.journal.orders(cycle['id']):
                     orders[intent.venue] = {'venue': intent.venue, 'action': action, 'asset': intent.instrument.symbol,
@@ -172,7 +204,8 @@ class Runtime:
                     'credentials': public_credentials(config), 'verified': self.verified,
                     'pending_registration': self.vault.load().get('pending_registration', {}).get('venue'),
                     'strategy': config.get('strategy'), 'execution': state, 'error': self.error,
-                    'orders': list(orders.values()), 'history': self.journal.history(50), 'events': self.journal.events(50)}
+                    'orders': list(orders.values()), 'history': self.journal.history(50), 'events': self.journal.events(50),
+                    'manual_residuals': [{'symbol': row['symbol'], 'amount_at_acceptance': row['amount']} for row in residues]}
 
     def save_config(self, config, *, replaces_key_for=None):
         config['revision'] = config.get('revision', 0) + 1
@@ -214,6 +247,7 @@ class Runtime:
             durable = response if 'wallet_url' not in response else {'ok': False, 'error': 'Откройте новую сессию регистрации ключа.'}
             with self.journal.transaction() as db:
                 db.execute('UPDATE commands SET response=? WHERE id=?', (encoded(durable), identity))
+            self.status()
             return response
 
     def _command(self, route, value):
@@ -327,12 +361,23 @@ class Runtime:
             details = ['%s: %s' % (item['asset'], 'готов' if item['ready'] else item.get('reason', 'недоступен'))
                        for item in result['markets']]
             return {'ok': True, 'preflight': result, 'message': 'Проверка без ордеров. ' + '; '.join(details)}
+        if route == '/manual-close':
+            acknowledged = value.get('acknowledge_residual') is True
+            preview = self.build_engine().reconcile_manual_close(acknowledge=acknowledged,
+                cycle_id=value.get('cycle_id'), normalized=value.get('normalized'))
+            if acknowledged:
+                self.error = ''
+                return self.status() | {'message': 'Ручная продажа подтверждена по истории и балансам. Старый цикл учтён; торговля остаётся выключенной.'}
+            return {'ok': True, 'preview': preview}
         if route == '/start':
             self.check_points()
             self.build_engine().start()
             self.journal.set('worker_suspended', False)
             self.wakeup.set()
-            return self.status() | {'message': 'Запуск принят. Переходим к первому ордеру без ожидания интервала перестановки.'}
+            recovering = (self.journal.active_cycle() or {}).get('state') == 'RECOVERY'
+            message = ('Проверяем прежний ордер и реальные позиции на биржах. До подтверждения результата повторного открытия не будет.'
+                       if recovering else 'Запуск принят. Переходим к первому ордеру без ожидания интервала перестановки.')
+            return self.status() | {'message': message}
         if route == '/stop':
             response = self.request_stop()
             self.wakeup.set()
@@ -456,6 +501,11 @@ class Runtime:
                     self.error = str(error)
                 except Exception:
                     self.error = 'Ошибка worker. Новые ордера не повторяются вслепую; проверьте журнал и состояние хеджа.'
+                finally:
+                    try:
+                        self.status()
+                    except VaultError:
+                        pass  # Preserve the last snapshot if the vault is temporarily unreadable.
 
 
 class Server(ThreadingHTTPServer):

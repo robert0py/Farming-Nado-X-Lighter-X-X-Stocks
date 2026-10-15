@@ -11,6 +11,24 @@ from test_app import ControlledExecutor
 
 
 class TradingDesktopTests(unittest.TestCase):
+    def test_manual_close_shows_residual_before_explicit_acknowledgement(self):
+        self.panel.client = Mock()
+        self.panel.client.request.return_value = {'ok': True, 'preview': {'cycle_id': 'saved',
+            'normalized': '10', 'remaining': '.01', 'sold': '.99', 'symbol': 'wSPYx', 'min_notional': '100'}}
+        self.panel.next_refresh = time.monotonic() + 60
+        self.panel.manual_close_dialog()
+        self.panel.executor.run_one()
+        self.panel.poll()
+        self.panel.client.request.assert_called_once_with('/manual-close', {'acknowledge_residual': False})
+        dialog = self.panel.dialogs[-1]
+        children = dialog.winfo_children()[0].winfo_children()
+        self.assertTrue(any('вне следующих хеджей' in str(child.cget('text')) for child in children if child.winfo_class() == 'Label'))
+        confirm = next(child for child in children if child.winfo_class() == 'TButton')
+        confirm.invoke()
+        self.panel.executor.run_one()
+        self.assertEqual(self.panel.client.request.call_args.args, ('/manual-close', {
+            'acknowledge_residual': True, 'cycle_id': 'saved', 'normalized': '10'}))
+
     def test_closest_maker_card_uses_ask_and_does_not_claim_percentage_mode(self):
         self.panel.data = {'execution': {'state': 'OPENING_SPOT', 'running': True, 'cycle': {'asset': 'SPY'}},
             'orders': [{'venue': 'nado', 'status': 'PENDING', 'quantity': '.14', 'asset': 'wSPYx',
@@ -93,6 +111,8 @@ class TradingDesktopTests(unittest.TestCase):
         self.root.after_cancel(self.panel.refresh_id)
         self.panel.executor.shutdown()
         self.panel.executor = ControlledExecutor()
+        self.panel.status_executor.shutdown()
+        self.panel.status_executor = ControlledExecutor()
 
     def tearDown(self):
         self.app.close()
@@ -192,8 +212,43 @@ class TradingDesktopTests(unittest.TestCase):
             raise tk.TclError('widget has been destroyed')
         self.panel.results.put(({'ok': True}, None, dismissed))
         self.panel.poll()
-        self.assertEqual(len(self.panel.executor.tasks), 1)
+        self.assertEqual(len(self.panel.status_executor.tasks), 1)
         self.assertIn(self.panel.refresh_id, self.root.tk.call('after', 'info'))
+
+    def test_background_refresh_does_not_disable_buttons_or_delay_stop_dispatch(self):
+        self.panel.client = Mock()
+        self.panel.render_buttons()
+        self.panel.poll()
+        self.assertTrue(self.panel.status_pending)
+        self.assertFalse(self.panel.busy)
+        self.assertEqual(len(self.panel.status_executor.tasks), 1)
+        self.assertTrue(all(str(button.cget('state')) == 'normal' for button in self.panel.buttons))
+        self.panel.request('/stop', {})
+        self.assertEqual(len(self.panel.executor.tasks), 1)
+        self.assertEqual(self.panel.control_waits, {})
+        self.panel.executor.run_one()
+        self.panel.client.request.assert_called_once_with('/stop', {})
+
+    def test_late_background_response_cannot_overwrite_a_new_command_result(self):
+        self.panel.client = Mock()
+        self.panel.poll()
+        generation = self.panel.command_generation
+        self.panel.request('/stop', {})
+        self.panel.data = {'execution': {'state': 'IDLE', 'running': False}}
+        self.panel.status_results.put((generation, self.panel.client,
+            {'execution': {'state': 'OPENING_SPOT', 'running': True}}, None))
+        self.root.after_cancel(self.panel.refresh_id)
+        self.panel.poll()
+        self.assertFalse(self.panel.data['execution']['running'])
+
+    def test_halt_explains_exact_cause_instead_of_generic_risk(self):
+        self.panel.data = {'error': 'Текущий цикл остановлен из-за риска.', 'execution': {'running': False,
+            'state': 'HALTED', 'cycle': {'halt_reason': 'Nado: неподтверждённая цена исполнения.'}}}
+        self.panel.render()
+        message = self.panel.message.cget('text')
+        self.assertIn('Nado: неподтверждённая цена', message)
+        self.assertNotIn('из-за риска', message)
+        self.assertNotIn('устраните', message)
 
     def key_form(self, venue='nado'):
         self.root.deiconify()

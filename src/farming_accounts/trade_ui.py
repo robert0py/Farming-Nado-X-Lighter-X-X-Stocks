@@ -20,6 +20,8 @@ STATE_NAMES = {'NOT_CONFIGURED': 'Настройте доступ и страт�
 
 
 def cycle_label(cycle):
+    if cycle.get('outcome') == 'MANUAL_CLOSE':
+        return 'Продажа вручную учтена'
     if cycle.get('state') == 'CLOSED' and cycle.get('outcome') == 'REJECTED':
         return 'Ордер отклонён'
     if cycle.get('state') == 'CLOSED' and cycle.get('hedged_at') is None:
@@ -61,6 +63,10 @@ def execution_step(data):
     if state == 'WAITING_API':
         return title, ('Биржа временно не отвечает. Задача сохранена: восстанавливаем связь и проверяем прежний ордер. '
                        + cycle.get('message', ''))
+    if state == 'HALTED':
+        reason = cycle.get('halt_reason') or cycle.get('message') or data.get('error') or 'Биржи ещё не подтвердили результат прежнего ордера.'
+        return 'Торговля приостановлена', ('Причина: ' + reason + ' Повторный запуск сначала проверяет прежние ордера и позиции на биржах; '
+                                        'новые покупки до подтверждения результата не отправляются.')
     return title, cycle.get('message') or execution.get('waiting_reason')
 
 
@@ -73,6 +79,11 @@ class TradingPanel:
         self.confirmed_strategy_revision = None
         self.busy, self.closed = False, False
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='worker-control')
+        self.status_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='worker-status')
+        self.status_results = queue.Queue()
+        self.status_pending = False
+        self.command_generation = 0
+        self.active_request = None
         self.results = queue.Queue()
         self.next_refresh = 0
         self.dialogs = []
@@ -84,6 +95,8 @@ class TradingPanel:
         worker.pack(fill='x')
         self.worker_label = label(worker, 'Процесс торговли не подключён', bold=True, size=12)
         self.worker_label.pack(side='left', padx=16, pady=15)
+        self.refresh_note = label(worker, '', color=MUTED, size=9)
+        self.refresh_note.pack(side='left', padx=4)
         for text, command in (('Этот ПК', self.connect_local), ('Подключить VPS', self.remote_dialog)):
             ttk.Button(worker, text=text, command=command).pack(side='right', padx=7, pady=9)
         accounts = tk.Frame(parent, bg=BG)
@@ -136,6 +149,7 @@ class TradingPanel:
         label(row, 'История циклов', size=14, bold=True).pack(side='left')
         self.button(row, 'Восстановить привязку ключа', lambda: self.request('/recover-registration', {})).pack(side='right')
         self.button(row, 'Выключить процесс', lambda: self.request('/shutdown', {}, callback=self.disconnected)).pack(side='right', padx=6)
+        self.button(row, 'Я закрыл позицию вручную', self.manual_close_dialog).pack(side='right', padx=6)
         columns = ('asset', 'state', 'started', 'deadline', 'residual')
         self.table = ttk.Treeview(history, columns=columns, show='headings', height=4)
         for key, title in zip(columns, ('Актив', 'Состояние', 'Начало', 'Закрытие по таймеру', 'Остаточная экспозиция')):
@@ -158,6 +172,7 @@ class TradingPanel:
                 on_error('Дождитесь завершения текущего запроса и повторите действие.')
             return
         self.busy = True
+        self.command_generation += 1
         self.render_buttons()
         def run():
             try:
@@ -174,16 +189,18 @@ class TradingPanel:
             if on_error:
                 on_error('Сначала подключите процесс торговли кнопкой «Этот ПК».')
             return
-        if path in ('/stop', '/close', '/shutdown') and self.busy:
-            if path not in self.control_waits and path != self.active_control:
+        request_key = path + (':' + str(value.get('venue')) if isinstance(value, dict) and value.get('venue') else '')
+        if self.busy:
+            if request_key not in self.control_waits and request_key != self.active_request:
                 def pending():
-                    self.control_waits.pop(path, None)
+                    self.control_waits.pop(request_key, None)
                     if not self.closed and self.client is not None:
                         self.request(path, value, callback, on_error)
-                self.control_waits[path] = self.app.root.after(100, pending)
-                self.message.configure(text='Команда остановки принята интерфейсом. Дожидаюсь ответа процесса; команда не потеряется.')
+                self.control_waits[request_key] = self.app.root.after(100, pending)
+                self.message.configure(text='Действие принято. Выполню после текущей команды; повторно нажимать не нужно.')
                 self.render_buttons()
             return
+        self.active_request = request_key
         if path in ('/stop', '/close', '/shutdown'):
             self.active_control = path
         if path == '/start':
@@ -206,6 +223,7 @@ class TradingPanel:
         self.work(connect, connected)
 
     def disconnected(self, result):
+        self.command_generation += 1
         self.client = None
         for timer in self.control_waits.values():
             self.app.root.after_cancel(timer)
@@ -274,6 +292,38 @@ class TradingPanel:
         from .strategy_ui import StrategyDialog
         return StrategyDialog(self)
 
+    def manual_close_dialog(self):
+        from .app import label, MUTED
+        def previewed(result):
+            preview = result['preview']
+            dialog, content = self.dialog('Ручное закрытие · проверка по биржам', 790, 420)
+            label(content, 'Отдельная продажа подтверждена в Nado', bold=True, size=14).pack(anchor='w')
+            label(content, f"Продано отдельными ордерами: {preview['sold']} {preview['symbol']}.\n"
+                  f"На Nado осталось: {preview['remaining']} {preview['symbol']}. На Lighter нет позиции и ордеров этого актива.\n\n"
+                  f"Остаток меньше минимальной суммы заявки Nado ({preview['min_notional']} USDT0). "
+                  'Он останется у вас вне следующих хеджей. Бот не будет продавать его или открывать на него short. '
+                  'Следующие покупки и их хедж будут считаться отдельно. Новые сделки сейчас не отправляются.',
+                  color=MUTED, wraplength=735, justify='left', size=10).pack(fill='x', pady=14)
+            feedback = label(content, '', color=MUTED, wraplength=735, size=9, justify='left')
+            feedback.pack(fill='x')
+            def accepted(value):
+                self.data = value
+                self.render()
+                if dialog.winfo_exists():
+                    dialog.destroy()
+            def failed(error):
+                if dialog.winfo_exists():
+                    confirm.configure(state='normal')
+                    feedback.configure(text=error)
+            def confirm_sale():
+                confirm.configure(state='disabled')
+                feedback.configure(text='Повторно проверяем остатки перед сохранением…')
+                self.request('/manual-close', {'acknowledge_residual': True, 'cycle_id': preview['cycle_id'],
+                                             'normalized': preview['normalized']}, callback=accepted, on_error=failed)
+            confirm = ttk.Button(content, text='Учесть продажу · остаток оставить вне бота', command=confirm_sale, style='Primary.TButton')
+            confirm.pack(anchor='w', pady=10)
+        self.request('/manual-close', {'acknowledge_residual': False}, callback=previewed)
+
     def relink_nado(self):
         def ready(result):
             from .app import label, MUTED
@@ -301,7 +351,7 @@ class TradingPanel:
     def render_buttons(self):
         for button in self.buttons:
             control = button.control_path
-            enabled = self.client is not None and (not self.busy or control is not None)
+            enabled = self.client is not None
             if control and (control in self.control_waits or control == self.active_control):
                 enabled = False
             button.configure(state='normal' if enabled else 'disabled')
@@ -320,6 +370,10 @@ class TradingPanel:
             price_description = ('Nado: ближайший maker, на шаг ниже ask' if settings.get('nado_maker_price_mode') == 'closest_ask'
                                  else f"отступ Nado {settings.get('nado_maker_distance_percent', '0.02')}%")
             self.summary.configure(text=prefix + f"{', '.join(settings['assets'])} · покупка Nado до {settings['notional_per_leg']} USDT0 · удержание {settings['hold_seconds'] / 3600:g} ч · {price_description} · проверка через {settings.get('nado_maker_reprice_seconds', 90)} с")
+            residues = self.data.get('manual_residuals', [])
+            if residues:
+                text = '; '.join(f"{row['amount_at_acceptance']} {row['symbol']}" for row in residues)
+                self.summary.configure(text=self.summary.cget('text') + '\nУчтённые исходные остатки вне хеджей: ' + text)
         execution = self.data.get('execution', {})
         cycle = execution.get('cycle') or {}
         state = execution.get('state', 'NOT_CONFIGURED')
@@ -330,7 +384,8 @@ class TradingPanel:
         timer = (f'{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}' if seconds is not None
                  else 'после открытия обеих сторон' if state in ('OPENING_SPOT', 'OPENING_HEDGE') else '—')
         self.cycle_detail.configure(text=f"Nado spot: {cycle.get('spot_quantity', '—')} · Lighter: {cycle.get('perp_quantity', '—')} · остаточная экспозиция: {cycle.get('residual_notional', '—')} · осталось: {timer}")
-        self.pnl.configure(text=f"Оценка PnL: {cycle.get('pnl_quote', '—')} · без funding и курса USDT0/USDG")
+        pnl = cycle.get('pnl_quote')
+        self.pnl.configure(text=f"Оценка PnL: {pnl if pnl is not None else '—'} · без funding и курса USDT0/USDG")
         latest = {}
         for order in self.data.get('orders', ()):
             latest[order['venue']] = order
@@ -350,10 +405,14 @@ class TradingPanel:
                 else:
                     details.append(f"Расчёт этой заявки: середина стакана Nado {pricing['reference_midpoint']} USDT0 · выбранный отступ {pricing['distance_percent']}% · лимит {order['limit_price']}. Это цены на момент расчёта; текущий рынок может измениться.")
         self.order_detail.configure(text='\n'.join(details) if details else 'Ордеров текущей попытки нет.')
-        reason = self.data.get('error') or progress
+        reason = progress if state == 'HALTED' else self.data.get('error') or progress
         if state == 'PAUSED':
-            reason = 'Процесс выключен. Позиции на биржах сохраняются. Нажмите «Этот ПК», затем выберите запуск или закрытие прежнего хеджа.'
-        if state == 'CLOSED' and cycle.get('hedged_at') is None and not self.data.get('error'):
+            reason = 'Торговый процесс выключен. Ордера и позиции на биржах сохраняются; журнал прежнего цикла сохранён. Новые торговые запросы не отправляются.'
+            if cycle.get('halt_reason') and cycle.get('state') in ('HALTED', 'RECOVERY'):
+                reason += ' Последняя причина остановки: ' + cycle['halt_reason']
+        if state == 'CLOSED' and cycle.get('outcome') == 'MANUAL_CLOSE':
+            reason = cycle.get('message')
+        elif state == 'CLOSED' and cycle.get('hedged_at') is None and not self.data.get('error'):
             reason = ('Ордер отклонён площадкой. ' + cycle.get('message', '') if cycle.get('outcome') == 'REJECTED'
                       else 'Хедж не был открыт; удержание не запускалось. ' + cycle.get('message', '')
                       if cycle.get('outcome') else 'Хедж не был открыт; удержание не запускалось.')
@@ -373,6 +432,21 @@ class TradingPanel:
             return
         while True:
             try:
+                generation, client, result, error = self.status_results.get_nowait()
+            except queue.Empty:
+                break
+            self.status_pending = False
+            if generation != self.command_generation or client is not self.client:
+                continue
+            self.next_refresh = time.monotonic() + 5
+            if error:
+                self.refresh_note.configure(text='Обновление задержано · повторю автоматически')
+            elif isinstance(result, dict) and 'execution' in result:
+                self.data = result
+                self.refresh_note.configure(text='Биржи обрабатывают запрос · кнопки доступны' if result.get('refreshing') else '')
+                self.render()
+        while True:
+            try:
                 item = self.results.get_nowait()
                 result, error, callback = item[:3]
                 on_error = item[3] if len(item) > 3 else None
@@ -380,6 +454,7 @@ class TradingPanel:
                 break
             self.busy = False
             self.active_control = None
+            self.active_request = None
             if error:
                 self.message.configure(text=error)
                 self.app.log('Торговля', error, error=True)
@@ -411,9 +486,17 @@ class TradingPanel:
                 self.message.configure(text=error)
             is_status = isinstance(result, dict) and 'execution' in result
             self.next_refresh = time.monotonic() + (5 if error or self.client is None or is_status else 0)
-        if self.client is not None and not self.busy and time.monotonic() >= self.next_refresh:
+        if self.client is not None and not self.busy and not self.status_pending and time.monotonic() >= self.next_refresh:
             self.next_refresh = time.monotonic() + 5
-            self.work(lambda: self.client.request('/status'))
+            self.status_pending = True
+            generation, client = self.command_generation, self.client
+            def refresh():
+                try:
+                    result, error = client.request('/status'), None
+                except Exception:
+                    result, error = None, True
+                self.status_results.put((generation, client, result, error))
+            self.status_executor.submit(refresh)
         self.refresh_id = self.app.root.after(200, self.poll)
 
     def close(self):
@@ -426,3 +509,4 @@ class TradingPanel:
             if dialog.winfo_exists():
                 getattr(dialog, 'close_handler', dialog.destroy)()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self.status_executor.shutdown(wait=False, cancel_futures=True)

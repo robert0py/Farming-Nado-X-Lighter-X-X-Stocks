@@ -72,6 +72,70 @@ class NoFillStream(FakeStream):
 
 
 class MakerTests(unittest.TestCase):
+    def manual_sale_fixture(self):
+        self.gateway.submit(self.intent)
+        order = self.transport.pending
+        self.transport.rows = [{'digest': order['digest'], 'subaccount': SENDER, 'product_id': 117,
+            'nonce': str(self.intent.nonce), 'amount': raw(1), 'base_filled': raw(1),
+            'price_x18': raw(104), 'expiration': str(self.intent.expiry), 'appendix': '1537',
+            'quote_filled': raw(-104), 'fee': raw(0), 'submission_idx': '7', 'last_fill_submission_idx': '7',
+            'last_fill_timestamp': str(NOW), 'post_balance': {'base': {'spot': {'product_id': 117, 'balance': {'amount': raw(1)}}}}}]
+        self.transport.orders = []
+        self.transport.base = D('.01')
+        self.gateway.clock = lambda: NOW + 1000
+        external = {'digest': '0x' + 'ef' * 32, 'order': {'sender': SENDER, 'amount': raw('-.99')},
+                    'isolated': False, 'base_filled': raw('-.99'), 'submission_idx': '8',
+                    'post_balance': {'base': {'spot': {'product_id': 117, 'balance': {'amount': raw('.01')}}}}}
+        self.transport.recent_matches = lambda *args: {'matches': [external]}
+        original_event = self.transport.archive_event
+        def event(sender, product_id, idx):
+            if int(idx) == 7:
+                return original_event(sender, product_id, idx)
+            return {'events': [{'subaccount': SENDER, 'product_id': 117, 'submission_idx': '8', 'isolated': False,
+                'event_type': 'match_orders', 'product': {'spot': {'product_id': 117, 'state': {'cumulative_deposits_multiplier_x18': str(10**18)}}},
+                'pre_balance': {'spot': {'product_id': 117, 'balance': {'amount': raw(1)}}},
+                'post_balance': {'spot': {'product_id': 117, 'balance': {'amount': raw('.01')}}}}]}
+        self.transport.archive_event = event
+        return external
+
+    def test_manual_sale_replays_external_event_and_never_sends_orders(self):
+        self.manual_sale_fixture()
+        count = len([call for call in self.transport.calls if call[0] == 'execute'])
+        observed, snapshot, proof = self.gateway.manual_close_proof(self.intent)
+        self.assertEqual(observed.filled_quantity, D(1))
+        self.assertEqual(snapshot['amount'], '0.01')
+        self.assertEqual(proof['sold'], '0.99')
+        self.assertEqual(proof['indices'], [8])
+        self.assertEqual(len([call for call in self.transport.calls if call[0] == 'execute']), count)
+
+    def test_manual_sale_rejects_another_account_and_changed_balance(self):
+        external = self.manual_sale_fixture()
+        self.transport.base = D('.02')
+        with self.assertRaises(TradingError):
+            self.gateway.manual_close_proof(self.intent)
+        self.transport.base = D('.01')
+        external['order']['sender'] = '0x' + 'ee' * 32
+        with self.assertRaises(TradingError):
+            self.gateway.manual_close_proof(self.intent)
+
+    def test_read_only_lookup_cannot_cancel_a_live_maker(self):
+        self.gateway.submit(self.intent)
+        self.gateway.clock = lambda: NOW + 100
+        self.assertIsNone(self.gateway.lookup(self.intent, read_only=True))
+        self.assertEqual(self.cancels(), [])
+
+    def test_maker_submission_does_not_wait_for_an_unused_twenty_second_stream(self):
+        from unittest.mock import patch
+        with patch.object(NoFillStream, 'collect', side_effect=AssertionError('Unused maker wait')):
+            self.assertEqual(self.gateway.submit(self.intent).status, 'PENDING')
+
+    def test_manual_baseline_is_bound_to_same_sender_and_exact_principal(self):
+        self.journal.set('manual-baseline:117', {'sender': SENDER, 'normalized': '10'})
+        self.assertTrue(self.gateway.accepts_manual_baseline(self.intent.instrument, {'normalized': '10'}))
+        self.assertFalse(self.gateway.accepts_manual_baseline(self.intent.instrument, {'normalized': '11'}))
+        self.journal.set('manual-baseline:117', {'sender': 'other', 'normalized': '10'})
+        self.assertFalse(self.gateway.accepts_manual_baseline(self.intent.instrument, {'normalized': '10'}))
+
     def test_configured_percent_reaches_signed_initial_and_replacement_orders(self):
         self.check_signed_prices('distance', '599.40', '609.39')
 
@@ -393,6 +457,16 @@ class MakerTests(unittest.TestCase):
     def test_archived_fill_cannot_exceed_saved_limit_price(self):
         self.partial_cancel_with_archive()
         self.transport.rows[0]['quote_filled'] = raw('-42.4')
+        with self.assertRaises(UnknownExecution):
+            self.gateway.lookup(self.intent)
+
+    def test_one_quote_wei_rounding_does_not_hide_a_confirmed_maker_fill(self):
+        self.partial_cancel_with_archive()
+        row = self.transport.rows[0]
+        row['quote_filled'] = str(int(row['quote_filled']) - 1)
+        result = self.gateway.lookup(self.intent)
+        self.assertEqual((result.status, result.filled_quantity, result.average_price), ('CANCELLED', D('.4'), D(104)))
+        row['quote_filled'] = str(int(row['quote_filled']) - 1)
         with self.assertRaises(UnknownExecution):
             self.gateway.lookup(self.intent)
 

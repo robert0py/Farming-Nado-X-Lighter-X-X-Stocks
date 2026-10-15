@@ -279,6 +279,10 @@ class NadoTransport:
                             'product_ids': [product_id], 'idx': str(idx), 'limit': {'raw': 1}, 'desc': True,
                             'isolated': False}})
 
+    def recent_matches(self, sender, product_id):
+        return self._request('/archive/v1', body={'matches': {'subaccounts': [sender],
+                             'product_ids': [product_id], 'limit': 100, 'isolated': False}})
+
     def execute(self, payload):
         if len(payload) != 1 or next(iter(payload)) not in {"place_order", "link_signer", "cancel_orders"}:
             raise TradingError("Разрешены только ордера, их отмена и привязка signer Nado.")
@@ -756,7 +760,10 @@ class NadoGateway:
                 return OrderObservation(intent.client_id, "REJECTED", Decimal(0), exchange_id=digest)
             if result.get("status") != "success" or _obj(result.get("data")).get("digest") != digest:
                 raise UnknownExecution("Nado не подтвердил digest ордера. Повторная отправка запрещена.")
-            observation = stream.collect(intent, digest)
+            # Maker finality is proved below by the durable order/archive path.
+            # Its stream result was never used, so a 20-second collect only
+            # blocked worker commands and deferred the first status update.
+            observation = None if intent.post_only else stream.collect(intent, digest)
             if observation is not None and not intent.post_only:
                 expected = baseline + observation.filled_quantity * (1 if intent.side == "buy" else -1)
                 if self.position(intent.instrument) != expected or self.open_orders(intent.instrument):
@@ -968,7 +975,7 @@ class NadoGateway:
             'normalized': str(baseline)})
         return OrderObservation(intent.client_id, 'EXPIRED', Decimal(0), exchange_id=digest)
 
-    def lookup(self, intent):
+    def lookup(self, intent, *, read_only=False):
         message, _, digest = self._order(intent)
         record = self.journal.get('maker:' + intent.client_id) if intent.post_only and self.journal else None
         if record and record['digest'] != digest:
@@ -976,6 +983,8 @@ class NadoGateway:
         if record:
             live = self.open_orders(intent.instrument)
             if digest in live:
+                if read_only:
+                    return None
                 if any(other != digest for other in live):
                     raise UnknownExecution('На рынке Nado есть посторонние ордера. Требуется сверка.')
                 actual_snapshot = self.capture_position(intent.instrument)
@@ -1049,12 +1058,25 @@ class NadoGateway:
             raise UnknownExecution("Nado не подтвердил достоверное исполнение ордера.")
         # Indexer quote_filled includes fees; fees remain a separate cost in the
         # journal. Removing them recovers the execution price of the signed order.
-        gross_quote = quote + fee
+        with localcontext() as context:
+            context.prec = 96
+            gross_quote = quote + fee
         if gross_quote == 0 or (gross_quote < 0) != (intent.side == 'buy'):
             raise UnknownExecution('Nado не подтвердил торговую стоимость без комиссии.')
-        average = abs(gross_quote) / filled
-        if average <= 0 or (intent.side == 'buy' and average > intent.limit_price) or (intent.side == 'sell' and average < intent.limit_price):
-            raise UnknownExecution('История Nado показывает цену вне сохранённого лимита.')
+        with localcontext() as context:
+            context.prec = 96
+            cost = abs(gross_quote)
+            limit_cost = filled * intent.limit_price
+            # Fixed-point quote and fee accounting can differ by one quote wei.
+            # Bound the TOTAL quote discrepancy, never by a price tick or %.
+            adverse = cost - limit_cost if intent.side == 'buy' else limit_cost - cost
+            average = cost / filled
+            if average <= 0 or adverse > Decimal('1e-18'):
+                raise UnknownExecution(f'Nado: цена исполнения {average} USDT0 не соответствует лимиту '
+                                       f'{intent.limit_price} для {intent.quantity} {intent.instrument.symbol}. '
+                                       'Подтверждение покупки приостановлено; встречный ордер пока не отправлен.')
+            if adverse > 0:
+                average = intent.limit_price
         # Complete filled quantity is proof even after a missed stream/restart.
         # Partial history is terminal only if its archived balance has caught up
         # to the current account and the IOC is no longer on the matching engine.
@@ -1067,8 +1089,15 @@ class NadoGateway:
         post_amount = _x18(_obj(spot.get("balance")).get("amount"))
         if intent.post_only:
             proof = self._balance_proof(intent, item, record, filled)
-            if proof is None or self.capture_position(intent.instrument)['normalized'] != proof['after']:
+            current = self.capture_position(intent.instrument)
+            if proof is None or current['normalized'] != proof['after']:
+                message = (f'Nado подтвердил исполнение {filled} {intent.instrument.symbol}, '
+                           f'текущий остаток аккаунта {format(Decimal(current["amount"]), ".12g")} {intent.instrument.symbol}. '
+                           'Результат сделки и текущий баланс пока не согласованы: проверяем историю; '
+                           'Lighter на прежний объём не открывается.')
+                self.journal.set('reconciliation:' + intent.client_id, {'message': message, 'checked_at': self.clock()})
                 return OrderObservation(intent.client_id, 'PENDING', filled, average, fee, digest, filled_at)
+            self.journal.set('reconciliation:' + intent.client_id, None)
             if record.get('cancel_state') == 'CONFIRMED' and Decimal(record['filled']) != filled:
                 if filled > Decimal(record['filled']):
                     raise UnknownExecution('История Nado противоречит подтверждённой отмене.')
@@ -1083,3 +1112,83 @@ class NadoGateway:
             return OrderObservation(intent.client_id, "PENDING", filled, average, fee, digest, filled_at)
         return OrderObservation(intent.client_id, "FILLED" if filled == intent.quantity else "CANCELLED",
                                 filled, average, fee, digest, filled_at)
+
+    def manual_close_proof(self, intent):
+        """Prove a full owned buy followed only by external sells; no writes."""
+        if not intent.post_only or intent.side != 'buy' or intent.reduce_only or self.clock() < intent.expiry + 5:
+            raise TradingError('Прежний ордер ещё может исполняться. Проверка ручного закрытия доступна после его окончания.')
+        if self.open_orders(intent.instrument):
+            raise TradingError('На Nado есть активные ордера этого актива. Ручное закрытие пока не подтверждено.')
+        observed = self.lookup(intent, read_only=True)
+        if observed is None or observed.filled_quantity != intent.quantity:
+            raise TradingError('Архив Nado ещё не подтвердил полное исполнение прежней покупки.')
+        record = self.journal.get('maker:' + intent.client_id)
+        own = _list(self.transport.archive_orders(record['digest']).get('orders'))
+        proof = self.journal.get('balanceproof:' + intent.client_id)
+        if len(own) != 1 or not proof:
+            raise TradingError('Нужен подтверждённый индексированный результат покупки Nado.')
+        last = _integer(own[0].get('last_fill_submission_idx'))
+        rows = _list(self.transport.recent_matches(self.sender, intent.instrument.id).get('matches'))
+        if len(rows) >= 100:
+            raise TradingError('История после покупки слишком длинная для автоматической сверки ручного закрытия.')
+        rows = sorted((row for row in rows if _integer(row.get('submission_idx')) > last),
+                      key=lambda row: _integer(row['submission_idx']))
+        if not rows:
+            raise TradingError('После покупки бота в истории Nado не найдена отдельная продажа.')
+        previous, sold, seen = int(proof['after']), 0, set()
+        for row in rows:
+            idx = _integer(row['submission_idx'])
+            order = _obj(row.get('order'))
+            delta = _integer(row.get('base_filled'), minimum=-(2**127), maximum=-1)
+            if (idx in seen or row.get('digest') == record['digest'] or row.get('isolated') is not False or
+                    str(order.get('sender', '')).lower() != self.sender or
+                    _integer(order.get('amount'), minimum=-(2**127), maximum=-1) > delta):
+                raise TradingError('История Nado не подтверждает отдельную продажу этого аккаунта.')
+            seen.add(idx)
+            events = _list(self.transport.archive_event(self.sender, intent.instrument.id, idx).get('events'))
+            if len(events) != 1:
+                raise TradingError('Снимок баланса отдельной продажи ещё недоступен.')
+            event = _obj(events[0])
+            product = _obj(_obj(event.get('product')).get('spot'))
+            if (event.get('event_type') != 'match_orders' or event.get('isolated') is not False or
+                    _integer(event.get('submission_idx')) != idx or _integer(event.get('product_id')) != intent.instrument.id or
+                    str(event.get('subaccount', '')).lower() != self.sender or
+                    _integer(product.get('product_id')) != intent.instrument.id):
+                raise TradingError('Снимок отдельной продажи относится к другой операции.')
+            multiplier = _integer(_obj(product.get('state')).get('cumulative_deposits_multiplier_x18'), minimum=10**18)
+            amounts = []
+            for field in ('pre_balance', 'post_balance'):
+                spot = _obj(_obj(event.get(field)).get('spot'))
+                if _integer(spot.get('product_id')) != intent.instrument.id:
+                    raise TradingError('Продукт баланса отдельной продажи не совпал.')
+                amounts.append(_integer(_obj(spot.get('balance')).get('amount'), maximum=2**127-1))
+            pre, post = amounts
+            if pre != previous * multiplier // 10**18 or pre + delta < 0:
+                raise TradingError('Между покупкой и продажей есть другие изменения баланса. Автоматическая сверка остановлена.')
+            previous = (pre + delta) * 10**18 // multiplier
+            match_post = _obj(_obj(_obj(row.get('post_balance')).get('base')).get('spot'))
+            if (post != previous * multiplier // 10**18 or _integer(match_post.get('product_id')) != intent.instrument.id or
+                    _integer(_obj(match_post.get('balance')).get('amount'), maximum=2**127-1) != post):
+                raise TradingError('Биржа ещё не согласовала результат отдельной продажи.')
+            sold -= delta
+        snapshot = self.capture_position(intent.instrument)
+        if self.open_orders(intent.instrument) or snapshot['normalized'] != str(previous):
+            raise TradingError('Текущий баланс Nado изменился после истории продажи. Проверим снова без новых ордеров.')
+        return observed, snapshot, {'sender': self.sender, 'product_id': intent.instrument.id,
+                                   'sold': str(Decimal(sold) / X18), 'indices': sorted(seen)}
+
+    def accepts_manual_baseline(self, instrument, snapshot):
+        saved = self.journal.get('manual-baseline:' + str(instrument.id)) if self.journal else None
+        return bool(saved and saved.get('sender') == self.sender and
+                    saved.get('normalized') == snapshot.get('normalized'))
+
+    def advance_manual_baseline(self, cycle):
+        orders = self.journal.orders(cycle['id'])
+        intent = next((intent for _, intent, _ in orders if intent.venue == VENUE), None)
+        if intent is None:
+            return
+        key = 'manual-baseline:' + str(intent.instrument.id)
+        saved = self.journal.get(key)
+        if saved and saved.get('sender') == self.sender:
+            saved['normalized'] = str(self._expected_principal(intent.instrument, cycle.get('spot_account_baseline'), orders))
+            self.journal.set(key, saved)

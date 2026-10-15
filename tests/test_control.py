@@ -16,6 +16,44 @@ from farming_accounts.trading.domain import TradingError
 
 
 class ControlTests(unittest.TestCase):
+    def test_manual_close_preview_and_acknowledgement_are_distinct_commands(self):
+        helper = Mock()
+        helper.reconcile_manual_close.return_value = {'cycle_id': 'saved', 'normalized': '10', 'remaining': '.01'}
+        with patch.object(self.runtime, 'build_engine', return_value=helper):
+            result = self.client.request('/manual-close', {'acknowledge_residual': False})
+            self.assertEqual(result['preview']['remaining'], '.01')
+            helper.reconcile_manual_close.assert_called_once_with(acknowledge=False, cycle_id=None, normalized=None)
+            self.client.request('/manual-close', {'acknowledge_residual': True, 'cycle_id': 'saved', 'normalized': '10'})
+            self.assertEqual(helper.reconcile_manual_close.call_args.kwargs,
+                             {'acknowledge': True, 'cycle_id': 'saved', 'normalized': '10'})
+
+    def test_status_retains_original_halt_cause_after_key_restoration_message(self):
+        cycle = {'id': 'old', 'state': 'HALTED', 'message': 'Nado: конкретная ошибка исполнения'}
+        self.runtime.journal.save_cycle(cycle, message=cycle['message'])
+        cycle['message'] = 'Доступ восстановлен'
+        self.runtime.journal.save_cycle(cycle)
+        self.assertEqual(self.client.request('/status')['execution']['cycle']['halt_reason'], 'Nado: конкретная ошибка исполнения')
+
+    def test_status_remains_available_while_exchange_operation_holds_runtime_lock(self):
+        self.runtime.status()
+        entered, release = threading.Event(), threading.Event()
+        def exchange_operation():
+            with self.runtime.lock:
+                entered.set()
+                release.wait(3)
+        thread = threading.Thread(target=exchange_operation)
+        thread.start()
+        self.assertTrue(entered.wait(1))
+        try:
+            started = time.monotonic()
+            status = self.client.request('/status')
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertTrue(status['refreshing'])
+            self.assertIn('status_age_seconds', status)
+        finally:
+            release.set()
+            thread.join()
+
     def test_strategy_response_reads_back_exact_persisted_distance_and_revision(self):
         value = {'mode': 'automatic', 'assets': ['SPY', 'QQQ'], 'notional_per_leg': '110',
             'nado_maker_distance_percent': '0.1', 'nado_maker_reprice_seconds': 100,
