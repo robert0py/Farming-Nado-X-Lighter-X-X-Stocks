@@ -5,11 +5,18 @@ import re
 import time
 
 from .models import wallet_address, account_index, nado_subaccount, AccountError
-from .trading.domain import Strategy, TradingError, CRYPTO_SYMBOLS
+from .trading.domain import Strategy, TradingError, CRYPTO_SYMBOLS, ETF_SYMBOLS
 
 
 DECIMAL_FIELDS = ('notional_per_leg', 'max_slippage_bps', 'residual_notional', 'margin_reserve', 'max_loss_quote', 'nado_maker_distance_percent')
 INTEGER_FIELDS = ('max_unhedged_seconds', 'quote_max_age_seconds', 'hold_seconds', 'nado_maker_reprice_seconds')
+
+
+def validate_current_assets(value):
+    unsupported = set(value.get('assets', ())) - CRYPTO_SYMBOLS - ETF_SYMBOLS
+    if unsupported:
+        raise TradingError('Прежние акции убраны из новых циклов: ' + ', '.join(sorted(unsupported)) +
+                           '. Откройте настройки стратегии, выберите криптовалюты, SPY или QQQ и сохраните список. История и восстановление прежнего хеджа сохранены.')
 
 
 def lighter_registration_inputs(value: dict) -> dict:

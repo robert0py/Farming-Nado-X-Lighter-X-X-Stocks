@@ -14,7 +14,7 @@ from farming_accounts.trading.journal import Journal
 from farming_accounts.trading.markets import matched_markets
 from farming_accounts.trading.nado import NadoGateway, perp_instruments
 from farming_accounts.trading.lighter import LighterVenue, LighterCredentials
-from farming_accounts.trade_config import strategy
+from farming_accounts.trade_config import strategy, validate_current_assets
 from test_markets import metadata
 from test_engine import TestClock, GatewayFixture
 from test_nado_trading import FakeTransport, FakeSigner, FakeStream, OWNER, SENDER, NOW, raw
@@ -50,6 +50,13 @@ class CryptoCatalogTests(unittest.TestCase):
                                hold_seconds=43200, alternate_crypto_direction=True))
         self.assertTrue(result.alternate_crypto_direction)
         self.assertEqual(result.points_verified_assets, ())
+
+    def test_old_stock_settings_cannot_start_new_cycles_but_still_decode_for_recovery(self):
+        value = dict(mode='automatic', assets=['AAPL', 'NVDA'], notional_per_leg='110', hold_seconds=43200)
+        self.assertEqual(strategy(value).assets, ('AAPL', 'NVDA'))
+        with self.assertRaisesRegex(TradingError, 'Прежние акции'):
+            validate_current_assets(value)
+        validate_current_assets(dict(assets=['BTC', 'ETH', 'SPY', 'QQQ']))
 
     def test_short_maker_price_is_above_bid_and_refresh_is_symmetric(self):
         item = Instrument('nado', 'BTC', 2, 'BTC-PERP', 'perp', D('.001'), D('.01'), D(0), D(100), D(1))

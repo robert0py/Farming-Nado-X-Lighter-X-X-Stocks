@@ -15,7 +15,7 @@ import time
 
 from . import __version__
 from .models import AccountError, nado_subaccount
-from .trade_config import credentials, public_credentials, strategy, canonical_strategy
+from .trade_config import credentials, public_credentials, strategy, canonical_strategy, validate_current_assets
 from .trading.domain import TradingError
 from .trading.journal import Journal, encoded
 from .vault import Vault, VaultError, state_directory
@@ -302,6 +302,7 @@ class Runtime:
         if route == '/strategy':
             settings = canonical_strategy(value['strategy'])
             strategy(settings)
+            validate_current_assets(settings)
             if not config.get('nado') or not config.get('lighter'):
                 raise TradingError('Сначала настройте оба торговых аккаунта.')
             if settings.get('points_evidence'):
@@ -440,6 +441,7 @@ class Runtime:
     def check_points(self):
         config = self.config()
         strategy(config.get('strategy', {}))
+        validate_current_assets(config['strategy'])
         # Ordinary hedges do not depend on a rewards campaign or its enrollment.
 
     def wallet(self, token, signature=None):
@@ -487,7 +489,8 @@ class Runtime:
                     engine = self.build_engine()
                     try:
                         self.check_points()
-                    except TradingError:
+                    except TradingError as error:
+                        self.error = str(error)
                         if self.journal.get('running', False):
                             engine.stop_new_cycles()
                     engine.tick()
