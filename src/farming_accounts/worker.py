@@ -304,8 +304,9 @@ class Runtime:
             strategy(settings)
             if not config.get('nado') or not config.get('lighter'):
                 raise TradingError('Сначала настройте оба торговых аккаунта.')
-            settings['points_evidence']['owner'] = config['nado']['owner']
-            settings['points_evidence']['subaccount'] = config['nado']['subaccount']
+            if settings.get('points_evidence'):
+                settings['points_evidence']['owner'] = config['nado']['owner']
+                settings['points_evidence']['subaccount'] = config['nado']['subaccount']
             config['strategy'] = settings
             self.save_config(config)
             saved = self.config()
@@ -439,10 +440,7 @@ class Runtime:
     def check_points(self):
         config = self.config()
         strategy(config.get('strategy', {}))
-        proof = config['strategy']['points_evidence']
-        owner = config.get('nado', {})
-        if proof.get('owner') != owner.get('owner') or proof.get('subaccount') != owner.get('subaccount'):
-            raise TradingError('Подтверждение xPoints относится к другому аккаунту. Обновите настройки стратегии.')
+        # Ordinary hedges do not depend on a rewards campaign or its enrollment.
 
     def wallet(self, token, signature=None):
         with self.lock:
@@ -473,7 +471,9 @@ class Runtime:
 
     def tick_loop(self):
         while not self.stopped.is_set():
-            self.wakeup.wait(10)
+            cycle = self.journal.active_cycle()
+            active_execution = cycle and cycle.get('state') in ('OPENING_SPOT', 'OPENING_HEDGE', 'RECOVERY', 'CLOSING')
+            self.wakeup.wait(1 if active_execution else 10)
             self.wakeup.clear()
             if self.stopped.is_set():
                 break

@@ -6,6 +6,7 @@
 - Persist order intent before submission, reconcile uncertain executions without blind write retries, and prevent new cycles while exposure is unresolved. No automatic trading until explicit strategy start in the app.
 - No server exists yet. Deliver an independently running local worker and Linux deployment package; do not claim VPS deployment before it exists.
 - Research API changes using official Nado and Lighter Robinhood Chain documentation. Do not substitute Lighter Core.
+- Current strategy universe (owner update 2026-10-16): top five common active crypto perpetuals ranked by Robinhood Lighter 24h quote volume, plus SPY/QQQ spot Nado vs perpetual Lighter. Preserve old stock history/recovery. Crypto cycles may alternate Nado long/Lighter short and Nado short/Lighter long after a completed cycle; spot must never be shorted. Ordinary hedging is independent of points eligibility; do not promise API trades earn a 2x multiplier.
 - Use `find-skills` from vercel-labs/skills and skills.sh to find appropriate skills as work evolves.
 - After every coherent code change, immediately commit and push it to this private repository. Never commit credentials, wallet private keys, account configuration, real balance snapshots, or logs.
 - Desktop delivery uses the Windows GitHub Actions workflow: every completed code push to main must pass tests and publish a private desktop release. Check the workflow result and repair failures.

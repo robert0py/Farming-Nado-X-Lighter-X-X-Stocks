@@ -8,15 +8,15 @@ from tkinter import ttk
 import webbrowser
 
 from .trade_config import strategy
-from .trading.domain import TradingError
+from .trading.domain import TradingError, CRYPTO_SYMBOLS
 
 
 POINTS_URL = 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado'
 PRICE_MODES = {'Ближе к исполнению · maker': 'closest_ask', 'Процентный отступ · maker': 'distance'}
 BASIC_FIELDS = ('notional_per_leg', 'hold_hours', 'nado_maker_distance_percent', 'nado_maker_reprice_seconds')
 FIELDS = (
-    ('notional_per_leg', 'Сумма покупки на Nado, USDT0',
-     'Укажите свой бюджет одной spot-покупки на Nado. На Lighter бот рассчитает short на сопоставимое количество того же базового актива с учётом множителей и округления. Стоимость short может отличаться. Минимумы бирж показаны у активов; ещё нужны резерв и полное обеспечение short на Lighter.'),
+    ('notional_per_leg', 'Размер позиции Nado, USDT0',
+     'Полный размер экспозиции, а не сумма маржи с плечом. Крипта открывается фьючерсом; SPY/QQQ — покупкой spot. Lighter хеджирует фактический объём противоположной стороной. Обеим биржам нужно полное обеспечение экспозиции плюс резерв; минимумы показаны у активов.'),
     ('nado_maker_distance_percent', 'Отступ от середины стакана, % (процентный режим)',
      'Введите процент напрямую: 0,1 означает 0,1%, а не 10%. Покупка рассчитывается ниже середины стакана Nado (между bid и ask). При цене 600 и расстоянии 0,1% лимит — 599,40. Можно указать 0%: цена будет в середине стакана с округлением по шагу биржи и сохранением maker post-only. Близкая заявка сохраняет очередь; перестановка нужна только при большем расстоянии.'),
     ('nado_maker_reprice_seconds', 'Через сколько секунд проверять лимитку',
@@ -134,11 +134,11 @@ class StrategyDialog:
         inner = tk.Frame(content, bg=PANEL)
         inner.pack(fill='both', expand=True, padx=22, pady=18)
         label(inner, 'Какие активы чередовать между циклами', bold=True, size=15).pack(anchor='w')
-        label(inner, 'Выберите минимум два. В каждом цикле бот покупает один актив на Nado и открывает short на этот же актив на Lighter. Следующий цикл — другой выбранный актив.',
+        label(inner, 'Выберите минимум два. Крипта: фьючерсы Nado ↔ Lighter, направления чередуются после завершения цикла. SPY/QQQ: только покупка spot Nado ↔ short Lighter. Следующий цикл — другой выбранный актив.',
               wraplength=840, justify='left', anchor='w', size=10, color=MUTED).pack(fill='x', pady=(7, 12))
         toolbar = tk.Frame(inner, bg=PANEL)
         toolbar.pack(fill='x')
-        self.catalog_status = label(toolbar, 'Проверяю spot xStocks и Robinhood Lighter…', color=MUTED, size=9)
+        self.catalog_status = label(toolbar, 'Проверяю общие криптофьючерсы, SPY и QQQ…', color=MUTED, size=9)
         self.catalog_status.pack(side='left')
         self.refresh_button = ttk.Button(toolbar, text='Обновить рынки', command=self.refresh)
         self.refresh_button.pack(side='right')
@@ -147,9 +147,15 @@ class StrategyDialog:
 
         first = inner.winfo_children()[0]
         label(inner, 'Сумма и время одного цикла', bold=True, size=14).pack(anchor='w', before=first)
-        label(inner, 'Nado: лимитная покупка post-only. Ближайший maker ставит цену на шаг ниже лучшей продажи; если рынок изменился, обновление — после подтверждённой отмены. При сдвиге рынка post-only защищает от taker-исполнения. Lighter открывается только на подтверждённый объём покупки.',
+        label(inner, 'Nado: лимитный maker post-only. Покупка — ниже лучшей продажи, продажа — выше лучшей покупки. Lighter: встречный рыночный IOC с пределом проскальзывания, только на подтверждённый объём исполнения Nado. Неполное исполнение сначала сверяется; повтор неизвестного ордера запрещён.',
               color=MUTED, size=9, wraplength=840, anchor='w', justify='left').pack(fill='x', pady=(5, 8), before=first)
         saved = panel.data.get('strategy') or {}
+        self.alternate = tk.BooleanVar(dialog, value=saved.get('alternate_crypto_direction', True))
+        self.original_alternate = self.alternate.get()
+        tk.Checkbutton(inner, text='Чередовать направления криптохеджа: Nado long / Lighter short, затем наоборот',
+                       variable=self.alternate, command=self.update_actions, bg=PANEL, fg=INK,
+                       activebackground=PANEL, activeforeground=INK, selectcolor=PANEL,
+                       wraplength=820, anchor='w', justify='left').pack(fill='x', pady=8, before=first)
         self.original_price_mode = next((title for title, code in PRICE_MODES.items()
                                         if code == saved.get('nado_maker_price_mode', 'closest_ask')), next(iter(PRICE_MODES)))
         label(inner, 'Как ставить лимитную покупку Nado', size=10).pack(anchor='w', before=first)
@@ -197,14 +203,14 @@ class StrategyDialog:
         self.original_inputs = {key: entry.get() for key, entry in self.entries.items()}
         self.saved_distance = str(saved.get('nado_maker_distance_percent', '0.02')) if saved else None
         self.saved_price_mode = saved.get('nado_maker_price_mode', 'distance') if saved else None
-        label(inner, 'Подтверждение программы xPoints', bold=True, size=13).pack(anchor='w', pady=(15, 7))
+        label(inner, 'xPoints для SPY/QQQ · необязательная отметка', bold=True, size=13).pack(anchor='w', pady=(15, 7))
         self.verified = tk.BooleanVar(dialog, value=False)
         self.points_check = tk.Checkbutton(footer, text='Я проверил участие аккаунта и выбранных spot xStocks в действующей программе xPoints',
                                           variable=self.verified, command=self.update_actions, bg=PANEL, fg=INK,
                                           activebackground=PANEL, activeforeground=INK, selectcolor=FIELD,
                                           wraplength=820, justify='left', anchor='w')
         self.points_check.pack(fill='x', before=self.status, pady=(0, 6))
-        label(inner, 'Наличие пары в API подтверждает рынки, но не право на поинты. Проверьте условия и участие аккаунта по ссылке.',
+        label(inner, 'Для обычного хеджирования эта отметка не нужна. Наличие пары или кошелька не гарантирует поинты либо множитель 2×, в том числе для API-ордеров.',
               color=MUTED, size=9, wraplength=840, justify='left', anchor='w').pack(fill='x', pady=6)
         ttk.Button(inner, text='Открыть правила xPoints', command=lambda: webbrowser.open(POINTS_URL)).pack(anchor='w', pady=6)
         self.refresh()
@@ -229,7 +235,7 @@ class StrategyDialog:
         return bool(self.window.winfo_exists())
 
     def update_actions(self):
-        enabled = self.ready and not self.pending and sum(var.get() for var in self.selected.values()) >= 2 and self.verified.get()
+        enabled = self.ready and not self.pending and sum(var.get() for var in self.selected.values()) >= 2
         self.save_button.configure(state='normal' if enabled else 'disabled')
         self.discard_button.configure(state='disabled' if self.saving else 'normal')
         self.refresh_button.configure(state='disabled' if self.pending else 'normal')
@@ -245,7 +251,7 @@ class StrategyDialog:
         self.entries['nado_maker_distance_percent'].configure(state='disabled' if self.pending or closest else 'normal')
         current = self.entries['nado_maker_distance_percent'].get().strip()
         state = 'Есть несохранённые изменения.' if self.is_dirty() else 'Нет несохранённых изменений.'
-        required = ' Для сохранения отметьте подтверждение xPoints ниже.' if not self.verified.get() else ''
+        required = ''
         saved = f'Сохранённый отступ: {self.saved_distance}%.' if self.saved_distance is not None else 'Стратегия ещё не сохранена.'
         if self.saved_price_mode == 'closest_ask':
             saved = 'Сохранённый режим: ближайший maker.'
@@ -254,13 +260,14 @@ class StrategyDialog:
 
     def is_dirty(self):
         return (any(entry.get() != self.original_inputs.get(key, '') for key, entry in self.entries.items())
+                or self.alternate.get() != self.original_alternate
                 or self.price_mode.get() != self.original_price_mode
                 or self.ready and self.chosen_assets() != self.original_assets or self.advanced.get())
 
     def selection_changed(self):
         self.verified.set(False)
         count = sum(var.get() for var in self.selected.values())
-        self.status.configure(text=f'Выбрано активов: {count}. Нужно минимум два; затем подтвердите участие в xPoints.')
+        self.status.configure(text=f'Выбрано активов: {count}. Нужно минимум два. Для криптофьючерсов подтверждение xPoints не требуется.')
         self.update_actions()
 
     def send(self, path, value, callback):
@@ -329,10 +336,12 @@ class StrategyDialog:
             minimum = tk.Frame(frame, bg=PANEL)
             minimum.pack(fill='x', padx=(24, 0))
             HelpIcon(minimum, f"{row['nado_symbol']} · Nado ID {row['nado_id']} ↔ {row['lighter_symbol']} · Lighter ID {row['lighter_id']}. Минимальная стоимость ордера из текущего API: Nado — {row['nado_min_notional']} USDT0; Lighter — {row['lighter_min_notional']} USDG. Перед стартом бот также проверяет округления, комиссии, цены и обеспечение. ID берутся из API автоматически.").pack(side='right')
-            label(minimum, f"{row['status']}\nМинимум: {row['nado_min_notional']} USDT0 / {row['lighter_min_notional']} USDG",
+            kind = 'Фьючерс ↔ фьючерс · long/short' if row.get('nado_kind') == 'perp' else 'Spot ↔ фьючерс · только покупка Nado'
+            volume = f"\nОбъём Lighter за 24 ч: {Decimal(row['volume_24h']):,.0f} USDG" if row.get('volume_24h') is not None else ''
+            label(minimum, f"{kind}\n{row['status']}\nМинимум: {row['nado_min_notional']} USDT0 / {row['lighter_min_notional']} USDG{volume}",
                   color=MUTED, size=9, justify='left', anchor='w', wraplength=345).pack(side='left', fill='x', expand=True)
         self.ready = True
-        self.catalog_status.configure(text=f'Пары из API: {len(markets)} · обновлено {stamp}')
+        self.catalog_status.configure(text=f'Топ-5 крипты по объёму Lighter за 24 ч + SPY/QQQ · {stamp}')
         self.selection_changed()
         unavailable = set(self.saved_assets) - {row['asset'] for row in markets if row['can_select']}
         if unavailable:
@@ -355,6 +364,7 @@ class StrategyDialog:
             self.status.configure(text='Выбран недоступный рынок. Обновите список и выберите подходящие активы.')
             return
         value = {'mode': 'manual' if self.advanced.get() else 'automatic', 'nado_post_only': True, 'preserve_spot_dust': True,
+                 'alternate_crypto_direction': self.alternate.get(),
                  'nado_maker_price_mode': PRICE_MODES.get(self.price_mode.get(), '')}
         for key, title, _ in FIELDS:
             if not self.advanced.get() and key not in BASIC_FIELDS:

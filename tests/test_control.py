@@ -316,8 +316,7 @@ class ControlTests(unittest.TestCase):
                     'max_unhedged_seconds': 60, 'quote_max_age_seconds': 10,
                     'points_evidence': {'url': 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado',
                                         'confirmed_at': time.time() - 90000, 'account_enrolled': False, 'assets': ['SPY', 'QQQ']}}
-        with self.assertRaises(TradingError):
-            strategy(settings)
+        self.assertEqual(strategy(settings).assets, ('SPY', 'QQQ'), 'Ordinary hedges do not require points enrollment')
         with self.assertRaises(TradingError):
             credentials('lighter', {'wallet_address': '0x' + '22' * 20, 'account_index': 1, 'api_key_index': 157}, require_key=False)
         settings['points_evidence']['account_enrolled'] = True

@@ -107,11 +107,12 @@ class Strategy:
     nado_maker_distance_percent: Decimal = Decimal('0.02')
     nado_maker_reprice_seconds: int = 90
     nado_maker_price_mode: str = 'distance'
+    alternate_crypto_direction: bool = False
 
     def validate(self) -> None:
         if self.nado_maker_price_mode not in ('distance', 'closest_ask'):
             raise TradingError('Выберите режим цены Nado: ближайший maker или процентный отступ.')
-        if any(not isinstance(value, bool) for value in (self.nado_post_only, self.preserve_spot_dust)):
+        if any(not isinstance(value, bool) for value in (self.nado_post_only, self.preserve_spot_dust, self.alternate_crypto_direction)):
             raise TradingError('Некорректный режим исполнения стратегии.')
         if self.nado_maker_price_mode == 'closest_ask' and not self.nado_post_only:
             raise TradingError('Ближайший maker требует включённый Nado post-only.')
@@ -133,8 +134,7 @@ class Strategy:
         if any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in
                (self.max_unhedged_seconds, self.quote_max_age_seconds, self.hold_seconds)):
             raise TradingError("Таймеры должны быть положительным числом секунд.")
-        if not set(self.assets).issubset(self.points_verified_assets):
-            raise TradingError("Подтвердите действующее участие каждого актива в xPoints.")
+        # Rewards eligibility is separate from ordinary hedge authorization.
 
 
 def quantize(value: Decimal, step: Decimal, *, upward: bool = False) -> Decimal:
@@ -150,32 +150,40 @@ def _maker_midpoint(book: Book) -> Decimal:
     return (book.bid + book.ask) / 2
 
 
+CRYPTO_SYMBOLS = frozenset({'BTC', 'ETH', 'SOL', 'HYPE', 'LIT', 'ZEC', 'XRP', 'NEAR', 'SUI', 'VVV', 'CASHCAT', 'PONS', 'USELESS', 'AI', 'ANSEM'})
+ETF_SYMBOLS = frozenset({'SPY', 'QQQ'})
+
+
 def maker_opening_price(instrument: Instrument, book: Book, distance_percent: Decimal = Decimal('0.02'),
-                        *, mode: str = 'distance') -> Decimal:
+                        *, mode: str = 'distance', side: str = 'buy') -> Decimal:
     with localcontext() as context:
         context.prec = 96
         if not distance_percent.is_finite() or not 0 <= distance_percent < 100:
             raise TradingError('Некорректное расстояние maker-заявки Nado.')
         midpoint = _maker_midpoint(book)
+        if side not in ('buy', 'sell'):
+            raise TradingError('Неизвестная сторона maker-ордера.')
         if mode == 'closest_ask':
             if book.bid >= book.ask:
                 raise TradingError('Стакан Nado пересечён: ожидаем корректные цены.')
             # Greatest valid tick strictly below ask, including non-aligned ask.
-            price = quantize(book.ask, instrument.price_tick, upward=True) - instrument.price_tick
+            price = (quantize(book.ask, instrument.price_tick, upward=True) - instrument.price_tick if side == 'buy'
+                     else quantize(book.bid, instrument.price_tick) + instrument.price_tick)
         elif mode == 'distance':
-            price = quantize(midpoint * (1 - distance_percent / 100), instrument.price_tick)
+            price = quantize(midpoint * (1 - distance_percent / 100 if side == 'buy' else 1 + distance_percent / 100),
+                             instrument.price_tick, upward=side == 'sell')
         else:
             raise TradingError('Неизвестный режим цены maker-заявки Nado.')
-        if price <= 0 or price >= book.ask:
+        if price <= 0 or (price >= book.ask if side == 'buy' else price <= book.bid):
             raise TradingError('Шаг цены не позволяет выставить maker-покупку Nado.')
         return price
 
 
 def maker_price_needs_refresh(instrument: Instrument, book: Book, current_price: Decimal,
-                             distance_percent: Decimal = Decimal('0.02'), *, mode: str = 'distance') -> bool:
+                             distance_percent: Decimal = Decimal('0.02'), *, mode: str = 'distance', side: str = 'buy') -> bool:
     with localcontext() as context:
         context.prec = 96
-        target = maker_opening_price(instrument, book, distance_percent, mode=mode)
+        target = maker_opening_price(instrument, book, distance_percent, mode=mode, side=side)
         if mode == 'closest_ask':
             return target != current_price
         midpoint = _maker_midpoint(book)

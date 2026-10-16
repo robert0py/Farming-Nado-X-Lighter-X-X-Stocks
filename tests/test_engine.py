@@ -827,10 +827,10 @@ class EngineTests(unittest.TestCase):
             self.engine.start()
         self.assertEqual(self.nado.requests, [])
 
-    def test_points_confirmation_is_required(self):
+    def test_ordinary_hedge_does_not_require_rewards_enrollment(self):
         self.engine.strategy = replace(self.strategy, points_verified_assets=())
-        with self.assertRaises(TradingError):
-            self.engine.start()
+        self.engine.start()
+        self.assertTrue(self.engine.status()['running'])
 
     def test_margin_reserve_breach_closes_and_stops(self):
         self.hedge()

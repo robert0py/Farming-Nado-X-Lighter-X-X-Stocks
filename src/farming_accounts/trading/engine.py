@@ -34,7 +34,7 @@ class Engine:
         raise TradingError("Неизвестная торговая площадка.")
 
     def _pairs(self) -> dict[str, tuple[Instrument, Instrument]]:
-        spot = {i.underlying: i for i in self.nado.instruments() if i.kind == "spot"}
+        spot = {i.underlying: i for i in self.nado.instruments() if i.kind in ('spot', 'perp')}
         perp = {i.underlying: i for i in self.lighter.instruments() if i.kind == "perp"}
         return {asset: (spot[asset], perp[asset]) for asset in spot.keys() & perp.keys()}
 
@@ -63,10 +63,10 @@ class Engine:
             raise TradingError('Nado не подтвердила снимок индексированного spot-баланса. Открытие запрещено.')
         spot = Decimal(snapshot['amount']) if snapshot is not None else self.nado.position(pair[0])
         dust_limit = min(Decimal('0.1'), strategy.notional_per_leg * Decimal('0.001'))
-        dust = (strategy.preserve_spot_dust and 0 <= spot < pair[0].quantity_step and
+        dust = (pair[0].kind == 'spot' and strategy.preserve_spot_dust and 0 <= spot < pair[0].quantity_step and
                 spot * books[0].ask <= dust_limit)
         accepted = getattr(self.nado, 'accepts_manual_baseline', None)
-        manual = bool(snapshot and accepted and accepted(pair[0], snapshot) and
+        manual = bool(pair[0].kind == 'spot' and snapshot and accepted and accepted(pair[0], snapshot) and
                       0 <= spot * books[0].ask < pair[0].min_notional)
         if (spot != 0 and not (dust or manual) or self.lighter.position(pair[1]) != 0 or
                 self.nado.open_orders(pair[0]) or self.lighter.open_orders(pair[1])):
@@ -159,7 +159,7 @@ class Engine:
                     if not all(i.tradable for i in pair):
                         raise TradingError("Новое открытие сейчас запрещено площадкой.")
                     baseline, _ = self._baseline(pair, books, self.strategy)
-                    target = self._opening_size(pair[0], books[0], self.strategy)
+                    target = self._opening_size(pair[0], books[0], self.strategy, self._direction(pair[0]))
                     underlying = target * pair[0].multiplier
                     hedge = quantize(underlying / pair[1].multiplier, pair[1].quantity_step)
                     if hedge < pair[1].min_qty or hedge * books[1].bid < pair[1].min_notional:
@@ -240,9 +240,15 @@ class Engine:
         cycle["state"], cycle["message"], cycle["updated_at"] = state, message, self.clock()
         self.journal.save_cycle(cycle, message=message if changed else "", time=self.clock())
 
-    def _opening_size(self, instrument: Instrument, book: Book, strategy: Strategy) -> Decimal:
+    def _direction(self, instrument):
+        if instrument.kind != 'perp' or not self.strategy.alternate_crypto_direction:
+            return 1
+        return -int(self.journal.get('last_crypto_direction', -1))
+
+    def _opening_size(self, instrument: Instrument, book: Book, strategy: Strategy, direction=1) -> Decimal:
         maker = strategy.nado_post_only
-        cap = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent, mode=strategy.nado_maker_price_mode) if maker else
+        cap = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent, mode=strategy.nado_maker_price_mode,
+                                  side='buy' if direction > 0 else 'sell') if maker else
                quantize(book.ask * (1 + strategy.max_slippage_bps / 10000), instrument.price_tick))
         if (not maker and cap < book.ask) or cap <= 0:
             raise TradingError("Ценовой шаг не позволяет соблюсти установленное проскальзывание.")
@@ -272,7 +278,8 @@ class Engine:
             try:
                 books = [self._book(i, self.strategy) for i in pair]
                 baseline, baseline_snapshot = self._baseline(pair, books, self.strategy)
-                target = self._opening_size(pair[0], books[0], self.strategy)
+                direction = self._direction(pair[0])
+                target = self._opening_size(pair[0], books[0], self.strategy, direction)
                 underlying = target * pair[0].multiplier
                 hedge_size = quantize(underlying / pair[1].multiplier, pair[1].quantity_step)
                 if hedge_size < pair[1].min_qty or hedge_size * books[1].bid < pair[1].min_notional:
@@ -285,6 +292,7 @@ class Engine:
                         self.lighter.available() < required_margin + self.strategy.margin_reserve):
                     raise TradingError("Недостаточно свободных средств для обеих экспозиций с заданным резервом.")
                 cycle = {"id": uuid.uuid4().hex, "asset": asset, "state": "OPENING_SPOT",
+                         'direction': direction, 'nado_kind': pair[0].kind,
                          "spot_id": pair[0].id, "perp_id": pair[1].id, "target_spot": str(target),
                          "spot_baseline": str(baseline),
                          "spot_account_baseline": baseline_snapshot,
@@ -372,6 +380,8 @@ class Engine:
         return code if isinstance(code, int) else None, value.get('reason') or 'Площадка отклонила ордер без исполнения.'
 
     def _closed(self, cycle: dict, outcome: str, message: str) -> None:
+        if outcome == 'COMPLETED' and cycle.get('nado_kind') == 'perp' and cycle.get('hedged_at') is not None:
+            self.journal.set('last_crypto_direction', cycle.get('direction', 1))
         if outcome in ('COMPLETED', 'UNWOUND'):
             advance = getattr(self.nado, 'advance_manual_baseline', None)
             if advance:
@@ -421,7 +431,8 @@ class Engine:
         factor = strategy.max_slippage_bps / 10000
         maker = instrument.venue.casefold() == 'nado' and strategy.nado_post_only
         if maker:
-            limit = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent, mode=strategy.nado_maker_price_mode) if side == 'buy' and not reduce_only else
+            limit = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent, mode=strategy.nado_maker_price_mode,
+                                         side=side) if not reduce_only else
                      quantize(book.bid if side == 'buy' else book.ask, instrument.price_tick, upward=side == 'sell'))
         else:
             limit = quantize(book.ask * (1 + factor), instrument.price_tick) if side == "buy" else quantize(
@@ -444,14 +455,14 @@ class Engine:
                              cycle["id"], instrument.venue, instrument, side, quantity, limit, reduce_only,
                              (receive_until * 1000 << 20) | sequence, expiry, post_only=maker)
         self.journal.put_intent(intent, action)
-        if maker and side == 'buy' and not reduce_only:
+        if maker and not reduce_only:
             midpoint = (book.bid + book.ask) / 2
             self.journal.set('pricing:' + intent.client_id, {
-                'price_mode': strategy.nado_maker_price_mode, 'reference_ask': str(book.ask),
+                'price_mode': strategy.nado_maker_price_mode, 'side': side, 'reference_ask': str(book.ask), 'reference_bid': str(book.bid),
                 'price_tick': str(instrument.price_tick),
                 'reference_midpoint': str(midpoint), 'reference_timestamp': book.timestamp,
                 'distance_percent': str(strategy.nado_maker_distance_percent),
-                'actual_distance_percent': str((midpoint - limit) / midpoint * 100)})
+                'actual_distance_percent': str(abs(midpoint - limit) / midpoint * 100)})
         cycle["attempts"] += 1
         self.journal.save_cycle(cycle)
         try:
@@ -497,7 +508,8 @@ class Engine:
                 value = observation.filled_quantity * observation.average_price
                 cash += value if intent.side == "sell" else -value
                 cash -= observation.fee
-        return cash + spot_quantity * spot_book.bid + perp_quantity * perp_book.ask
+        return (cash + spot_quantity * (spot_book.bid if spot_quantity >= 0 else spot_book.ask)
+                + perp_quantity * (perp_book.bid if perp_quantity >= 0 else perp_book.ask))
 
     def tick(self) -> dict:
         with self._mutex, localcontext() as context:
@@ -528,7 +540,10 @@ class Engine:
                 # A crash may occur between intent insertion and updating the cycle cache.
                 cycle["attempts"] = len(self.journal.orders(cycle["id"]))
                 spot_quantity, perp_quantity = self._quantities(cycle)
-                if spot_quantity < 0 or perp_quantity > 0:
+                direction = cycle.get('direction', 1)
+                if direction not in (1, -1) or direction == -1 and spot.kind != 'perp':
+                    raise TradingError('Неверное сохранённое направление хеджа.')
+                if spot_quantity * direction < 0 or perp_quantity * direction > 0:
                     raise TradingError("Нарушено направление позиций хеджа.")
                 matcher = getattr(self.nado, 'position_matches', None)
                 spot_matches = (matcher(spot, cycle.get('spot_account_baseline'), self.journal.orders(cycle['id']))
@@ -560,7 +575,7 @@ class Engine:
                         correcting_orders.append(intent)
                 if len(correcting_orders) > 16:
                     raise TradingError("Превышен предел корректирующих ордеров; автоматическое исполнение остановлено.")
-                hedged = spot_quantity > 0 and perp_quantity < 0 and residual_quote <= strategy.residual_notional
+                hedged = spot_quantity * direction > 0 and perp_quantity * direction < 0 and residual_quote <= strategy.residual_notional
                 if hedged and cycle["deadline"] is None:
                     completed_at = self.journal.completion_time(cycle["id"])
                     cycle["hedged_at"] = completed_at if completed_at is not None else self.clock()
@@ -568,7 +583,8 @@ class Engine:
                     self.journal.save_cycle(cycle)
                 available = self.lighter.available()
                 loss_limit = pnl <= -strategy.max_loss_quote
-                low_margin = available < strategy.margin_reserve
+                nado_available = self.nado.available() if spot.kind == 'perp' else None
+                low_margin = available < strategy.margin_reserve or (nado_available is not None and nado_available < strategy.margin_reserve)
                 risk_close = loss_limit or low_margin
                 if risk_close:
                     self.journal.set("running", False)
@@ -579,10 +595,12 @@ class Engine:
                     self._closed(cycle, 'NOT_OPENED', "Открытие остановлено до отправки ордеров.")
                     return self.status()
                 if cycle["attempts"] == 0 and not closing:
-                    cycle['target_spot'] = str(self._opening_size(spot, spot_book, strategy))
-                    self._write(cycle, spot, spot_book, "buy", Decimal(cycle["target_spot"]), "open_spot", reduce_only=False)
+                    cycle['target_spot'] = str(self._opening_size(spot, spot_book, strategy, direction))
+                    self._write(cycle, spot, spot_book, 'buy' if direction > 0 else 'sell', Decimal(cycle["target_spot"]), "open_spot", reduce_only=False)
                     if cycle["state"] not in ('RECOVERY', 'CLOSED', 'HALTED'):
                         self._opening_result(cycle)
+                    if cycle['state'] == 'OPENING_HEDGE' and spot.kind == 'perp':
+                        return self.tick()
                     return self.status()
                 if spot_quantity == 0 and perp_quantity == 0 and cycle["attempts"]:
                     orders = self.journal.orders(cycle['id'])
@@ -594,8 +612,8 @@ class Engine:
                         else:
                             self._opening_result(cycle)
                             if cycle['state'] != 'CLOSED' and self.clock() >= cycle.get('next_opening_at', 0):
-                                cycle['target_spot'] = str(self._opening_size(spot, spot_book, strategy))
-                                self._write(cycle, spot, spot_book, 'buy', Decimal(cycle['target_spot']), 'open_spot', reduce_only=False)
+                                cycle['target_spot'] = str(self._opening_size(spot, spot_book, strategy, direction))
+                                self._write(cycle, spot, spot_book, 'buy' if direction > 0 else 'sell', Decimal(cycle['target_spot']), 'open_spot', reduce_only=False)
                                 if cycle['state'] not in ('RECOVERY', 'CLOSED', 'HALTED'):
                                     self._opening_result(cycle)
                         self.journal.set('close_requested', False)
@@ -615,13 +633,15 @@ class Engine:
                     reasons = []
                     if loss_limit:
                         reasons.append(f'Расчётный PnL {pnl} достиг порога убытка −{strategy.max_loss_quote}.')
-                    if low_margin:
+                    if available < strategy.margin_reserve:
                         reasons.append(f'Свободное обеспечение Lighter {available} USDG ниже резерва {strategy.margin_reserve} USDG.')
+                    if nado_available is not None and nado_available < strategy.margin_reserve:
+                        reasons.append(f'Свободное обеспечение Nado {nado_available} USDT0 ниже резерва {strategy.margin_reserve} USDT0.')
                     self._transition(cycle, "CLOSING", ' '.join(reasons) or cycle.get('message') or "Контролируемое закрытие обеих сторон.")
-                    if perp_quantity < 0:
-                        self._write(cycle, perp, perp_book, "buy", -perp_quantity, "close_perp", reduce_only=True)
-                    elif spot_quantity > 0:
-                        self._write(cycle, spot, spot_book, "sell", spot_quantity, "close_spot", reduce_only=True)
+                    if perp_quantity != 0:
+                        self._write(cycle, perp, perp_book, 'buy' if perp_quantity < 0 else 'sell', abs(perp_quantity), "close_perp", reduce_only=True)
+                    elif spot_quantity != 0:
+                        self._write(cycle, spot, spot_book, 'sell' if spot_quantity > 0 else 'buy', abs(spot_quantity), "close_spot", reduce_only=True)
                     elif cycle["attempts"] == 0:
                         self._closed(cycle, 'NOT_OPENED', "Открытие остановлено до отправки ордеров.")
                     return self.status()
@@ -641,14 +661,15 @@ class Engine:
                               if expired else 'Lighter подтвердил завершение встречного ордера без исполнения.')
                     self._transition(cycle, "CLOSING", reason + ' Закрываем подтверждённый остаток Nado.')
                     return self.status()
-                if residual > 0:
-                    hedge_quantity = quantize(residual / perp.multiplier, perp.quantity_step)
-                    if hedge_quantity < perp.min_qty or hedge_quantity * perp_book.bid < perp.min_notional:
+                if residual * direction > 0:
+                    hedge_quantity = quantize(abs(residual) / perp.multiplier, perp.quantity_step)
+                    hedge_price = perp_book.bid if direction > 0 else perp_book.ask
+                    if hedge_quantity < perp.min_qty or hedge_quantity * hedge_price < perp.min_notional:
                         self.journal.set("running", False)
                         self._transition(cycle, "CLOSING", "Частичное исполнение нельзя безопасно хеджировать; закрытие.")
                     else:
                         try:
-                            self._write(cycle, perp, perp_book, "sell", hedge_quantity, "open_perp", reduce_only=False)
+                            self._write(cycle, perp, perp_book, 'sell' if direction > 0 else 'buy', hedge_quantity, "open_perp", reduce_only=False)
                         except ReadUnavailable:
                             raise
                         except TradingError as error:
@@ -657,9 +678,9 @@ class Engine:
                             return self.status()
                         if cycle["state"] != "RECOVERY":
                             self._transition(cycle, "OPENING_HEDGE", "Подтверждение встречного исполнения.")
-                elif residual < 0:
-                    correction = quantize(-residual / perp.multiplier, perp.quantity_step)
-                    self._write(cycle, perp, perp_book, "buy", correction, "correct_perp", reduce_only=True)
+                elif residual * direction < 0:
+                    correction = quantize(abs(residual) / perp.multiplier, perp.quantity_step)
+                    self._write(cycle, perp, perp_book, 'buy' if direction > 0 else 'sell', correction, "correct_perp", reduce_only=True)
                 return self.status()
             except ReadUnavailable as error:
                 self._transition(cycle, 'WAITING_API', str(error) + ' Задача сохранена; повторяем чтение и сверку без дублирования ордеров.')

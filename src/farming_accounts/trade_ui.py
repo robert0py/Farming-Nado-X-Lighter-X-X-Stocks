@@ -15,7 +15,7 @@ from .vault import Vault, VaultError, state_directory
 STATE_NAMES = {'NOT_CONFIGURED': 'Настройте доступ и стратегию', 'IDLE': 'Остановлен', 'WAITING': 'Готовим ордер на Nado',
                'WAITING_API': 'Ожидание API · задача продолжается',
                'PAUSED': 'Процесс исполнения выключен',
-               'OPENING_SPOT': 'Выставляем лимитку на Nado', 'OPENING_HEDGE': 'Открываем short на Lighter', 'HEDGED': 'Хедж открыт · идёт удержание',
+               'OPENING_SPOT': 'Выставляем лимитку на Nado', 'OPENING_HEDGE': 'Открываем встречную позицию Lighter', 'HEDGED': 'Хедж открыт · идёт удержание',
                'CLOSING': 'Закрытие обеих сторон', 'CLOSED': 'Цикл завершён', 'RECOVERY': 'Сверка прежнего ордера', 'HALTED': 'Остановлено · нужна сверка'}
 
 
@@ -35,7 +35,19 @@ def execution_step(data):
     cycle = execution.get('cycle') or {}
     state = execution.get('state', 'NOT_CONFIGURED')
     title = cycle_label(cycle) if state == 'CLOSED' else STATE_NAMES.get(state, state)
+    if state == 'OPENING_HEDGE' and cycle.get('nado_kind') != 'perp':
+        title = 'Открываем short на Lighter'
     wait = (cycle.get('strategy') or data.get('strategy') or {}).get('nado_maker_reprice_seconds', 90)
+    if cycle.get('nado_kind') == 'perp' and state in ('OPENING_SPOT', 'OPENING_HEDGE', 'HEDGED', 'CLOSING'):
+        nado_side, lighter_side = ('long', 'short') if cycle.get('direction', 1) > 0 else ('short', 'long')
+        if state == 'OPENING_SPOT':
+            return 'Ожидаем maker-исполнение Nado', (f'Nado {nado_side}: лимитка post-only. Проверка цены через {wait} с после выставления. '
+                f'После подтверждения объёма открываем {lighter_side} Lighter рыночным IOC с ограничением цены. Таймер удержания ещё не начался.')
+        if state == 'OPENING_HEDGE':
+            return f'Открываем {lighter_side} Lighter', f'Nado {nado_side} подтверждён. Хеджируем фактически исполненное количество; ждём подтверждения Lighter.'
+        if state == 'HEDGED':
+            return title, f'Nado {nado_side} и Lighter {lighter_side} подтверждены. Идёт удержание до таймера. Funding двух площадок может различаться.'
+        return title, f'Закрываем {lighter_side} Lighter, затем {nado_side} Nado. Проверяем остатки обеих площадок. ' + cycle.get('message', '')
     if state == 'WAITING':
         return title, (execution.get('waiting_reason') or
             'Проверяем аккаунты, средства и рынок перед первой лимиткой Nado. '
@@ -101,7 +113,7 @@ class TradingPanel:
             ttk.Button(worker, text=text, command=command).pack(side='right', padx=7, pady=9)
         accounts = tk.Frame(parent, bg=BG)
         accounts.pack(fill='x', pady=(12, 0))
-        for index, (venue, title) in enumerate((('nado', 'Nado · spot xStocks'), ('lighter', 'Lighter · Robinhood Chain'))):
+        for index, (venue, title) in enumerate((('nado', 'Nado · криптофьючерсы / SPY / QQQ'), ('lighter', 'Lighter · Robinhood Chain'))):
             accounts.columnconfigure(index, weight=1, uniform='keys')
             card = tk.Frame(accounts, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
             card.grid(row=0, column=index, sticky='nsew', padx=(0, 6) if index == 0 else (6, 0))
@@ -367,9 +379,10 @@ class TradingPanel:
         if settings:
             prefix = ('Сохранено и подтверждено: ' if self.confirmed_strategy_revision is not None and
                       self.confirmed_strategy_revision == self.data.get('revision') else 'Сохранённая стратегия: ')
-            price_description = ('Nado: ближайший maker, на шаг ниже ask' if settings.get('nado_maker_price_mode') == 'closest_ask'
+            price_description = ('Nado: ближайший maker к встречной стороне стакана' if settings.get('nado_maker_price_mode') == 'closest_ask'
                                  else f"отступ Nado {settings.get('nado_maker_distance_percent', '0.02')}%")
-            self.summary.configure(text=prefix + f"{', '.join(settings['assets'])} · покупка Nado до {settings['notional_per_leg']} USDT0 · удержание {settings['hold_seconds'] / 3600:g} ч · {price_description} · проверка через {settings.get('nado_maker_reprice_seconds', 90)} с")
+            alternating = ' · направления крипты чередуются' if settings.get('alternate_crypto_direction') else ''
+            self.summary.configure(text=prefix + f"{', '.join(settings['assets'])} · размер Nado до {settings['notional_per_leg']} USDT0 · удержание {settings['hold_seconds'] / 3600:g} ч · {price_description} · проверка через {settings.get('nado_maker_reprice_seconds', 90)} с{alternating}")
             residues = self.data.get('manual_residuals', [])
             if residues:
                 text = '; '.join(f"{row['amount_at_acceptance']} {row['symbol']}" for row in residues)
@@ -383,7 +396,7 @@ class TradingPanel:
         seconds = max(0, int(deadline - time.time())) if deadline is not None else None
         timer = (f'{seconds // 3600:02d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}' if seconds is not None
                  else 'после открытия обеих сторон' if state in ('OPENING_SPOT', 'OPENING_HEDGE') else '—')
-        self.cycle_detail.configure(text=f"Nado spot: {cycle.get('spot_quantity', '—')} · Lighter: {cycle.get('perp_quantity', '—')} · остаточная экспозиция: {cycle.get('residual_notional', '—')} · осталось: {timer}")
+        self.cycle_detail.configure(text=f"Nado {'фьючерс' if cycle.get('nado_kind') == 'perp' else 'spot'}: {cycle.get('spot_quantity', '—')} · Lighter: {cycle.get('perp_quantity', '—')} · остаточная экспозиция: {cycle.get('residual_notional', '—')} · осталось: {timer}")
         pnl = cycle.get('pnl_quote')
         uncertain = state in ('HALTED', 'RECOVERY', 'WAITING_API') or state == 'PAUSED' and cycle.get('state') != 'CLOSED'
         if uncertain:

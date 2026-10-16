@@ -23,7 +23,7 @@ from urllib.request import Request, build_opener
 from ..models import AccountError, nado_subaccount, wallet_address
 from ..transport import MAX_RESPONSE, NoRedirects
 from .domain import (Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable,
-                     TradingError, UnknownExecution, maker_price_needs_refresh)
+                     TradingError, UnknownExecution, maker_price_needs_refresh, CRYPTO_SYMBOLS)
 
 X18 = Decimal(10**18)
 VENUE = "nado"
@@ -259,7 +259,7 @@ class NadoTransport:
         return _obj(result.get("data"))
 
     def symbols(self):
-        return self._request("/archive/v2/symbols", params={"product_type": "spot"})
+        return self._request("/archive/v2/symbols", params={})
 
     def archive_orders(self, digest):
         return self._request("/archive/v1", body={"orders": {"digests": [digest]}})
@@ -481,6 +481,34 @@ def spot_instruments(metadata, approved_assets):
     return tuple(result)
 
 
+def perp_instruments(metadata, approved_assets):
+    result = []
+    for key, item in _obj(metadata).items():
+        item = _obj(item)
+        if item.get('type') != 'perp' or not key.endswith('-PERP'):
+            continue
+        asset = key.removesuffix('-PERP')
+        if asset not in CRYPTO_SYMBOLS or asset not in approved_assets:
+            continue
+        if item.get('symbol') != key or item.get('isolated_only') is not False:
+            raise TradingError('Nado не подтвердил обычный cross-margin криптовалютный фьючерс.')
+        step, tick, minimum = [_x18(item.get(field)) for field in ('size_increment', 'price_increment_x18', 'min_size')]
+        status = item.get('trading_status')
+        if min(step, tick, minimum) <= 0 or status not in {'live', 'post_only', 'reduce_only', 'soft_reduce_only', 'not_tradable'}:
+            raise TradingError('Некорректные ограничения фьючерса Nado.')
+        hours = item.get('market_hours')
+        opened = hours is None or _obj(hours).get('is_open') is True
+        result.append(Instrument(VENUE, asset, _integer(item.get('product_id'), minimum=1), key, 'perp',
+                                 step, tick, Decimal(0), minimum, Decimal(1), status in ('live', 'post_only') and opened))
+    if len({i.id for i in result}) != len(result) or len({i.underlying for i in result}) != len(result):
+        raise TradingError('Неоднозначные фьючерсные рынки Nado.')
+    return tuple(result)
+
+
+def _units(value, instrument):
+    return _integer(value, minimum=-(2**127) if instrument.kind == 'perp' else 0, maximum=2**127-1)
+
+
 class NadoGateway:
     def __init__(self, owner, subaccount="default", private_key=None, approved_assets=(), *,
                  transport=None, signer=None, clock=time.time, stream_factory=NadoLifecycle, journal=None):
@@ -515,6 +543,14 @@ class NadoGateway:
 
     def capture_position(self, instrument):
         """Balance and interest index from one atomic subaccount-info response."""
+        if instrument.kind == 'perp' and instrument.venue == VENUE:
+            info = self.transport.query({'type': 'subaccount_info', 'subaccount': self.sender})
+            self._account(info)
+            rows = [r for r in _list(info.get('perp_balances')) if _integer(_obj(r).get('product_id')) == instrument.id]
+            if len(rows) > 1:
+                raise TradingError('Nado вернул неоднозначную фьючерсную позицию.')
+            amount = _x18(_obj(rows[0].get('balance')).get('amount')) if rows else Decimal(0)
+            return {'amount': str(amount), 'normalized': str(_scaled(amount)), 'multiplier': str(10**18)}
         if instrument.venue != VENUE or instrument.kind != 'spot':
             raise TradingError('Индекс процентов разрешён только для spot Nado.')
         info = self.transport.query({'type': 'subaccount_info', 'subaccount': self.sender})
@@ -531,6 +567,18 @@ class NadoGateway:
     def _expected_principal(self, instrument, baseline, orders):
         """Expected account principal from a continuous, proved cycle ledger."""
         baseline = _obj(baseline)
+        if instrument.kind == 'perp':
+            previous = _units(baseline.get('normalized'), instrument)
+            if _scaled(Decimal(baseline['amount'])) != previous:
+                raise UnknownExecution('Исходная фьючерсная позиция Nado противоречива.')
+            for _, intent, obs in orders:
+                if intent.venue != VENUE or intent.instrument.id != instrument.id or obs is None or obs.filled_quantity == 0:
+                    continue
+                proof = self.journal.get('balanceproof:' + intent.client_id) if self.journal else None
+                if not obs.terminal or not proof or proof.get('digest') != obs.exchange_id or Decimal(proof['filled']) != obs.filled_quantity or _units(proof['before'], instrument) != previous:
+                    raise UnknownExecution('Нет непрерывной сверки фьючерсных исполнений Nado.')
+                previous = _units(proof['after'], instrument)
+            return previous
         if any(field not in baseline for field in ('amount', 'multiplier', 'normalized')):
             raise UnknownExecution('Нет сохранённого исходного индекса процентов Nado.')
         try:
@@ -557,7 +605,7 @@ class NadoGateway:
         """Reconcile indexed principal against only this cycle's proved fills."""
         previous = self._expected_principal(instrument, baseline, orders)
         actual = self.capture_position(instrument)
-        return _integer(actual['normalized'], maximum=2**127 - 1) == previous
+        return _units(actual['normalized'], instrument) == previous
 
     def verify(self):
         linked = self.transport.query({"type": "linked_signer", "subaccount": self.sender})
@@ -585,11 +633,12 @@ class NadoGateway:
             raise TradingError("Не удалось проверить поток исполнений Nado. Торговля ещё не готова.") from None
 
     def instruments(self):
-        return spot_instruments(self.transport.symbols(), self.approved_assets)
+        metadata = self.transport.symbols()
+        return spot_instruments(metadata, self.approved_assets) + perp_instruments(metadata, self.approved_assets)
 
     def _instrument(self, instrument, *, closing=False):
-        if instrument.venue != VENUE or instrument.kind != "spot":
-            raise TradingError("Nado исполняет только разрешённые spot xStocks.")
+        if instrument.venue != VENUE or instrument.kind not in ('spot', 'perp'):
+            raise TradingError("Nado исполняет только разрешённые рынки стратегии.")
         found = next((i for i in self.instruments() if i.id == instrument.id), None)
         if found is None or replace(found, tradable=instrument.tradable) != instrument:
             raise TradingError("Рынок или exchange rate Nado изменились. Требуется новый расчёт хеджа.")
@@ -632,12 +681,21 @@ class NadoGateway:
         return Book(sides[0][0], sides[1][0], timestamp, sides[0][1], sides[1][1])
 
     def position(self, instrument):
+        if instrument.kind == 'perp':
+            return Decimal(self.capture_position(instrument)['amount'])
         if instrument.venue != VENUE or instrument.kind != "spot":
             raise TradingError("Запрос позиции Nado разрешён только для spot.")
         return self._account().get(instrument.id, Decimal(0))
 
     def available(self):
-        return self._account()[0]
+        info = self.transport.query({'type': 'subaccount_info', 'subaccount': self.sender})
+        quote = self._account(info)[0]
+        if info.get('perp_balances'):
+            healths = _list(info.get('healths'))
+            if len(healths) != 3:
+                raise TradingError('Nado не подтвердил доступное обеспечение фьючерсов.')
+            return min(quote, _x18(_obj(healths[0]).get('health')))
+        return quote
 
     def open_orders(self, instrument):
         data = self.transport.query({"type": "subaccount_orders", "sender": self.sender,
@@ -653,7 +711,7 @@ class NadoGateway:
         return tuple(result)
 
     def _order(self, intent):
-        if (intent.venue != VENUE or intent.instrument.kind != "spot" or intent.side not in {"buy", "sell"}
+        if (intent.venue != VENUE or intent.instrument.kind not in ('spot', 'perp') or intent.side not in {"buy", "sell"}
                 or intent.quantity <= 0 or intent.limit_price <= 0
                 or intent.quantity % intent.instrument.quantity_step != 0
                 or intent.limit_price % intent.instrument.price_tick != 0):
@@ -686,6 +744,21 @@ class NadoGateway:
             raise TradingError("Размер spot-ордера меньше текущего минимума Nado.")
         if self.open_orders(intent.instrument):
             raise TradingError("На рынке Nado уже есть открытые ордера. Нужна сверка.")
+        if intent.instrument.kind == 'perp':
+            snapshot = self.capture_position(intent.instrument)
+            position = Decimal(snapshot['amount'])
+            if intent.reduce_only:
+                if position == 0 or (position > 0) != (intent.side == 'sell') or intent.quantity > abs(position):
+                    raise TradingError('Закрытие Nado превышает фактическую фьючерсную позицию или имеет неверную сторону.')
+            elif position != 0 and (position > 0) != (intent.side == 'buy'):
+                raise TradingError('Нельзя открывать криптохедж поверх противоположной позиции Nado.')
+            maximum = self.transport.query({'type': 'max_order_size', 'sender': self.sender,
+                'product_id': intent.instrument.id, 'price_x18': str(_scaled(intent.limit_price)),
+                'direction': 'long' if intent.side == 'buy' else 'short', 'spot_leverage': 'false',
+                'reduce_only': str(intent.reduce_only and not intent.post_only).lower()})
+            if abs(_x18(maximum.get('max_order_size'))) < intent.quantity:
+                raise TradingError('Размер фьючерсной заявки превышает доступное обеспечение Nado.')
+            return snapshot
         balances = self._account()
         baseline = balances.get(intent.instrument.id, Decimal(0))
         if intent.side == "sell" and (not intent.reduce_only or intent.quantity > baseline):
@@ -737,7 +810,7 @@ class NadoGateway:
                     baseline_snapshot = self.capture_position(intent.instrument)
                     expected = self._expected_principal(intent.instrument, cycle.get('spot_account_baseline'),
                                                         self.journal.orders(intent.cycle_id))
-                    if _integer(baseline_snapshot['normalized'], maximum=2**127 - 1) != expected:
+                    if _units(baseline_snapshot['normalized'], intent.instrument) != expected:
                         raise TradingError('Spot-баланс Nado изменился вне ордеров бота. Новый ордер не отправлен.')
                     baseline = Decimal(baseline_snapshot['amount'])
                     self.journal.set('maker:' + intent.client_id, {'baseline': str(baseline), 'digest': digest,
@@ -825,6 +898,8 @@ class NadoGateway:
         the product state at a matching submission; matches identify our signed
         order and base delta. Both must agree before we anchor a terminal fill.
         """
+        if intent.instrument.kind == 'perp':
+            return self._perp_balance_proof(intent, item, record, filled)
         if record is None or record.get('baseline_normalized') is None:
             raise UnknownExecution('Нет исходного индексированного баланса maker-ордера Nado.')
         before = _integer(record['baseline_normalized'], maximum=2**127 - 1)
@@ -921,6 +996,82 @@ class NadoGateway:
         self.journal.set('balanceproof:' + intent.client_id, proof)
         return proof
 
+    def _perp_balance_proof(self, intent, item, record, filled):
+        """Prove signed base position through each matching-engine archive event.
+
+        Funding changes virtual quote balances, never the base position. No
+        deposit-interest inversion or spot rebasing is applied to perpetuals.
+        """
+        if not record or record.get('baseline_normalized') is None:
+            raise UnknownExecution('Нет исходной позиции maker-фьючерса Nado.')
+        cached = self.journal.get('balanceproof:' + intent.client_id)
+        if cached and cached.get('digest') == record['digest'] and Decimal(cached.get('filled', '-1')) == filled:
+            return cached
+        if item.get('last_fill_submission_idx') is None or item.get('submission_idx') is None:
+            return None
+        last, placed = _integer(item['last_fill_submission_idx']), _integer(item['submission_idx'])
+        if last < placed:
+            raise UnknownExecution('Противоречивые индексы фьючерсного исполнения Nado.')
+        matches, cursor = [], last
+        for _ in range(10):
+            rows = _list(_obj(self.transport.archive_matches(self.sender, intent.instrument.id, cursor)).get('matches'))
+            matches.extend(r for r in rows if _obj(r).get('digest') == record['digest'])
+            if not rows or len(rows) < 100:
+                break
+            oldest = min(_integer(_obj(r).get('submission_idx')) for r in rows)
+            if oldest <= placed:
+                break
+            cursor = oldest - 1
+        if not matches:
+            return None
+        message, _, _ = self._order(intent)
+        before = previous = _units(record['baseline_normalized'], intent.instrument)
+        total, seen = 0, set()
+        def amount(container):
+            balance = _obj(_obj(container).get('perp'))
+            if _integer(balance.get('product_id')) != intent.instrument.id:
+                raise UnknownExecution('Архив Nado содержит позицию другого фьючерса.')
+            return _units(_obj(balance.get('balance')).get('amount'), intent.instrument)
+        for match in sorted(matches, key=lambda r: _integer(r.get('submission_idx'))):
+            idx = _integer(match.get('submission_idx'))
+            order = _obj(match.get('order'))
+            if (idx in seen or not placed <= idx <= last or match.get('isolated') is not False or
+                str(order.get('sender', '')).lower() != self.sender or
+                any(_integer(order.get(k), minimum=-(2**127) if k in ('amount', 'priceX18') else 0) != v for k, v in message.items() if k != 'sender')):
+                raise UnknownExecution('Фьючерсное исполнение Nado не соответствует подписанной заявке.')
+            seen.add(idx)
+            delta = _units(match.get('base_filled'), intent.instrument)
+            if delta == 0 or (delta > 0) != (intent.side == 'buy'):
+                raise UnknownExecution('Неверное направление фьючерсного исполнения Nado.')
+            total += delta
+            if abs(total) > _scaled(filled):
+                raise UnknownExecution('Превышен подтверждённый объём фьючерсного исполнения.')
+            if _units(match.get('cumulative_base_filled'), intent.instrument) != total:
+                return None
+            events = _list(_obj(self.transport.archive_event(self.sender, intent.instrument.id, idx)).get('events'))
+            if not events:
+                return None
+            if len(events) != 1:
+                raise UnknownExecution('Неоднозначный снимок фьючерсного исполнения Nado.')
+            event = _obj(events[0])
+            if _integer(event.get('submission_idx')) < idx:
+                return None
+            if (_integer(event.get('submission_idx')) != idx or _integer(event.get('product_id')) != intent.instrument.id or
+                str(event.get('subaccount', '')).lower() != self.sender or event.get('event_type') != 'match_orders' or
+                event.get('isolated') is not False or _integer(_obj(_obj(event.get('product')).get('perp')).get('product_id')) != intent.instrument.id):
+                raise UnknownExecution('Снимок Nado относится к другой фьючерсной операции.')
+            pre, post = amount(event.get('pre_balance')), amount(event.get('post_balance'))
+            if pre != previous or post != pre + delta or amount(_obj(match.get('post_balance')).get('base')) != post:
+                raise UnknownExecution('Фьючерсная позиция Nado изменилась вне ордеров бота.')
+            previous = post
+        if abs(total) != _scaled(filled):
+            return None
+        if max(seen) != last or amount(_obj(item.get('post_balance')).get('base')) != previous:
+            raise UnknownExecution('Последний снимок фьючерсной позиции Nado не согласован.')
+        proof = {'before': str(before), 'after': str(previous), 'filled': str(filled), 'digest': record['digest']}
+        self.journal.set('balanceproof:' + intent.client_id, proof)
+        return proof
+
     def _expired_unfilled(self, intent, digest, record):
         """Prove zero from signed expiry, covered history AND unchanged principal.
 
@@ -938,7 +1089,7 @@ class NadoGateway:
         for _, saved, observation in self.journal.orders(intent.cycle_id):
             if saved.client_id == intent.client_id and observation and observation.filled_quantity > 0:
                 return None
-        baseline = _integer(record['baseline_normalized'], maximum=2**127 - 1)
+        baseline = _units(record['baseline_normalized'], intent.instrument)
         if self.open_orders(intent.instrument) or int(self.capture_position(intent.instrument)['normalized']) != baseline:
             return None
         def latest(result):
@@ -988,10 +1139,10 @@ class NadoGateway:
                 if any(other != digest for other in live):
                     raise UnknownExecution('На рынке Nado есть посторонние ордера. Требуется сверка.')
                 actual_snapshot = self.capture_position(intent.instrument)
-                actual = _integer(actual_snapshot['normalized'], maximum=2**127 - 1)
+                actual = _units(actual_snapshot['normalized'], intent.instrument)
                 if record.get('baseline_normalized') is None:
                     raise UnknownExecution('Для сохранённого maker-ордера Nado нет исходного индекса процентов.')
-                baseline = _integer(record['baseline_normalized'], maximum=2**127 - 1)
+                baseline = _units(record['baseline_normalized'], intent.instrument)
                 # A stream timeout is not an order timeout. An unfilled maker
                 # remains on the exchange between polls and through restart.
                 # Any balance change makes us cancel only our remaining amount
@@ -1008,7 +1159,7 @@ class NadoGateway:
                         self.clock() >= placed + reprice_seconds):
                     try:
                         due = maker_price_needs_refresh(intent.instrument, self.book(intent.instrument), intent.limit_price,
-                                                       distance_percent, mode=price_mode)
+                                                       distance_percent, mode=price_mode, side=intent.side)
                     except (TradingError, AccountError, TimeoutError):
                         # Missing/stale quotes cannot justify cancelling a live
                         # order. Reconcile again with no new writes or fake fill.
@@ -1083,7 +1234,7 @@ class NadoGateway:
         if self.open_orders(intent.instrument):
             return OrderObservation(intent.client_id, "PENDING", filled, average, fee, digest, filled_at)
         post = _obj(_obj(item.get("post_balance")).get("base"))
-        spot = _obj(post.get("spot"))
+        spot = _obj(post.get(intent.instrument.kind))
         if _integer(spot.get("product_id")) != intent.instrument.id:
             raise UnknownExecution("История Nado не подтверждает spot-продукт.")
         post_amount = _x18(_obj(spot.get("balance")).get("amount"))

@@ -201,7 +201,7 @@ class StrategyFormTests(unittest.TestCase):
         self.assertEqual(form.entries['hold_hours'].get(), '12')
         self.assertEqual(str(form.save_button.cget('state')), 'disabled')
 
-    def test_two_assets_and_explicit_points_confirmation_required(self):
+    def test_two_assets_required_but_points_confirmation_optional(self):
         form = self.load_form()
         self.fill(form)
         form.selected['QQQ'].set(False)
@@ -212,7 +212,7 @@ class StrategyFormTests(unittest.TestCase):
         self.assertEqual(self.panel.executor.tasks, [])
         form.selected['QQQ'].set(True)
         form.selection_changed()
-        self.assertEqual(str(form.save_button.cget('state')), 'disabled')
+        self.assertEqual(str(form.save_button.cget('state')), 'normal')
 
     def test_percent_conversion_and_cycle_order_are_preserved_exactly(self):
         self.panel.data = {'revision': 9, 'strategy': {'assets': ['SPY', 'QQQ'],
@@ -252,7 +252,7 @@ class StrategyFormTests(unittest.TestCase):
         form.entries['notional_per_leg'].delete(0, 'end')
         form.entries['notional_per_leg'].insert(0, 'NaN')
         form.save()
-        self.assertIn('Сумма покупки', form.status.cget('text'))
+        self.assertIn('Размер позиции', form.status.cget('text'))
         form.entries['notional_per_leg'].delete(0, 'end')
         form.entries['notional_per_leg'].insert(0, '50')
         form.save()

@@ -73,7 +73,7 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(result['fetched_at'], 123)
         self.assertCountEqual(result['assets'], ['QQQ', 'SPY'])
         self.assertCountEqual(transport.get.call_args_list, [
-            unittest.mock.call(NADO_SYMBOLS, {'product_type': 'spot'}), unittest.mock.call(LIGHTER_MARKETS, {})])
+            unittest.mock.call(NADO_SYMBOLS, {}), unittest.mock.call(LIGHTER_MARKETS, {})])
         transport.get.side_effect = AccountError('API недоступен')
         with self.assertRaisesRegex(TradingError, 'API недоступен'):
             hedge_catalog(transport_factory=lambda: transport)

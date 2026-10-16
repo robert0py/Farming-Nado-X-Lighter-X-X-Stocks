@@ -18,7 +18,7 @@ import time
 from typing import Callable
 from urllib.parse import urlsplit
 
-from .domain import Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable, TradingError, UnknownExecution
+from .domain import Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable, TradingError, UnknownExecution, CRYPTO_SYMBOLS
 
 
 RH_URL = "https://api.rh.lighter.xyz"
@@ -155,7 +155,7 @@ def perpetual_instruments(metadata):
     for item in _items(response.get("order_book_details")):
         item = _data(item)
         symbol = item.get("symbol")
-        if symbol not in STOCK_SYMBOLS or item.get("market_type") != "perp":
+        if symbol not in STOCK_SYMBOLS | CRYPTO_SYMBOLS or item.get("market_type") != "perp":
             continue
         multiplier = _number(item.get("multiplier"))
         if multiplier <= 0:
@@ -398,7 +398,7 @@ the durable engine must only call lookup(), including after a process restart.
             raise TradingError("Сначала проверьте торговый API-ключ Lighter.")
         if not intent.instrument.tradable and not intent.reduce_only:
             raise TradingError("Рынок Lighter запрещает новые позиции.")
-        if (intent.side == "buy") != intent.reduce_only:
+        if intent.instrument.underlying not in CRYPTO_SYMBOLS and (intent.side == "buy") != intent.reduce_only:
             raise TradingError("Lighter разрешает открытие short и только reduce-only закрытие short.")
         quantity, price = _number(intent.quantity), _number(intent.limit_price)
         if quantity <= 0 or price <= 0 or int(intent.expiry) <= self._clock():
@@ -463,10 +463,10 @@ the durable engine must only call lookup(), including after a process restart.
             raise UnknownExecution("Ордер Lighter найден, но его исполнение не подтверждено. Повтор запрещён.")
         account = await self._account()
         position = self._position_from(account, intent.instrument)
-        if intent.reduce_only and (position >= 0 or intent.quantity > abs(position)):
-            raise TradingError("Закрывающий ордер Lighter превышает фактический short.")
-        if not intent.reduce_only and position > 0:
-            raise TradingError("На Lighter уже существует встречная long-позиция.")
+        if intent.reduce_only and (position == 0 or (position > 0) != (intent.side == 'sell') or intent.quantity > abs(position)):
+            raise TradingError("Закрывающий ордер Lighter превышает позицию или имеет неверную сторону.")
+        if not intent.reduce_only and position != 0 and (position > 0) != (intent.side == 'buy'):
+            raise TradingError("На Lighter уже существует позиция другого направления.")
         # Fresh nonce per key; all calls are serialized. Never decrement a nonce
         # or retry the POST after a timeout; the engine reconciles the client ID.
         nonce_data = _response(await self._client.tx_api.next_nonce(

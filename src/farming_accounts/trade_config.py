@@ -5,7 +5,7 @@ import re
 import time
 
 from .models import wallet_address, account_index, nado_subaccount, AccountError
-from .trading.domain import Strategy, TradingError
+from .trading.domain import Strategy, TradingError, CRYPTO_SYMBOLS
 
 
 DECIMAL_FIELDS = ('notional_per_leg', 'max_slippage_bps', 'residual_notional', 'margin_reserve', 'max_loss_quote', 'nado_maker_distance_percent')
@@ -94,11 +94,10 @@ def strategy(value: dict, *, clock=time.time) -> Strategy:
         if len(assets) < 2 or any(not re.fullmatch(r'[A-Z]{1,8}', asset) for asset in assets):
             raise TradingError('Для смены актива между циклами выберите минимум два базовых актива.')
         proof = value.get('points_evidence', {})
-        confirmed = float(proof.get('confirmed_at', 0))
-        if (proof.get('account_enrolled') is not True or not isinstance(proof.get('assets'), list) or not 0 < confirmed <= clock() or
-                proof.get('url') != 'https://docs.nado.xyz/incentives-and-rewards/xpoints-on-nado'):
-            raise TradingError('Подтвердите участие аккаунта и выбранных активов в действующей программе xPoints.')
+        if not isinstance(proof, dict):
+            raise TradingError('Некорректный формат необязательной отметки xPoints.')
         result = Strategy(assets=assets, points_verified_assets=tuple(proof.get('assets', ())),
+                          alternate_crypto_direction=value.get('alternate_crypto_direction', False),
                           nado_maker_price_mode=value.get('nado_maker_price_mode', 'distance'),
                           nado_post_only=value.get('nado_post_only', False),
                           preserve_spot_dust=value.get('preserve_spot_dust', False), **values)
