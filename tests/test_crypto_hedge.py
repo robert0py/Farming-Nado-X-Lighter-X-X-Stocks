@@ -50,6 +50,8 @@ class CryptoCatalogTests(unittest.TestCase):
                                hold_seconds=43200, alternate_crypto_direction=True))
         self.assertTrue(result.alternate_crypto_direction)
         self.assertEqual(result.points_verified_assets, ())
+        with self.assertRaisesRegex(TradingError, 'maker post-only'):
+            replace(result, nado_post_only=False).validate()
 
     def test_old_stock_settings_cannot_start_new_cycles_but_still_decode_for_recovery(self):
         value = dict(mode='automatic', assets=['AAPL', 'NVDA'], notional_per_leg='110', hold_seconds=43200)

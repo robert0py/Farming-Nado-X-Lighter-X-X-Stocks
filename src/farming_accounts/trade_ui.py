@@ -418,7 +418,9 @@ class TradingPanel:
             pricing = order.get('pricing')
             if venue == 'nado' and order.get('action') == 'open_spot' and pricing:
                 if pricing.get('price_mode') == 'closest_ask':
-                    details.append(f"Ближайший maker: лучшая продажа {pricing['reference_ask']} USDT0 · шаг {pricing['price_tick']} · лимит покупки {order['limit_price']}. Post-only: только добавление ликвидности. Это цены на момент расчёта; текущий рынок может измениться.")
+                    short = pricing.get('side', 'buy') == 'sell'
+                    reference = pricing.get('reference_bid') if short else pricing['reference_ask']
+                    details.append(f"Ближайший maker: {'лучшая покупка' if short else 'лучшая продажа'} {reference} USDT0 · шаг {pricing['price_tick']} · лимит {'продажи' if short else 'покупки'} {order['limit_price']}. Post-only: только добавление ликвидности. Это цены на момент расчёта; текущий рынок может измениться.")
                 else:
                     details.append(f"Расчёт этой заявки: середина стакана Nado {pricing['reference_midpoint']} USDT0 · выбранный отступ {pricing['distance_percent']}% · лимит {order['limit_price']}. Это цены на момент расчёта; текущий рынок может измениться.")
         self.order_detail.configure(text='\n'.join(details) if details else 'Ордеров текущей попытки нет.')

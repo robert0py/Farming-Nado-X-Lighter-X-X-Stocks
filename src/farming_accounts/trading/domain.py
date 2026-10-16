@@ -120,6 +120,8 @@ class Strategy:
                    self.margin_reserve, self.max_loss_quote, self.nado_maker_distance_percent)
         if not self.assets or len(set(self.assets)) != len(self.assets):
             raise TradingError("Выберите неповторяющийся список разрешённых активов.")
+        if set(self.assets) & CRYPTO_SYMBOLS and not self.nado_post_only:
+            raise TradingError('Криптохедж Nado требует maker post-only. Включите лимитное исполнение без taker.')
         if any(not isinstance(x, Decimal) or not x.is_finite() or x < 0 for x in amounts):
             raise TradingError("Лимиты стратегии должны быть конечными неотрицательными числами.")
         if self.notional_per_leg <= 0 or self.max_loss_quote <= 0:
