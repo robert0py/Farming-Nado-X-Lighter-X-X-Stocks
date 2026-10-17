@@ -410,7 +410,7 @@ class Application:
         self.trading = TradingPanel(self, self.trading_page)
         from .accounting_ui import AccountingPanel
         self.accounting = AccountingPanel(self, accounting_page)
-        logs = tk.Frame(main, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
+        logs = self.balance_logs = tk.Frame(main, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
         logs.pack(fill='x', padx=22, pady=(12, 0))
         self.logs_button = tk.Button(logs, text='События подключения  ▸', bg=PANEL, fg=MUTED, activebackground=FIELD,
                                      activeforeground=INK, relief='flat', anchor='w', font=('Segoe UI', 9), padx=12, pady=8,
@@ -420,8 +420,9 @@ class Application:
                                  padx=12, pady=6, state='disabled', wrap='word', takefocus=False)
         self.logs_text.tag_configure('error', foreground=RED)
         self.logs_open = False
-        label(main, 'Баланс: публичное чтение · торговля: отдельные зашифрованные ключи · управление независимым worker',
-              color=MUTED, size=8, anchor='w').pack(side='bottom', fill='x', padx=22, pady=(10, 12), before=self.pages)
+        self.footer = label(main, 'Баланс: публичное чтение · торговля: отдельные зашифрованные ключи · управление независимым worker',
+                            color=MUTED, size=8, anchor='w')
+        self.footer.pack(side='bottom', fill='x', padx=22, pady=(10, 12), before=self.pages)
         logs.pack_configure(side='bottom', before=self.pages)
         self.navigate('balance')
         self.render_balances()
@@ -468,6 +469,14 @@ class Application:
         if page not in ('balance', 'trading'):
             return
         self.page = page
+        if page == 'trading':
+            # Connection logs belong to the balance viewer. Reserve the trading
+            # page's height for the live hedge and history, including long diagnostics.
+            self.balance_logs.pack_forget()
+            self.footer.pack_forget()
+        else:
+            self.footer.pack(side='bottom', fill='x', padx=22, pady=(10, 12), before=self.pages)
+            self.balance_logs.pack(side='bottom', fill='x', padx=22, pady=(12, 0), before=self.pages)
         self.page_title.configure(text='Баланс' if page == 'balance' else 'Торговля')
         self.page_hint.configure(text='Обновление каждые 30 сек. после подключения' if page == 'balance' else '')
         (self.balance_page if page == 'balance' else self.trading_page).tkraise()

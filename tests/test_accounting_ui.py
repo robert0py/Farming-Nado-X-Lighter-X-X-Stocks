@@ -59,6 +59,18 @@ class AccountingUITests(unittest.TestCase):
             self.assertLessEqual(widget.winfo_rooty() + widget.winfo_height(), bottom)
         self.root.withdraw()
 
+    def test_balance_connection_footer_does_not_squeeze_live_trading_history(self):
+        self.root.deiconify()
+        self.app.navigate('trading')
+        self.root.update_idletasks()
+        self.assertFalse(self.app.balance_logs.winfo_ismapped())
+        self.assertFalse(self.app.footer.winfo_ismapped())
+        self.app.navigate('balance')
+        self.root.update_idletasks()
+        self.assertTrue(self.app.balance_logs.winfo_ismapped())
+        self.assertTrue(self.app.footer.winfo_ismapped())
+        self.root.withdraw()
+
     def test_loading_uses_saved_local_accounts_without_restarting_trading_worker(self):
         self.panel.local.request = Mock(return_value={'job_id': 'history', 'state': 'loading', 'message': 'Читаем API'})
         self.panel.load()
