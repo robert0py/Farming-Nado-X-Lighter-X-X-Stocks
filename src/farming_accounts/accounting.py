@@ -36,6 +36,9 @@ NOTES = [
     'Оценка закрытых хеджей: противоположные пары одного актива сопоставляются FIFO внутри выбранного периода. '
     'Ценовой результат обеих сторон минус четыре распределённые комиссии; котировки условно равны 1:1. '
     'Открытия до начала периода, незакрытые остатки и пары с неизвестной комиссией не входят в известный итог.',
+    'Объём — сумма абсолютной торговой стоимости всех покупок и продаж за выбранный период по исходным исполнениям, '
+    'включая открытия, закрытия и сделки без пары. Комиссии не прибавляются к объёму: они вычитаются из результата '
+    'закрытых частей хеджа вместе с учётом фактических цен обеих сторон.',
 ]
 
 
@@ -191,12 +194,41 @@ def make_report(fills, start, end):
                 'pnl_unknown': sum(f.pnl is None for f in group),
                 'turnover': str(sum((f.price * f.quantity for f in group), Decimal(0)))}
     closed = close_pairs(rows)
-    return {'start': start, 'end': end, 'fills': [f.public() for f in source], 'rows': rows, 'closed_hedges': closed,
+    report = {'start': start, 'end': end, 'fills': [f.public() for f in source], 'rows': rows, 'closed_hedges': closed,
             'summary': summary, 'pairs': pair_count, 'unmatched_rows': sum(not r['pair'] for r in rows),
             'closed_summary': {'count': len(closed), 'unknown_net': sum(r['net_estimate_1_to_1'] is None for r in closed),
                                'known_net_estimate_1_to_1': str(sum((Decimal(r['net_estimate_1_to_1']) for r in closed
                                                                    if r['net_estimate_1_to_1'] is not None), Decimal(0)))},
             'notes': NOTES.copy()}
+    report['totals'] = report_totals(report)
+    return report
+
+
+def report_totals(report):
+    """Gross executed turnover and closed-pair costs have distinct scopes.
+
+Use the source-fill summary, never the split pairing rows. Recompute from this
+stable contract so a new desktop can also display an older worker's report.
+"""
+    with localcontext() as context:
+        context.prec = 80
+        amounts = defaultdict(Decimal)
+        for item in report['summary'].values():
+            amounts[(item['venue'], item['currency'])] += number(item['turnover'])
+        for venue, currency in [('Nado', 'USDT0'), ('Lighter RH', 'USDG')]:
+            amounts.setdefault((venue, currency), Decimal(0))
+        volumes = [{'venue': venue, 'currency': currency, 'amount': str(amount)}
+                   for (venue, currency), amount in sorted(amounts.items(), key=lambda item: (item[0][0] != 'Nado', item[0]))]
+        combined = (str(sum(amounts.values(), Decimal(0)))
+                    if all(currency in ('USDT0', 'USDG') for _, currency in amounts) else None)
+        closed = report['closed_summary']
+        known = closed['count'] - closed['unknown_net']
+        net = number(closed['known_net_estimate_1_to_1']) if known else None
+        return {'turnover_by_venue': volumes, 'total_turnover_estimate_1_to_1': combined,
+                'known_closed_parts': known, 'unknown_closed_parts': closed['unknown_net'],
+                'closed_net_estimate_1_to_1': None if net is None else str(net),
+                'spent_estimate_1_to_1': None if net is None else str(max(-net, Decimal(0))),
+                'earned_estimate_1_to_1': None if net is None else str(max(net, Decimal(0)))}
 
 
 def close_pairs(rows):
@@ -274,10 +306,19 @@ def report_bundle(report):
         archive.writestr('Hedge-report.csv', csv_bytes(report['rows'], ROW_COLUMNS))
         columns = ('venue', 'currency', 'fills', 'fees_known', 'fees_unknown', 'reported_pnl_known', 'pnl_unknown', 'turnover')
         archive.writestr('Summary.csv', csv_bytes(list(report['summary'].values()), columns))
+        totals = report_totals(report)
+        total_rows = [{'metric': item['venue'] + ' turnover', 'amount': item['amount'], 'currency': item['currency'],
+                       'scope': 'All executions in selected period'} for item in totals['turnover_by_venue']]
+        for metric in ('total_turnover_estimate_1_to_1', 'closed_net_estimate_1_to_1',
+                       'spent_estimate_1_to_1', 'earned_estimate_1_to_1'):
+            total_rows.append({'metric': metric, 'amount': totals[metric], 'currency': 'USD estimate 1:1',
+                               'scope': 'All executions in selected period' if metric.startswith('total_turnover')
+                               else 'Known closed hedge parts; fees included; funding excluded'})
+        archive.writestr('Totals.csv', csv_bytes(total_rows, ('metric', 'amount', 'currency', 'scope')))
         columns = ('asset', 'entry_pair', 'exit_pair', 'opened_utc', 'closed_utc', 'underlying_quantity',
                    'gross_estimate_1_to_1', 'fees_estimate_1_to_1', 'net_estimate_1_to_1')
         archive.writestr('Closed-hedges.csv', csv_bytes(report['closed_hedges'], columns))
-        archive.writestr('Report.json', json.dumps(report, ensure_ascii=False, indent=2))
+        archive.writestr('Report.json', json.dumps(report | {'totals': totals}, ensure_ascii=False, indent=2))
         archive.writestr('Прочитай меня.txt', '\n'.join([
             'Период UTC: ' + stamp(report['start']) + ' — ' + stamp(report['end']) + ' (конец не включён).',
             'Аккаунты отчёта: ' + json.dumps(report.get('accounts', {}), ensure_ascii=False),

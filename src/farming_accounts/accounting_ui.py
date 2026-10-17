@@ -12,7 +12,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 from urllib.parse import urlsplit
 
-from .accounting import AccountingError, ROW_COLUMNS, csv_bytes, period, report_bundle
+from .accounting import AccountingError, ROW_COLUMNS, csv_bytes, period, report_bundle, report_totals
 from .accounting_jobs import AccountingJobs, collect_report
 from .control import ControlError
 from .vault import Vault, state_directory
@@ -192,11 +192,24 @@ class AccountingPanel:
         self.message.configure(text=f'Готово: {len(report["fills"])} исполнений · {report["pairs"]} предполагаемых пар · '
                                     f'без пары {report["unmatched_rows"]} строк. Даты — местные. ' + self.account_names(report))
         closed = report['closed_summary']
-        lines = [f'Закрытых частей хеджа: {closed["count"]}',
-                 'Результат после комиссий ≈ ' + self.format(closed['known_net_estimate_1_to_1']) + ' USD'
-                 if closed['count'] > closed['unknown_net'] else 'Результат после комиссий: —',
+        totals = report_totals(report)
+        report['totals'] = totals
+        lines = [f'Закрытых частей хеджа: {closed["count"]}']
+        for item in totals['turnover_by_venue']:
+            venue = 'Lighter' if item['venue'] == 'Lighter RH' else item['venue']
+            lines.append('Объём ' + venue + ': ' + self.money(item['amount']) + ' ' + item['currency'])
+        lines.extend(['Суммарный объём ≈ ' + self.money(totals['total_turnover_estimate_1_to_1']) + ' USD',
+                      'Объём за период: покупки + продажи.', '',
+                      'Результат закрытых частей после комиссий ≈ ' + self.format(totals['closed_net_estimate_1_to_1']) + ' USD'
+                      if totals['known_closed_parts'] else 'Результат после комиссий: —'])
+        if totals['known_closed_parts']:
+            if Decimal(totals['closed_net_estimate_1_to_1']) < 0:
+                lines.append('Потрачено ≈ ' + self.format(totals['spent_estimate_1_to_1']) + ' USD')
+            else:
+                lines.append('Получено ≈ ' + self.format(totals['earned_estimate_1_to_1']) + ' USD')
+        lines.extend(['В результате учтены комиссии и разница цен обеих сторон.',
                  f'Не рассчитано из-за комиссий: {closed["unknown_net"]}',
-                 'Оценка FIFO по предполагаемым парам, курс 1:1, без funding. Открытия до периода не включены.', '']
+                 'Оценка FIFO по предполагаемым парам, курс 1:1, без funding. Открытия до периода не включены.', ''])
         fees_estimate = Decimal(0)
         for item in report['summary'].values():
             fees_estimate += Decimal(item['fees_known'])
@@ -226,6 +239,10 @@ class AccountingPanel:
         shortened = owner[:6] + '…' + owner[-4:] if len(owner) > 12 else owner
         return (f'Nado: {shortened} / {nado.get("subaccount", "default")} (cross). '
                 f'Lighter RH: #{lighter.get("account_index", "—")}.') if accounts else ''
+
+    @staticmethod
+    def money(value):
+        return '—' if value is None else format(Decimal(value), ',.2f').replace(',', ' ')
 
     @staticmethod
     def format(value):

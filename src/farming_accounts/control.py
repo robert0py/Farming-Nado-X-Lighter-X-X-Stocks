@@ -24,7 +24,7 @@ class ControlError(Exception):
 LOCAL_URL = 'http://127.0.0.1:8765'
 # Only this accounting-only GUI update is compatible with the preceding
 # trading protocol. Future releases must explicitly evaluate compatibility.
-ACTIVE_WORKER_COMPATIBILITY = {'0.5.3': frozenset({'0.5.2'})}
+ACTIVE_WORKER_COMPATIBILITY = {'0.5.3': frozenset({'0.5.2'}), '0.5.4': frozenset({'0.5.2', '0.5.3'})}
 
 
 class ControlClient:

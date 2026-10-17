@@ -106,7 +106,27 @@ class AccountingUITests(unittest.TestCase):
         self.assertIn('USDT0', summary)
         self.assertIn('USDG', summary)
         self.assertIn('Убыток от задержки: нет данных', summary)
+        self.assertLess(summary.index('Объём Nado:'), summary.index('Объём Lighter:'))
+        self.assertLess(summary.index('Объём Lighter:'), summary.index('Суммарный объём'))
+        self.assertLess(summary.index('Суммарный объём'), summary.index('Результат после комиссий'))
+        self.assertIn('100.00 USDT0', summary)
+        self.assertIn('100.00 USDG', summary)
+        self.assertIn('200.00 USD', summary)
         self.assertEqual(str(self.panel.zip_button.cget('state')), 'normal')
+
+    def test_closed_result_shows_spent_with_fees_after_venue_turnovers(self):
+        from decimal import Decimal as D
+        report = make_report([fill(price=D(100), fee=D('.1')),
+            fill('Lighter RH', 'lo', NOW + 1, 'sell', price=D(101), fee=D('.2')),
+            fill(identity='nc', timestamp=NOW + 600, side='sell', price=D(110), fee=D('.3')),
+            fill('Lighter RH', 'lc', NOW + 601, 'buy', price=D(113), fee=D('.4'))], NOW - 10, NOW + 1000)
+        self.panel.ready(report)
+        summary = self.panel.summary.get('1.0', 'end')
+        self.assertIn('Объём Nado: 210.00 USDT0', summary)
+        self.assertIn('Объём Lighter: 214.00 USDG', summary)
+        self.assertIn('Суммарный объём ≈ 424.00 USD', summary)
+        self.assertIn('Потрачено ≈ 3 USD', summary)
+        self.assertLess(summary.index('Суммарный объём'), summary.index('Потрачено'))
 
     def test_export_cancel_does_not_write_file(self):
         self.panel.ready(make_report([], NOW - 10, NOW + 10))

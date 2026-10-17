@@ -15,7 +15,7 @@ import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
-from farming_accounts.accounting import AccountingError, Fill, csv_bytes, make_report, number, report_bundle
+from farming_accounts.accounting import AccountingError, Fill, csv_bytes, make_report, number, report_bundle, report_totals
 from farming_accounts.accounting_sources import (EXPORT_HOST, download_csv, fetch_history, fetch_nado,
                                                 nado_fill, parse_lighter)
 from farming_accounts.accounting_jobs import AccountingJobs, collect_report
@@ -79,6 +79,42 @@ class AccountingTests(unittest.TestCase):
         self.assertEqual(D(result['fees_estimate_1_to_1']), D(1))
         self.assertEqual(D(result['net_estimate_1_to_1']), D(0))
         self.assertEqual(report['closed_summary']['count'], 1)
+        totals = report['totals']
+        self.assertEqual([D(v['amount']) for v in totals['turnover_by_venue']], [D(210), D(213)])
+        self.assertEqual(D(totals['total_turnover_estimate_1_to_1']), D(423))
+        self.assertEqual(D(totals['spent_estimate_1_to_1']), D(0))
+
+    def test_turnover_uses_source_fills_once_including_partial_and_unpaired_trades(self):
+        n = fill(quantity='3', fee=D(20))
+        report = self.report([n, n, fill('Lighter RH', 'l1', side='sell', quantity='1', price=D(101)),
+                              fill('Lighter RH', 'l2', side='sell', quantity='1', price=D(102))])
+        totals = report['totals']
+        self.assertEqual([D(v['amount']) for v in totals['turnover_by_venue']], [D(300), D(203)])
+        self.assertEqual(D(totals['total_turnover_estimate_1_to_1']), D(503))
+        self.assertIsNone(totals['spent_estimate_1_to_1'])
+        self.assertEqual(report['unmatched_rows'], 1)
+
+    def test_spent_includes_both_price_changes_and_all_four_fees(self):
+        report = self.report([fill(price=D(100), fee=D('.1')),
+            fill('Lighter RH', 'lo', NOW + 1, 'sell', price=D(101), fee=D('.2')),
+            fill(identity='nc', timestamp=NOW + 600, side='sell', price=D(110), fee=D('.3')),
+            fill('Lighter RH', 'lc', NOW + 601, 'buy', price=D(113), fee=D('.4'))])
+        self.assertEqual(D(report['totals']['closed_net_estimate_1_to_1']), D(-3))
+        self.assertEqual(D(report['totals']['spent_estimate_1_to_1']), D(3))
+        self.assertEqual(D(report['totals']['earned_estimate_1_to_1']), D(0))
+        self.assertEqual(D(report['totals']['total_turnover_estimate_1_to_1']), D(424))
+
+    def test_empty_history_is_zero_turnover_and_unsupported_currency_is_not_summed_as_dollars(self):
+        report = self.report([])
+        self.assertEqual(D(report['totals']['total_turnover_estimate_1_to_1']), D(0))
+        self.assertIsNone(report['totals']['closed_net_estimate_1_to_1'])
+        report = self.report([fill(quote='EUR')])
+        self.assertIsNone(report['totals']['total_turnover_estimate_1_to_1'])
+
+    def test_older_worker_report_totals_can_be_computed_without_new_metadata(self):
+        report = self.report([fill(), fill('Lighter RH', 'l1', side='sell')])
+        expected = report.pop('totals')
+        self.assertEqual(report_totals(report), expected)
 
     def test_partial_round_trip_leaves_unclosed_size_out_of_profit_estimate(self):
         report = self.report([fill(quantity='2', price=D(100)),
@@ -95,6 +131,16 @@ class AccountingTests(unittest.TestCase):
             fill('Lighter RH', 'lc', NOW + 601, 'buy')])
         self.assertIsNone(report['closed_hedges'][0]['net_estimate_1_to_1'])
         self.assertEqual(report['closed_summary']['unknown_net'], 1)
+        self.assertIsNone(report['totals']['spent_estimate_1_to_1'])
+        self.assertIsNone(report['totals']['earned_estimate_1_to_1'])
+
+    def test_positive_closed_result_is_earned_instead_of_negative_spending(self):
+        report = self.report([fill(price=D(100), fee=D('.1')),
+            fill('Lighter RH', 'lo', NOW + 1, 'sell', price=D(102), fee=D('.2')),
+            fill(identity='nc', timestamp=NOW + 600, side='sell', price=D(110), fee=D('.3')),
+            fill('Lighter RH', 'lc', NOW + 601, 'buy', price=D(109), fee=D('.4'))])
+        self.assertEqual(D(report['totals']['earned_estimate_1_to_1']), D(2))
+        self.assertEqual(D(report['totals']['spent_estimate_1_to_1']), D(0))
 
     def test_partial_allocations_conserve_quantity_fees_and_pnl(self):
         n = fill(quantity='3', fee=D('.1'), pnl=D('1'))
@@ -177,7 +223,9 @@ class AccountingTests(unittest.TestCase):
     def test_bundle_has_three_tables_summary_json_and_no_credentials(self):
         report = self.report([fill(), fill('Lighter RH', 'l1', side='sell')])
         with zipfile.ZipFile(io.BytesIO(report_bundle(report))) as archive:
-            self.assertTrue({'Nado.csv', 'Lighter.csv', 'Hedge-report.csv', 'Summary.csv', 'Report.json'} <= set(archive.namelist()))
+            self.assertTrue({'Nado.csv', 'Lighter.csv', 'Hedge-report.csv', 'Summary.csv', 'Totals.csv', 'Report.json'} <= set(archive.namelist()))
+            totals = list(csv.DictReader(io.StringIO(archive.read('Totals.csv').decode('utf-8-sig')), delimiter=';'))
+            self.assertEqual(D(next(row['amount'] for row in totals if row['metric'] == 'total_turnover_estimate_1_to_1')), D(200))
             self.assertEqual(json.loads(archive.read('Report.json'))['rows'], report['rows'])
             for name in archive.namelist():
                 self.assertNotIn(b'private_key', archive.read(name))
