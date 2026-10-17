@@ -22,6 +22,9 @@ class ControlError(Exception):
 
 
 LOCAL_URL = 'http://127.0.0.1:8765'
+# Only this accounting-only GUI update is compatible with the preceding
+# trading protocol. Future releases must explicitly evaluate compatibility.
+ACTIVE_WORKER_COMPATIBILITY = {'0.5.3': frozenset({'0.5.2'})}
 
 
 class ControlClient:
@@ -42,7 +45,8 @@ class ControlClient:
     def request(self, path: str, data: dict | None = None) -> dict:
         if path not in ('/status', '/markets', '/preflight', '/credentials', '/strategy', '/start',
                         '/stop', '/close', '/verify', '/register/nado', '/register/lighter',
-                        '/registration-options/lighter', '/relink/nado', '/recover-registration', '/shutdown', '/manual-close'):
+                        '/registration-options/lighter', '/relink/nado', '/recover-registration', '/shutdown', '/manual-close',
+                        '/accounting/start', '/accounting/status', '/accounting/page', '/accounting/cancel'):
             raise ControlError('Неизвестная команда worker.')
         body = None if data is None else json.dumps(data | {'command_id': secrets.token_hex(16)}, allow_nan=False).encode()
         req = Request(self.url + path, body, method='GET' if body is None else 'POST',
@@ -92,6 +96,8 @@ def ensure_local_worker(client: ControlClient) -> None:
         cycle = execution.get('cycle') or {}
         if execution.get('running') or (cycle and cycle.get('state') != 'CLOSED') or execution.get('state') in (
                 'OPENING_SPOT', 'OPENING_HEDGE', 'HEDGED', 'CLOSING', 'HALTED', 'RECOVERY'):
+            if status.get('version') in ACTIVE_WORKER_COMPATIBILITY.get(__version__, ()):
+                return  # Keep active orders and the proven trading worker; local accounting uses its own reads.
             raise ControlError('Работает другая версия процесса торговли с активной стратегией или незавершённым хеджем. '
                                'Остановите и завершите хедж в предыдущей версии перед обновлением процесса.')
         # The worker independently checks the durable journal and rejects shutdown with exposure.

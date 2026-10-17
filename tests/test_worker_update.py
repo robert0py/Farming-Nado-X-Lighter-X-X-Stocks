@@ -9,6 +9,16 @@ from farming_accounts.control import ControlError, ensure_local_worker
 
 
 class WorkerUpdateTests(unittest.TestCase):
+    def test_accounting_gui_reuses_compatible_active_worker_without_restart(self):
+        if __version__ != '0.5.3':
+            self.skipTest('Compatibility deliberately limited to accounting-only release')
+        client = Mock()
+        client.request.return_value = {'version': '0.5.2', 'execution': {'state': 'HEDGED', 'running': True}}
+        with patch('farming_accounts.control.subprocess.Popen') as spawn:
+            ensure_local_worker(client)
+            spawn.assert_not_called()
+        client.request.assert_called_once_with('/status')
+
     def test_current_worker_is_reused_without_commands_or_spawn(self):
         client = Mock()
         client.request.return_value = {'version': __version__}

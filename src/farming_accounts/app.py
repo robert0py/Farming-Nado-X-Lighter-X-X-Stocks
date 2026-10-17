@@ -61,7 +61,7 @@ class AccountPanel:
             self.subaccount.trace_add('write', self.input_changed)
         self.frame = tk.Frame(parent, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
         header = tk.Frame(self.frame, bg=PANEL)
-        header.pack(fill='x', padx=18, pady=(17, 13))
+        header.pack(fill='x', padx=18, pady=(12, 8))
         self.connect_button = ttk.Button(header, text='Подключить', style='Primary.TButton', command=self.primary_action)
         self.connect_button.pack(side='right')
         self.settings_button = ttk.Button(header, text='⋯', width=3, command=self.open_dialog)
@@ -69,7 +69,7 @@ class AccountPanel:
         label(header, self.title, size=17, bold=True).pack(side='left')
         divider(self.frame).pack(fill='x')
         content = tk.Frame(self.frame, bg=PANEL)
-        content.pack(fill='x', padx=18, pady=(7, 0))
+        content.pack(fill='x', padx=18, pady=(5, 0))
         self.values = {}
         rows = [('status', 'Статус'), ('equity', 'Стоимость аккаунта'),
                 ('cash', 'Токены USDT0' if venue == 'nado' else 'Доступный баланс')]
@@ -78,16 +78,16 @@ class AccountPanel:
         for key, title in rows:
             row = tk.Frame(content, bg=PANEL)
             row.pack(fill='x')
-            label(row, title, color=MUTED, size=11).pack(side='left', pady=8)
+            label(row, title, color=MUTED, size=11).pack(side='left', pady=4)
             value = label(row, '—', size=11, anchor='e')
-            value.pack(side='right', pady=8)
+            value.pack(side='right', pady=4)
             self.values[key] = value
             divider(content).pack(fill='x')
         self.identity = label(self.frame, 'Spot xStocks' if venue == 'nado' else 'Robinhood Chain · USDG',
                               color=MUTED, size=9, anchor='w', justify='left', wraplength=370)
-        self.identity.pack(fill='x', padx=18, pady=(11, 3))
+        self.identity.pack(fill='x', padx=18, pady=(7, 3))
         self.updated = label(self.frame, 'Данные ещё не получены', color=MUTED, size=9, anchor='w')
-        self.updated.pack(fill='x', padx=18, pady=(0, 14))
+        self.updated.pack(fill='x', padx=18, pady=(0, 10))
         self.frame.bind('<Configure>', lambda event: self.identity.configure(wraplength=max(160, event.width - 36)))
         self.status_text = 'Не подключён'
         self.error_text = ''
@@ -367,10 +367,14 @@ class Application:
         cards.columnconfigure(1, weight=1, uniform='accounts')
         self.nado = self.lighter = None
         # Table is constructed before account cards call their first render.
-        section = tk.Frame(self.balance_page, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
-        section.pack(fill='both', expand=True, pady=(16, 0))
+        self.balance_tabs = ttk.Notebook(self.balance_page, height=120, width=650)
+        self.balance_tabs.pack(fill='both', expand=True, pady=(16, 0))
+        section = tk.Frame(self.balance_tabs, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
+        self.balance_tabs.add(section, text='Активы аккаунтов')
+        accounting_page = tk.Frame(self.balance_tabs, bg=PANEL)
+        self.balance_tabs.add(accounting_page, text='Учёт')
         heading = tk.Frame(section, bg=PANEL)
-        heading.pack(fill='x', padx=18, pady=13)
+        heading.pack(fill='x', padx=18, pady=10)
         label(heading, 'Активы аккаунтов', size=15, bold=True).pack(side='left')
         self.asset_status = label(heading, '', color=MUTED, size=9)
         self.asset_status.pack(side='right')
@@ -404,6 +408,8 @@ class Application:
         self.trading_page.grid(row=0, column=0, sticky='nsew')
         from .trade_ui import TradingPanel
         self.trading = TradingPanel(self, self.trading_page)
+        from .accounting_ui import AccountingPanel
+        self.accounting = AccountingPanel(self, accounting_page)
         logs = tk.Frame(main, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
         logs.pack(fill='x', padx=22, pady=(12, 0))
         self.logs_button = tk.Button(logs, text='События подключения  ▸', bg=PANEL, fg=MUTED, activebackground=FIELD,
@@ -415,7 +421,8 @@ class Application:
         self.logs_text.tag_configure('error', foreground=RED)
         self.logs_open = False
         label(main, 'Баланс: публичное чтение · торговля: отдельные зашифрованные ключи · управление независимым worker',
-              color=MUTED, size=8, anchor='w').pack(fill='x', padx=22, pady=(10, 12))
+              color=MUTED, size=8, anchor='w').pack(side='bottom', fill='x', padx=22, pady=(10, 12), before=self.pages)
+        logs.pack_configure(side='bottom', before=self.pages)
         self.navigate('balance')
         self.render_balances()
         self.poll_id = root.after(100, self.poll)
@@ -447,6 +454,11 @@ class Application:
         style.configure('Treeview.Heading', background=FIELD, foreground=MUTED, font=('Segoe UI', 10),
                         padding=(6, 8), relief='flat')
         style.map('Treeview.Heading', background=[('active', FIELD)])
+        style.configure('Accounting.Treeview', rowheight=27, font=('Segoe UI', 9))
+        style.configure('TNotebook', background=BG, borderwidth=0, bordercolor=LINE, lightcolor=LINE, darkcolor=LINE)
+        style.configure('TNotebook.Tab', background=FIELD, foreground=MUTED, padding=(16, 8), font=('Segoe UI', 10),
+                        bordercolor=LINE, lightcolor=LINE, darkcolor=LINE, focuscolor=BLUE)
+        style.map('TNotebook.Tab', background=[('selected', PANEL)], foreground=[('selected', INK)])
         for orientation in ('Vertical', 'Horizontal'):
             style.configure(orientation + '.TScrollbar', background=FIELD, troughcolor=PANEL, bordercolor=PANEL,
                             arrowcolor=MUTED, lightcolor=FIELD, darkcolor=FIELD, borderwidth=0)
@@ -517,6 +529,7 @@ class Application:
         for panel in (self.nado, self.lighter):
             panel.close_dialog()
         self.trading.close()
+        self.accounting.close()
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.root.destroy()
 

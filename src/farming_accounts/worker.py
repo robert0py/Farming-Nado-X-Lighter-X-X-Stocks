@@ -20,6 +20,8 @@ from .trading.domain import AccessVerificationError, TradingError
 from .trading.journal import Journal, encoded
 from .vault import Vault, VaultError, state_directory
 from .wallet_page import HTML
+from .accounting import AccountingError
+from .accounting_jobs import AccountingJobs, ROUTES as ACCOUNTING_ROUTES
 
 
 class Runtime:
@@ -40,6 +42,7 @@ class Runtime:
         self.wakeup = threading.Event()
         self.shutdown = None
         self._status_cache = None
+        self.accounting = AccountingJobs(self.config)
         self.status()
 
     def config(self):
@@ -602,10 +605,15 @@ def handler_for(runtime):
                 value = json.loads(self.rfile.read(length))
                 if not isinstance(value, dict):
                     raise ValueError()
-                result = (runtime.wallet(self.headers['Authorization'][7:], value.get('signature', '')) if wallet
-                          else runtime.command(self.path, value))
+                if self.path in ACCOUNTING_ROUTES:
+                    # Read-only history must not wait for the trading lock or affect
+                    # trading error/status, command journal, orders or signatures.
+                    result = runtime.accounting.request(self.path, value)
+                else:
+                    result = (runtime.wallet(self.headers['Authorization'][7:], value.get('signature', '')) if wallet
+                              else runtime.command(self.path, value))
                 self.reply(result, 200 if result.get('ok') else 422)
-            except (TradingError, VaultError) as error:
+            except (TradingError, VaultError, AccountingError) as error:
                 self.reply({'ok': False, 'error': str(error)}, 422)
             except (ValueError, TypeError):
                 self.reply({'ok': False, 'error': 'Некорректный запрос.'}, 400)
@@ -646,6 +654,7 @@ def main(argv=None):
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
+        runtime.accounting.close()
         runtime.stopped.set()
         runtime.wakeup.set()
         thread.join(timeout=80)

@@ -29,7 +29,7 @@ STOCK_SYMBOLS = frozenset({"AAPL", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "QQQ
 RESERVED_KEY_INDICES = frozenset({0, 1, 2, 3, 157, 255})
 READ_PATHS = frozenset({"/api/v1/account", "/api/v1/apikeys", "/api/v1/accountActiveOrders",
                         "/api/v1/accountOrders", "/api/v1/orderBookDetails", "/api/v1/orderBookOrders",
-                        "/api/v1/nextNonce", "/api/v1/trades"})
+                        "/api/v1/nextNonce", "/api/v1/trades", "/api/v1/export"})
 
 
 class _RhSession:
@@ -212,14 +212,14 @@ the durable engine must only call lookup(), including after a process restart.
         self._observed_ids: set[int] = set()
         self._cooldown_until = 0.0
 
-    def _run(self, factory: Callable, *, writing: bool = False, operation='чтение API'):
+    def _run(self, factory: Callable, *, writing: bool = False, operation='чтение API', timeout=REQUEST_TIMEOUT):
         with self._lock:
             if self._closed:
                 raise TradingError("Соединение Lighter закрыто.")
             if self._clock() < self._cooldown_until:
                 raise ReadUnavailable("Lighter ограничил запросы. Дождитесь завершения паузы.")
             try:
-                return self._loop.run_until_complete(asyncio.wait_for(factory(), REQUEST_TIMEOUT))
+                return self._loop.run_until_complete(asyncio.wait_for(factory(), timeout))
             except TradingError:
                 raise
             except Exception as exc:
@@ -283,6 +283,23 @@ the durable engine must only call lookup(), including after a process restart.
                 raise TradingError("Lighter не подтвердил подпись API-ключа.")
             self._auth_until = self._clock() + 600
         return self._auth
+
+    def history_export(self, start, end):
+        """A separate accounting client calls this read-only method, never the engine client."""
+        async def operation():
+            await self._account()  # Prove the configured wallet/account binding before authenticated export.
+            response = _response(await self._client.order_api.export(
+                authorization=await self._token(), type='trade', account_index=self.credentials.account_index,
+                start_timestamp=start * 1000, end_timestamp=end * 1000 - 1,
+                side='all', role='all', trade_type='all', aggregate=False, _request_timeout=60))
+            return response.get('data_url')
+        return self._run(operation, operation='выгрузку истории сделок', timeout=65)
+
+    def history_contracts(self):
+        async def operation():
+            await self._ensure_client()
+            return _response(await self._client.order_api.order_book_details(_request_timeout=REQUEST_TIMEOUT))
+        return self._run(operation, operation='чтение размеров контрактов для отчёта')
 
     async def _account(self) -> dict:
         await self._ensure_client()
