@@ -4,9 +4,12 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+import sys
 import tkinter as tk
 import unittest
 from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 from farming_accounts.app import Application
 from farming_accounts.accounting import make_report

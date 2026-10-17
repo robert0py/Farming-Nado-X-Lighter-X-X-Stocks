@@ -8,9 +8,12 @@ from pathlib import Path
 import tempfile
 import threading
 import time
+import sys
 import unittest
 from unittest.mock import Mock, MagicMock, patch
 import zipfile
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 from farming_accounts.accounting import AccountingError, Fill, csv_bytes, make_report, number, report_bundle
 from farming_accounts.accounting_sources import (EXPORT_HOST, download_csv, fetch_history, fetch_nado,
