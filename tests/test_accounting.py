@@ -330,13 +330,18 @@ class AccountingJobTests(unittest.TestCase):
         self.fail('Job did not finish')
 
     def test_job_retains_only_normalized_report_and_collects_pages(self):
-        jobs = AccountingJobs(lambda: {'private_key': 'never-export-me'}, fetcher=lambda *args: [fill()])
+        jobs = AccountingJobs(lambda: {'nado': {'owner': OWNER, 'private_key': 'never-export-me'},
+                                      'lighter': {'account_index': 42, 'api_private_key': 'never-export-me'}},
+                              fetcher=lambda *args: [fill()])
         try:
             started = jobs.request('/accounting/start', {'start': NOW - 1, 'end': NOW + 1})
             status = self.wait_for_job(jobs, started['job_id'])
             self.assertEqual(status['state'], 'ready')
             report = collect_report(jobs, status)
             self.assertEqual(len(report['fills']), 1)
+            self.assertEqual(report['accounts']['Lighter RH']['account_index'], 42)
+            self.assertEqual(report['accounts']['Nado']['scope'], 'cross')
+            self.assertEqual(report['fills'][0]['account'], OWNER + ':default')
             self.assertNotIn('never-export-me', json.dumps(status) + json.dumps(report))
         finally:
             jobs.close()

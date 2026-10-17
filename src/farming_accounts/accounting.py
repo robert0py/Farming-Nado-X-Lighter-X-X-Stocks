@@ -261,8 +261,8 @@ def csv_bytes(rows, columns):
 
 ROW_COLUMNS = ('pair', 'venue', 'time_utc', 'asset', 'symbol', 'side', 'quantity', 'underlying_quantity',
                'price', 'quote', 'fee', 'reported_pnl', 'gap_seconds', 'execution_spread_percent_estimate_1_to_1',
-               'delay_pnl', 'match', 'fill_id', 'order_id', 'role', 'kind')
-FILL_COLUMNS = tuple(Fill.__dataclass_fields__)
+               'delay_pnl', 'match', 'fill_id', 'order_id', 'role', 'kind', 'account')
+FILL_COLUMNS = tuple(Fill.__dataclass_fields__) + ('account',)
 
 
 def report_bundle(report):
@@ -280,6 +280,7 @@ def report_bundle(report):
         archive.writestr('Report.json', json.dumps(report, ensure_ascii=False, indent=2))
         archive.writestr('Прочитай меня.txt', '\n'.join([
             'Период UTC: ' + stamp(report['start']) + ' — ' + stamp(report['end']) + ' (конец не включён).',
+            'Аккаунты отчёта: ' + json.dumps(report.get('accounts', {}), ensure_ascii=False),
             'Nado.csv и Lighter.csv — нормализованные полные исполнения выбранных аккаунтов за период.',
             'Hedge-report.csv — попарные распределения: Nado, затем Lighter. Без пары — в конце.',
             'fee: положительное число = расход, отрицательное = возврат. Пустая ячейка = данных нет.',

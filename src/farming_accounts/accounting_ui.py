@@ -72,6 +72,7 @@ class AccountingPanel:
         self.message = label(self.frame, 'Выберите даты: программа сама загрузит историю обеих площадок. Формат: ДД.ММ.ГГГГ.',
                              color=MUTED, size=9, anchor='w', wraplength=1050, justify='left')
         self.message.pack(fill='x', padx=14, pady=(1, 8))
+        self.message.bind('<Configure>', lambda event: self.message.configure(wraplength=max(300, event.width)))
         body = tk.Frame(self.frame, bg=PANEL)
         body.pack(fill='both', expand=True, padx=14)
         body.columnconfigure(0, weight=1)
@@ -189,7 +190,7 @@ class AccountingPanel:
         self.zip_button.configure(state='normal')
         self.csv_button.configure(state='normal')
         self.message.configure(text=f'Готово: {len(report["fills"])} исполнений · {report["pairs"]} предполагаемых пар · '
-                                    f'без пары {report["unmatched_rows"]} строк. Даты на экране — местное время.')
+                                    f'без пары {report["unmatched_rows"]} строк. Даты — местные. ' + self.account_names(report))
         closed = report['closed_summary']
         lines = [f'Закрытых частей хеджа: {closed["count"]}',
                  'Результат после комиссий ≈ ' + self.format(closed['known_net_estimate_1_to_1']) + ' USD'
@@ -216,6 +217,15 @@ class AccountingPanel:
                       'Подробности и все строки — в ZIP.'])
         self.set_summary('\n'.join(lines))
         self.show_page()
+
+    @staticmethod
+    def account_names(report):
+        accounts = report.get('accounts', {})
+        nado, lighter = accounts.get('Nado', {}), accounts.get('Lighter RH', {})
+        owner = nado.get('owner') or ''
+        shortened = owner[:6] + '…' + owner[-4:] if len(owner) > 12 else owner
+        return (f'Nado: {shortened} / {nado.get("subaccount", "default")} (cross). '
+                f'Lighter RH: #{lighter.get("account_index", "—")}.') if accounts else ''
 
     @staticmethod
     def format(value):

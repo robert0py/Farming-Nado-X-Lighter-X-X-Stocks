@@ -173,4 +173,3 @@ class AccountingControlTests(unittest.TestCase):
         with self.assertRaises(ControlError):
             self.client.request('/accounting/start', {'start': 1, 'end': 2})
         self.assertEqual(self.runtime.error, '')
-

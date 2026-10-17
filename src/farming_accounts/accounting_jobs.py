@@ -82,11 +82,20 @@ class AccountingJobs:
                     job['message'] = message
         try:
             config = deepcopy(self.config())
+            nado, lighter = config.get('nado', {}), config.get('lighter', {})
+            accounts = {'Nado': {'owner': nado.get('owner'), 'subaccount': nado.get('subaccount', 'default'), 'scope': 'cross'},
+                        'Lighter RH': {'wallet_address': lighter.get('wallet_address'), 'account_index': lighter.get('account_index'),
+                                       'network': 'Robinhood Chain'}}
             fills = self.fetcher(config, job['start'], job['end'], job['cancel'], progress)
             config.clear()
             if job['cancel'].is_set():
                 return
             report = make_report(fills, job['start'], job['end'])
+            report['accounts'] = accounts
+            identities = {'Nado': str(accounts['Nado']['owner'] or '') + ':' + accounts['Nado']['subaccount'],
+                          'Lighter RH': str(accounts['Lighter RH']['account_index'] or '')}
+            for row in report['rows'] + report['fills']:
+                row['account'] = identities[row['venue']]
             with self.lock:
                 if not job['cancel'].is_set():
                     job['report'], job['state'] = report, 'ready'
