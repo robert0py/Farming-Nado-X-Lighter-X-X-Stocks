@@ -439,6 +439,18 @@ class NadoLifecycleTests(unittest.TestCase):
 
 
 class NadoTransportTests(unittest.TestCase):
+    def test_read_rejection_explains_operation_and_safe_code_without_raw_payload(self):
+        transport = NadoTransport()
+        with patch.object(transport, '_request', return_value={'status': 'failure', 'error_code': 2018,
+                          'error': 'sensitive-reflected-sender-and-signature'}):
+            with self.assertRaises(TradingError) as caught:
+                transport.query({'type': 'max_order_size'})
+        self.assertIn('2018', str(caught.exception))
+        self.assertIn('размера ордера', str(caught.exception))
+        self.assertIn('фьючерсный', str(caught.exception))
+        self.assertNotIn('sensitive', str(caught.exception))
+        self.assertNotIn('ключ', str(caught.exception))
+
     def test_temporary_read_failure_is_retryable_and_never_reflects_request_secrets(self):
         from farming_accounts.trading.domain import ReadUnavailable
         class Opener:

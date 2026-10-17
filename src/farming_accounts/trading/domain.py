@@ -9,6 +9,14 @@ class TradingError(Exception):
     """A safe error with no credentials or raw signed payloads."""
 
 
+class AccessVerificationError(TradingError):
+    """Identify which venue failed verification without blaming unrelated keys."""
+
+    def __init__(self, venue, message):
+        super().__init__(message)
+        self.venue = venue
+
+
 class UnknownExecution(TradingError):
     """A write may have reached the exchange; only reconciliation is allowed."""
 

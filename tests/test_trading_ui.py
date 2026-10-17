@@ -11,6 +11,54 @@ from test_app import ControlledExecutor
 
 
 class TradingDesktopTests(unittest.TestCase):
+    def test_closed_message_disappears_after_ten_seconds_and_poll_cannot_resurrect_it(self):
+        self.panel.data = {'execution': {'state': 'CLOSED', 'running': False, 'cycle': {
+            'id': 'done', 'state': 'CLOSED', 'updated_at': 50, 'hedged_at': 1, 'message': 'Обе стороны закрыты.'}}}
+        with patch('farming_accounts.trade_ui.time.monotonic', return_value=100):
+            self.panel.render()
+        with patch('farming_accounts.trade_ui.time.monotonic', return_value=109.99):
+            self.panel.render(); self.panel.expire_message()
+            self.assertEqual(self.panel.message.cget('text'), 'Обе стороны закрыты.')
+            self.assertEqual(self.panel.message_deadline, 110)
+        with patch('farming_accounts.trade_ui.time.monotonic', return_value=110):
+            self.panel.expire_message(); self.panel.render()
+            self.assertEqual(self.panel.message.cget('text'), '')
+            self.assertEqual(self.panel.message.winfo_manager(), '')
+        with patch('farming_accounts.trade_ui.time.monotonic', return_value=200):
+            self.panel.render()
+            self.assertEqual(self.panel.message.cget('text'), '')
+
+    def test_active_order_and_unresolved_recovery_messages_do_not_expire(self):
+        for state in ('OPENING_SPOT', 'RECOVERY', 'HALTED', 'HEDGED'):
+            with self.subTest(state=state):
+                self.panel.data = {'execution': {'state': state, 'running': False, 'cycle': {
+                    'state': state, 'message': 'Ждём подтверждения площадки.'}}}
+                with patch('farming_accounts.trade_ui.time.monotonic', return_value=100):
+                    self.panel.render()
+                with patch('farming_accounts.trade_ui.time.monotonic', return_value=1000):
+                    self.panel.expire_message()
+                self.assertTrue(self.panel.message.cget('text'))
+                self.assertIsNone(self.panel.message_deadline)
+
+    def test_new_command_replaces_expired_message_and_uses_its_own_ten_seconds(self):
+        self.panel.data = {'execution': {'state': 'IDLE', 'running': False}}
+        with patch('farming_accounts.trade_ui.time.monotonic', return_value=100):
+            self.panel.render()
+            self.panel.show_message('Первое действие завершено.', transient=True)
+        with patch('farming_accounts.trade_ui.time.monotonic', return_value=110):
+            self.panel.expire_message()
+            self.assertFalse(self.panel.message.winfo_manager())
+            self.panel.results.put(({'message': 'Второе действие завершено.'}, None, None))
+            self.panel.poll()
+            self.assertEqual(self.panel.message_deadline, 120)
+            self.assertEqual(self.panel.message.winfo_manager(), 'pack')
+        with patch('farming_accounts.trade_ui.time.monotonic', return_value=119):
+            self.panel.render(); self.panel.expire_message()
+            self.assertEqual(self.panel.message.cget('text'), 'Второе действие завершено.')
+        with patch('farming_accounts.trade_ui.time.monotonic', return_value=120):
+            self.panel.expire_message()
+            self.assertEqual(self.panel.message.cget('text'), '')
+
     def test_manual_close_shows_residual_before_explicit_acknowledgement(self):
         self.panel.client = Mock()
         self.panel.client.request.return_value = {'ok': True, 'preview': {'cycle_id': 'saved',

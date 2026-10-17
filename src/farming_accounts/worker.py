@@ -16,7 +16,7 @@ import time
 from . import __version__
 from .models import AccountError, nado_subaccount
 from .trade_config import credentials, public_credentials, strategy, canonical_strategy, validate_current_assets
-from .trading.domain import TradingError
+from .trading.domain import AccessVerificationError, TradingError
 from .trading.journal import Journal, encoded
 from .vault import Vault, VaultError, state_directory
 from .wallet_page import HTML
@@ -237,8 +237,8 @@ class Runtime:
                     self.error = ''
             except (TradingError, VaultError) as error:
                 self.error = str(error)
-                if route in ('/preflight', '/start'):
-                    self.verified.clear()
+                if isinstance(error, AccessVerificationError):
+                    self.verified.pop(error.venue, None)
                 elif route == '/verify':
                     self.verified.pop(value.get('venue'), None)
                 response = {'ok': False, 'error': str(error)}
@@ -375,7 +375,10 @@ class Runtime:
             return {'ok': True, 'preview': preview}
         if route == '/start':
             self.check_points()
-            self.build_engine().start()
+            engine = self.build_engine()
+            engine.start()
+            if engine.access_verified:
+                self.verified.update(nado=True, lighter=True)
             self.journal.set('worker_suspended', False)
             self.wakeup.set()
             recovering = (self.journal.active_cycle() or {}).get('state') == 'RECOVERY'

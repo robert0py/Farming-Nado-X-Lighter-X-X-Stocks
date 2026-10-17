@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 
-from .domain import (Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable, Strategy, TradingError,
+from .domain import (AccessVerificationError, Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable, Strategy, TradingError,
                      TradingGateway, UnknownExecution, maker_opening_price, quantize)
 from .journal import Journal, encoded
 
@@ -20,10 +20,19 @@ class Engine:
         self._mutex = threading.RLock()
         self._verified = False
 
+    @property
+    def access_verified(self):
+        return self._verified
+
     def _verify(self) -> None:
         if not self._verified:
-            self.nado.verify()
-            self.lighter.verify()
+            for venue in ('nado', 'lighter'):
+                try:
+                    self._gateway(venue).verify()
+                except ReadUnavailable:
+                    raise
+                except TradingError as error:
+                    raise AccessVerificationError(venue, str(error)) from None
             self._verified = True
 
     def _gateway(self, venue: str) -> TradingGateway:
@@ -143,9 +152,8 @@ class Engine:
         with self._mutex, localcontext() as context:
             context.prec = 96
             self.strategy.validate()
-            self.nado.verify()
-            self.lighter.verify()
-            self._verified = True
+            self._verified = False
+            self._verify()
             pairs = self._pairs()
             cash, margin = self.nado.available(), self.lighter.available()
             result = []
@@ -172,6 +180,10 @@ class Engine:
                     required_margin = max(self.strategy.notional_per_leg, hedge * books[1].ask)
                     if margin < required_margin + self.strategy.margin_reserve:
                         raise TradingError("Недостаточно обеспечения Lighter для встречной экспозиции с резервом.")
+                    capacity = getattr(self.nado, 'check_order_capacity', None)
+                    if capacity is not None:
+                        side = 'buy' if self._direction(pair[0]) > 0 else 'sell'
+                        capacity(pair[0], side, target, self._opening_price(pair[0], books[0], self.strategy, side))
                     for instrument in pair:
                         checker = getattr(self._gateway(instrument.venue), "execution_ready", None)
                         if checker is not None:
@@ -245,13 +257,18 @@ class Engine:
             return 1
         return -int(self.journal.get('last_crypto_direction', -1))
 
-    def _opening_size(self, instrument: Instrument, book: Book, strategy: Strategy, direction=1) -> Decimal:
+    @staticmethod
+    def _opening_price(instrument, book, strategy, side):
         maker = strategy.nado_post_only
         cap = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent, mode=strategy.nado_maker_price_mode,
-                                  side='buy' if direction > 0 else 'sell') if maker else
+                                  side=side) if maker else
                quantize(book.ask * (1 + strategy.max_slippage_bps / 10000), instrument.price_tick))
         if (not maker and cap < book.ask) or cap <= 0:
             raise TradingError("Ценовой шаг не позволяет соблюсти установленное проскальзывание.")
+        return cap
+
+    def _opening_size(self, instrument: Instrument, book: Book, strategy: Strategy, direction=1) -> Decimal:
+        cap = self._opening_price(instrument, book, strategy, 'buy' if direction > 0 else 'sell')
         quantity = quantize(strategy.notional_per_leg / cap, instrument.quantity_step)
         if quantity < instrument.min_qty or quantity * cap < instrument.min_notional:
             minimum = quantize(max(instrument.min_qty, instrument.min_notional / cap),

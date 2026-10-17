@@ -16,6 +16,21 @@ from farming_accounts.trading.domain import TradingError
 
 
 class ControlTests(unittest.TestCase):
+    def test_operational_start_error_preserves_verified_keys(self):
+        self.runtime.verified.update(nado=True, lighter=True)
+        with patch.object(self.runtime, '_command', side_effect=TradingError('Размер ниже минимума рынка')):
+            with self.assertRaises(ControlError):
+                self.client.request('/start', {})
+        self.assertEqual(self.client.request('/status')['verified'], {'nado': True, 'lighter': True})
+
+    def test_failed_start_verification_invalidates_only_the_failed_venue(self):
+        from farming_accounts.trading.domain import AccessVerificationError
+        self.runtime.verified.update(nado=True, lighter=True)
+        with patch.object(self.runtime, '_command', side_effect=AccessVerificationError('nado', 'Привязка Nado изменилась')):
+            with self.assertRaises(ControlError):
+                self.client.request('/start', {})
+        self.assertEqual(self.client.request('/status')['verified'], {'lighter': True})
+
     def test_manual_close_preview_and_acknowledgement_are_distinct_commands(self):
         helper = Mock()
         helper.reconcile_manual_close.return_value = {'cycle_id': 'saved', 'normalized': '10', 'remaining': '.01'}

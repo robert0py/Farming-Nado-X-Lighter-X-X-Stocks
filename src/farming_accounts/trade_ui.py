@@ -143,7 +143,10 @@ class TradingPanel:
         self.message = label(parent, 'Сначала подключите процесс торговли. На этом ПК он работает, пока компьютер включён.',
                              color=MUTED, anchor='w', justify='left', wraplength=1100, size=10)
         self.message.pack(fill='x', pady=(0, 10))
-        current = tk.Frame(parent, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
+        self.message_deadline = time.monotonic() + 10
+        self.message_pending = False
+        self.terminal_message_key = None
+        current = self.current_card = tk.Frame(parent, bg=PANEL, highlightbackground=LINE, highlightthickness=1)
         current.pack(fill='x')
         self.cycle_state = label(current, 'Текущий хедж: —', bold=True, size=13, anchor='w')
         self.cycle_state.pack(fill='x', padx=16, pady=(12, 6))
@@ -170,6 +173,19 @@ class TradingPanel:
         self.table.pack(fill='both', expand=True, padx=16, pady=(0, 12))
         self.refresh_id = app.root.after(200, self.poll)
         self.render()
+
+    def show_message(self, text, *, transient=False, pending=False):
+        self.message.configure(text=text)
+        if text and not self.message.winfo_manager():
+            self.message.pack(fill='x', pady=(0, 10), before=self.current_card)
+        self.message_deadline = time.monotonic() + 10 if transient else None
+        self.message_pending = pending
+
+    def expire_message(self):
+        if not self.busy and self.message_deadline is not None and time.monotonic() >= self.message_deadline:
+            self.message.configure(text='')
+            self.message.pack_forget()
+            self.message_deadline = None
 
     def button(self, parent, title, command, *, primary=False):
         button = ttk.Button(parent, text=title, command=command, style='Primary.TButton' if primary else 'TButton')
@@ -209,17 +225,17 @@ class TradingPanel:
                     if not self.closed and self.client is not None:
                         self.request(path, value, callback, on_error)
                 self.control_waits[request_key] = self.app.root.after(100, pending)
-                self.message.configure(text='Действие принято. Выполню после текущей команды; повторно нажимать не нужно.')
+                self.show_message('Действие принято. Выполню после текущей команды; повторно нажимать не нужно.', pending=True)
                 self.render_buttons()
             return
         self.active_request = request_key
         if path in ('/stop', '/close', '/shutdown'):
             self.active_control = path
         if path == '/start':
-            self.message.configure(text='Проверяем доступ к Nado и Lighter, средства и рынок. Затем отправляем первую лимитку Nado. '
-                                        'Интервал перестановки начнётся после выставления, ждать его перед первым ордером не нужно.')
+            self.show_message('Проверяем доступ к Nado и Lighter, средства и рынок. Затем отправляем первую лимитку Nado. '
+                              'Интервал перестановки начнётся после выставления, ждать его перед первым ордером не нужно.', pending=True)
         else:
-            self.message.configure(text='Выполняю команду…')
+            self.show_message('Выполняю команду…', pending=True)
         self.work(lambda: self.client.request(path, value), callback, on_error)
 
     def connect_local(self):
@@ -230,8 +246,8 @@ class TradingPanel:
         def connected(result):
             self.client, self.data = result
             self.worker_label.configure(text='Торговля: этот компьютер · ' + self.data.get('version', ''))
-            self.message.configure(text='Worker продолжит работу после закрытия окна. Для работы при выключенном ПК подключите VPS.')
             self.render()
+            self.show_message('Процесс торговли продолжит работу после закрытия окна. Для работы при выключенном ПК подключите VPS.', transient=True)
         self.work(connect, connected)
 
     def disconnected(self, result):
@@ -268,8 +284,8 @@ class TradingPanel:
                 if dialog.winfo_exists():
                     dialog.destroy()
                 self.worker_label.configure(text='Торговля: VPS ' + values[0])
-                self.message.configure(text='Подключён независимый серверный worker.')
                 self.render()
+                self.show_message('Подключён независимый серверный процесс.', transient=True)
             self.work(job, connected)
         ttk.Button(content, text='Подключить', command=connect, style='Primary.TButton').pack(anchor='w', pady=(15, 0))
         try:
@@ -351,7 +367,7 @@ class TradingPanel:
                 except Exception:
                     opened = False
                 if not opened:
-                    self.message.configure(text='Скопируйте ссылку и откройте её в браузере с MetaMask.')
+                    self.show_message('Скопируйте ссылку и откройте её в браузере с MetaMask.', transient=True)
             def copy():
                 dialog.clipboard_clear()
                 dialog.clipboard_append(value.get())
@@ -435,10 +451,21 @@ class TradingPanel:
             reason = ('Ордер отклонён площадкой. ' + cycle.get('message', '') if cycle.get('outcome') == 'REJECTED'
                       else 'Хедж не был открыт; удержание не запускалось. ' + cycle.get('message', '')
                       if cycle.get('outcome') else 'Хедж не был открыт; удержание не запускалось.')
-        if reason:
+        if reason and not self.busy:
             if execution.get('running') is False and state not in ('CLOSED', 'IDLE', 'NOT_CONFIGURED'):
                 reason = 'Новые циклы остановлены. ' + reason
-            self.message.configure(text=reason)
+            active = (execution.get('running') or cycle and cycle.get('state') != 'CLOSED' or
+                      state in ('OPENING_SPOT', 'OPENING_HEDGE', 'HEDGED', 'CLOSING', 'HALTED', 'RECOVERY', 'WAITING_API'))
+            if active:
+                self.terminal_message_key = None
+                self.show_message(reason)
+            else:
+                key = (state, cycle.get('id'), cycle.get('updated_at'), reason)
+                if key != self.terminal_message_key or self.message_pending:
+                    self.terminal_message_key = key
+                    self.show_message(reason, transient=True)
+        elif not self.busy and self.message_pending:
+            self.show_message('Действие завершено.', transient=True)
         self.table.delete(*self.table.get_children())
         for item in self.data.get('history', ()):
             def stamp(value):
@@ -474,8 +501,8 @@ class TradingPanel:
             self.busy = False
             self.active_control = None
             self.active_request = None
+            feedback = error
             if error:
-                self.message.configure(text=error)
                 self.app.log('Торговля', error, error=True)
                 if on_error:
                     try:
@@ -488,7 +515,7 @@ class TradingPanel:
                         callback(result)
                     except Exception:
                         message = 'Не удалось обработать ответ. Проверьте состояние подключения перед повторной командой.'
-                        self.message.configure(text=message)
+                        feedback = message
                         if on_error:
                             try:
                                 on_error(message)
@@ -497,12 +524,13 @@ class TradingPanel:
                 elif isinstance(result, dict) and 'execution' in result:
                     self.data = result
                 if isinstance(result, dict) and result.get('message'):
-                    self.message.configure(text=result['message'])
+                    feedback = result['message']
                     self.app.log('Торговля', result['message'])
             self.render()
-            if error:
-                # A failed start must not be hidden by the last cycle's message.
-                self.message.configure(text=error)
+            if feedback:
+                # Command feedback gets ten seconds; polling the same closed
+                # cycle must neither restart that clock nor resurrect old text.
+                self.show_message(feedback, transient=True)
             is_status = isinstance(result, dict) and 'execution' in result
             self.next_refresh = time.monotonic() + (5 if error or self.client is None or is_status else 0)
         if self.client is not None and not self.busy and not self.status_pending and time.monotonic() >= self.next_refresh:
@@ -516,6 +544,7 @@ class TradingPanel:
                     result, error = None, True
                 self.status_results.put((generation, client, result, error))
             self.status_executor.submit(refresh)
+        self.expire_message()
         self.refresh_id = self.app.root.after(200, self.poll)
 
     def close(self):

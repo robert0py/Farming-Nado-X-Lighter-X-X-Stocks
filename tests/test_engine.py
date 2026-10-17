@@ -1002,6 +1002,23 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.nado.requests + self.lighter.requests, [])
         self.assertEqual(self.journal.history(), [])
 
+    def test_preflight_checks_actual_order_capacity_before_accepting_start(self):
+        checked = []
+        def capacity(instrument, side, quantity, price):
+            checked.append((instrument, side, quantity, price))
+            raise TradingError('Размер заявки превышает доступный лимит Nado')
+        self.nado.check_order_capacity = capacity
+        result = self.engine.preflight()
+        self.assertTrue(all(not row['ready'] for row in result['markets']))
+        self.assertTrue(all('лимит Nado' in row['reason'] for row in result['markets']))
+        self.assertEqual(len(checked), 2)
+        self.assertTrue(all(side == 'buy' and quantity > 0 and price > 0 for _, side, quantity, price in checked))
+        with self.assertRaisesRegex(TradingError, 'лимит Nado'):
+            self.engine.start()
+        self.assertEqual(self.nado.requests + self.lighter.requests, [])
+        self.assertEqual(self.journal.history(), [])
+        self.assertFalse(self.journal.get('running', False))
+
     def test_stream_authentication_rejection_prevents_start_without_order_intents(self):
         def rejected(instrument):
             raise TradingError("fixture websocket authentication rejected")

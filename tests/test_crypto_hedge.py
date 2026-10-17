@@ -153,6 +153,8 @@ class PerpTransport(FakeTransport):
         self.fill = D(0)
 
     def query(self, params):
+        if params['type'] == 'max_order_size' and 'spot_leverage' in params:
+            raise TradingError('Nado 2018: product ID must be for a spot market')
         result = super().query(params)
         if params['type'] == 'subaccount_info':
             result['spot_balances'][1]['balance']['amount'] = raw(0)
@@ -165,6 +167,8 @@ class PerpTransport(FakeTransport):
     def execute(self, body):
         self.calls.append(('execute', body))
         if 'place_order' in body:
+            if 'spot_leverage' in body['place_order']:
+                raise AssertionError('Perpetual submission must not select the spot-only API path')
             self.pending = body['place_order']
             self.orders = [{'digest': self.pending['digest']}]
             return {'status': 'success', 'data': {'digest': self.pending['digest']}}
@@ -190,6 +194,28 @@ class PerpTransport(FakeTransport):
 
 
 class CryptoNadoTests(unittest.TestCase):
+    def test_capacity_and_submission_use_perpetual_path_for_both_directions(self):
+        for side, position, reducing in [('buy', D(0), False), ('sell', D(0), False),
+                                          ('sell', D(1), True), ('buy', D(-1), True)]:
+            with self.subTest(side=side, reducing=reducing), TemporaryDirectory() as directory, Journal(Path(directory)/'state.sqlite3') as journal:
+                transport = PerpTransport(); transport.base = position
+                gateway = NadoGateway(OWNER, approved_assets=('BTC',), transport=transport, signer=FakeSigner(),
+                                      stream_factory=FakeStream, journal=journal, clock=lambda: NOW)
+                item = gateway.instruments()[0]
+                snapshot = gateway.capture_position(item)
+                gateway.check_order_capacity(item, side, D(1), D(104))
+                self.assertFalse(any(kind == 'execute' for kind, _ in transport.calls))
+                intent = OrderIntent('crypto', 'cycle', 'nado', item, side, D(1), D(104), reducing,
+                                     ((NOW+60)*1000 << 20), NOW+900, True)
+                journal.save_cycle(dict(id='cycle', state='OPENING_SPOT', spot_account_baseline=snapshot))
+                journal.put_intent(intent, 'close_spot' if reducing else 'open_spot')
+                self.assertEqual(gateway.submit(intent).status, 'PENDING')
+                self.assertNotIn('spot_leverage', transport.pending)
+                requests = [p for kind, p in transport.calls if kind == 'query' and p['type'] == 'max_order_size']
+                self.assertEqual(len(requests), 2)
+                self.assertTrue(all('spot_leverage' not in p for p in requests))
+                self.assertEqual(requests[-1]['direction'], 'long' if side == 'buy' else 'short')
+
     def test_signed_short_fill_is_proved_and_negative_baseline_survives_restart(self):
         with TemporaryDirectory() as directory, Journal(Path(directory)/'state.sqlite3') as journal:
             transport = PerpTransport()

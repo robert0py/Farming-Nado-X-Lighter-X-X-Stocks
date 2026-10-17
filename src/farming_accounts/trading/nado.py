@@ -255,7 +255,19 @@ class NadoTransport:
             raise TradingError("Запрос Nado не разрешён торговым адаптером.")
         result = self._request("/gateway/v1/query", params=parameters)
         if result.get("status") != "success":
-            raise TradingError("Nado отклонил запрос чтения. Проверьте состояние аккаунта и рынка.")
+            raw_code = result.get('error_code')
+            code = raw_code if type(raw_code) is int and 0 <= raw_code <= 999999 else None
+            operation = {'max_order_size': 'расчёт допустимого размера ордера',
+                         'linked_signer': 'проверку привязки торгового ключа',
+                         'subaccount_info': 'чтение состояния аккаунта',
+                         'market_liquidity': 'чтение стакана',
+                         'subaccount_orders': 'чтение открытых ордеров'}.get(parameters['type'], 'чтение данных API')
+            detail = ('Параметры запроса предназначены для спота, а выбран фьючерсный рынок.' if code == 2018
+                      else ORDER_REJECTIONS.get(code, 'Площадка не подтвердила запрошенные данные.'))
+            message = f"Nado отклонил {operation}" + (f' (код {code})' if code is not None else '') + '. ' + detail
+            if code in (1000, 1015, 1004, 2068):
+                raise ReadUnavailable(message)
+            raise TradingError(message)
         return _obj(result.get("data"))
 
     def symbols(self):
@@ -735,6 +747,22 @@ class NadoGateway:
                                                       "0x" + intent.instrument.id.to_bytes(20, "big").hex()))
         return message, signature, digest
 
+    def check_order_capacity(self, instrument, side, quantity, price, *, reduce_only=False):
+        """The same read-only size check for preflight and the actual submission.
+
+        Supplying spot_leverage (even true) selects Nado's spot-only path.
+        Perpetuals must omit it; spot orders explicitly forbid borrowing.
+        """
+        parameters = {'type': 'max_order_size', 'sender': self.sender, 'product_id': instrument.id,
+                      'price_x18': str(_scaled(price)), 'direction': 'long' if side == 'buy' else 'short',
+                      'reduce_only': str(reduce_only).lower()}
+        if instrument.kind == 'spot':
+            parameters['spot_leverage'] = 'false'
+        maximum = self.transport.query(parameters)
+        if abs(_x18(maximum.get('max_order_size'))) < quantity:
+            raise TradingError('Размер заявки превышает доступный лимит Nado' +
+                               (' без займа.' if instrument.kind == 'spot' else ' для фьючерсного рынка.'))
+
     def _precheck(self, intent):
         self.verify()
         if intent.expiry <= self.clock() or not self.clock() * 1000 < intent.nonce >> 20 <= self.clock() * 1000 + 100000:
@@ -752,12 +780,8 @@ class NadoGateway:
                     raise TradingError('Закрытие Nado превышает фактическую фьючерсную позицию или имеет неверную сторону.')
             elif position != 0 and (position > 0) != (intent.side == 'buy'):
                 raise TradingError('Нельзя открывать криптохедж поверх противоположной позиции Nado.')
-            maximum = self.transport.query({'type': 'max_order_size', 'sender': self.sender,
-                'product_id': intent.instrument.id, 'price_x18': str(_scaled(intent.limit_price)),
-                'direction': 'long' if intent.side == 'buy' else 'short', 'spot_leverage': 'false',
-                'reduce_only': str(intent.reduce_only and not intent.post_only).lower()})
-            if abs(_x18(maximum.get('max_order_size'))) < intent.quantity:
-                raise TradingError('Размер фьючерсной заявки превышает доступное обеспечение Nado.')
+            self.check_order_capacity(intent.instrument, intent.side, intent.quantity, intent.limit_price,
+                                      reduce_only=intent.reduce_only and not intent.post_only)
             return snapshot
         balances = self._account()
         baseline = balances.get(intent.instrument.id, Decimal(0))
@@ -776,12 +800,8 @@ class NadoGateway:
         fee_rate = max(Decimal(0), fee_rate)  # Rebates are not spendable before settlement.
         if intent.side == "buy" and balances[0] < intent.quantity * intent.limit_price * (1 + fee_rate) + fee_fixed:
             raise TradingError("Недостаточно USDT0 для spot-покупки и комиссий без займа.")
-        maximum = self.transport.query({"type": "max_order_size", "sender": self.sender,
-                                       "product_id": intent.instrument.id, "price_x18": str(_scaled(intent.limit_price)),
-                                       "direction": "long" if intent.side == "buy" else "short",
-                                       "spot_leverage": "false", "reduce_only": str(intent.reduce_only and not intent.post_only).lower()})
-        if abs(_x18(maximum.get("max_order_size"))) < intent.quantity:
-            raise TradingError("Размер spot-ордера превышает лимит Nado без займа.")
+        self.check_order_capacity(intent.instrument, intent.side, intent.quantity, intent.limit_price,
+                                  reduce_only=intent.reduce_only and not intent.post_only)
         return self.capture_position(intent.instrument)
 
     def submit(self, intent):
@@ -798,7 +818,9 @@ class NadoGateway:
                     self._contracts[0], self._contracts[1], self.clock))
                 payload = {"product_id": intent.instrument.id, "order": {k: str(v) if k != "sender" else v
                                                                           for k, v in message.items()},
-                           "signature": signature, "digest": digest, "spot_leverage": False}
+                           "signature": signature, "digest": digest}
+                if intent.instrument.kind == 'spot':
+                    payload['spot_leverage'] = False
                 if intent.post_only:
                     if self.journal is None:
                         raise TradingError('Maker-ордер требует постоянного журнала до отправки.')
