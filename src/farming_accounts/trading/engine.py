@@ -365,7 +365,8 @@ class Engine:
                 self.journal.observe(result, observed_at=self.clock())
                 if result.status == 'PENDING' and result.filled_quantity == 0:
                     confirmed_resting.add(intent.client_id)
-                if result.terminal and intent.reduce_only and result.filled_quantity == 0 and (not intent.post_only or result.status == 'REJECTED'):
+                code, _ = self._rejection(intent)
+                if result.terminal and intent.reduce_only and result.filled_quantity == 0 and (not intent.post_only or result.status == 'REJECTED' and code != 2008):
                     self.journal.set("running", False)
                     _, reason = self._rejection(intent)
                     self._transition(cycle, "HALTED", "Закрытие не исполнилось. Остаток сохранён; автоматических повторов нет. " + reason)
@@ -377,10 +378,12 @@ class Engine:
                        if obs is None or not obs.terminal]
             maker_wait = (len(pending) == 1 and pending[0][0].post_only and
                           pending[0][0].client_id in confirmed_resting and
-                          not pending[0][0].reduce_only and pending[0][1] is not None and
+                          pending[0][1] is not None and
                           pending[0][1].status == 'PENDING' and pending[0][1].filled_quantity == 0)
             if maker_wait:
-                self._transition(cycle, 'OPENING_SPOT',
+                closing_maker = pending[0][0].reduce_only
+                self._transition(cycle, 'CLOSING' if closing_maker else 'OPENING_SPOT',
+                                 'Лимитное закрытие Nado принято. Ждём исполнения; Lighter сохраняется до подтверждения закрытого объёма.' if closing_maker else
                                  'Лимитный maker-ордер Nado принят. Ожидаем покупку; таймер удержания начнётся после открытия обеих сторон.')
             else:
                 reasons = [self.journal.get('reconciliation:' + intent.client_id) for intent, _ in pending]
@@ -448,9 +451,8 @@ class Engine:
         factor = strategy.max_slippage_bps / 10000
         maker = instrument.venue.casefold() == 'nado' and strategy.nado_post_only
         if maker:
-            limit = (maker_opening_price(instrument, book, strategy.nado_maker_distance_percent, mode=strategy.nado_maker_price_mode,
-                                         side=side) if not reduce_only else
-                     quantize(book.bid if side == 'buy' else book.ask, instrument.price_tick, upward=side == 'sell'))
+            limit = maker_opening_price(instrument, book, strategy.nado_maker_distance_percent,
+                                       mode=strategy.nado_maker_price_mode, side=side)
         else:
             limit = quantize(book.ask * (1 + factor), instrument.price_tick) if side == "buy" else quantize(
                 book.bid * (1 - factor), instrument.price_tick, upward=True)
@@ -466,13 +468,13 @@ class Engine:
         if not reduce_only and self._gateway(instrument.venue).available() < quantity * limit + strategy.margin_reserve:
             raise TradingError("Недостаточно средств с установленным резервом.")
         sequence = len(self.journal.orders(cycle["id"])) + 1
-        expiry = int(self.clock()) + (max(900, strategy.nado_maker_reprice_seconds + 60) if maker and not reduce_only else 90)
+        expiry = int(self.clock()) + (max(900, strategy.nado_maker_reprice_seconds + 60) if maker else 90)
         receive_until = int(self.clock()) + 90
         intent = OrderIntent(uuid.uuid5(uuid.NAMESPACE_URL, f"{cycle['id']}:{sequence}:{instrument.venue}").hex,
                              cycle["id"], instrument.venue, instrument, side, quantity, limit, reduce_only,
                              (receive_until * 1000 << 20) | sequence, expiry, post_only=maker)
         self.journal.put_intent(intent, action)
-        if maker and not reduce_only:
+        if maker:
             midpoint = (book.bid + book.ask) / 2
             self.journal.set('pricing:' + intent.client_id, {
                 'price_mode': strategy.nado_maker_price_mode, 'side': side, 'reference_ask': str(book.ask), 'reference_bid': str(book.bid),
@@ -488,12 +490,13 @@ class Engine:
                 raise UnknownExecution("Площадка не подтвердила идентификатор отправленного ордера.")
             self.journal.observe(result, observed_at=self.clock())
             if not result.terminal:
-                if maker and not reduce_only and result.status == 'PENDING' and result.filled_quantity == 0:
-                    self._transition(cycle, 'OPENING_SPOT',
+                if maker and result.status == 'PENDING' and result.filled_quantity == 0:
+                    self._transition(cycle, 'CLOSING' if reduce_only else 'OPENING_SPOT',
+                                     'Ждём исполнения лимитного закрытия Nado. Затем закрываем соответствующий объём Lighter.' if reduce_only else
                                      'Лимитный maker-ордер Nado принят. Ожидаем покупку; таймер удержания начнётся после открытия обеих сторон.')
                 else:
                     self._transition(cycle, "RECOVERY", "Ордер принят; ожидание фактического исполнения.")
-            elif reduce_only and result.filled_quantity == 0 and (not maker or result.status == 'REJECTED'):
+            elif reduce_only and result.filled_quantity == 0 and (not maker or result.status == 'REJECTED' and self._rejection(intent)[0] != 2008):
                 self.journal.set("running", False)
                 _, reason = self._rejection(intent)
                 self._transition(cycle, "HALTED", "Площадка не исполнила закрытие в пределах цены. Требуется проверка остатка; повторов нет. " + reason)
@@ -524,7 +527,8 @@ class Engine:
             if observation and observation.terminal and observation.filled_quantity:
                 value = observation.filled_quantity * observation.average_price
                 cash += value if intent.side == "sell" else -value
-                cash -= observation.fee
+                if observation.fee is not None:
+                    cash -= observation.fee
         return (cash + spot_quantity * (spot_book.bid if spot_quantity >= 0 else spot_book.ask)
                 + perp_quantity * (perp_book.bid if perp_quantity >= 0 else perp_book.ask))
 
@@ -575,7 +579,9 @@ class Engine:
                 residual_quote = abs(residual) * spot_book.ask / spot.multiplier
                 pnl = self._pnl(cycle, spot_book, perp_book, spot_quantity, perp_quantity)
                 cycle.update(spot_quantity=str(spot_quantity), perp_quantity=str(perp_quantity),
-                             residual_notional=str(residual_quote), pnl_quote=str(pnl))
+                             residual_notional=str(residual_quote), pnl_quote=str(pnl),
+                             fees_complete=all(obs.fee is not None for _, _, obs in self.journal.orders(cycle['id'])
+                                               if obs and obs.filled_quantity > 0))
                 self.journal.save_cycle(cycle)
                 correcting_orders = []
                 for index, (action, intent, observation) in enumerate(self.journal.orders(cycle['id'])):
@@ -584,11 +590,11 @@ class Engine:
                     if observation and observation.status == 'NOT_SUBMITTED':
                         continue
                     code, _ = self._rejection(intent)
-                    maker_wait = (action == 'open_spot' and intent.post_only and observation and
+                    maker_wait = (action in ('open_spot', 'close_spot') and intent.post_only and observation and
                                   observation.terminal and observation.filled_quantity == 0 and
                                   (observation.status in ('CANCELLED', 'EXPIRED') or
                                    observation.status == 'REJECTED' and code == 2008))
-                    if not maker_wait:
+                    if not maker_wait and not intent.reduce_only:
                         correcting_orders.append(intent)
                 if len(correcting_orders) > 16:
                     raise TradingError("Превышен предел корректирующих ордеров; автоматическое исполнение остановлено.")
@@ -642,11 +648,6 @@ class Engine:
                     self.journal.set("close_requested", False)
                     return self.status()
                 if closing:
-                    empty_closes = sum(1 for index, (action, intent, obs) in enumerate(self.journal.orders(cycle['id']))
-                                       if index >= cycle.get('retry_budget_start', 0)
-                                       if action == 'close_spot' and intent.post_only and obs and obs.status in ('CANCELLED', 'EXPIRED') and obs.filled_quantity == 0)
-                    if empty_closes >= 3:
-                        raise TradingError('Maker-закрытие трижды отменено без исполнения. Остаток сохранён; проверьте рынок и запросите закрытие снова.')
                     reasons = []
                     if loss_limit:
                         reasons.append(f'Расчётный PnL {pnl} достиг порога убытка −{strategy.max_loss_quote}.')
@@ -654,9 +655,11 @@ class Engine:
                         reasons.append(f'Свободное обеспечение Lighter {available} USDG ниже резерва {strategy.margin_reserve} USDG.')
                     if nado_available is not None and nado_available < strategy.margin_reserve:
                         reasons.append(f'Свободное обеспечение Nado {nado_available} USDT0 ниже резерва {strategy.margin_reserve} USDT0.')
-                    self._transition(cycle, "CLOSING", ' '.join(reasons) or cycle.get('message') or "Контролируемое закрытие обеих сторон.")
-                    if perp_quantity != 0:
-                        self._write(cycle, perp, perp_book, 'buy' if perp_quantity < 0 else 'sell', abs(perp_quantity), "close_perp", reduce_only=True)
+                    self._transition(cycle, "CLOSING", ' '.join(reasons) or 'Сначала лимитно закрываем Nado; затем рыночно уменьшаем Lighter на подтверждённый закрытый объём.')
+                    remaining_hedge = quantize(abs(spot_quantity * spot.multiplier) / perp.multiplier, perp.quantity_step)
+                    excess_hedge = max(Decimal(0), abs(perp_quantity) - remaining_hedge)
+                    if excess_hedge > 0:
+                        self._write(cycle, perp, perp_book, 'buy' if perp_quantity < 0 else 'sell', excess_hedge, 'close_perp', reduce_only=True)
                     elif spot_quantity != 0:
                         self._write(cycle, spot, spot_book, 'sell' if spot_quantity > 0 else 'buy', abs(spot_quantity), "close_spot", reduce_only=True)
                     elif cycle["attempts"] == 0:

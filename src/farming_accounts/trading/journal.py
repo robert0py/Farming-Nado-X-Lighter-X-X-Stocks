@@ -35,7 +35,8 @@ def decode_observation(raw: str | None) -> OrderObservation | None:
         return None
     value = json.loads(raw)
     for key in ("filled_quantity", "fee"):
-        value[key] = Decimal(value[key])
+        if value[key] is not None:
+            value[key] = Decimal(value[key])
     if value["average_price"] is not None:
         value["average_price"] = Decimal(value["average_price"])
     return OrderObservation(**value)
@@ -164,7 +165,8 @@ class Journal:
             intent, old = decode_intent(row[0]), decode_observation(row[1])
             quantity = observation.filled_quantity
             if (not quantity.is_finite() or quantity < 0 or quantity > intent.quantity or
-                    (old is not None and quantity < old.filled_quantity) or not observation.fee.is_finite()):
+                    (old is not None and quantity < old.filled_quantity) or
+                    observation.fee is not None and not observation.fee.is_finite()):
                 raise TradingError("Площадка вернула противоречивое исполнение ордера.")
             if old is not None and old.terminal and (not observation.terminal or quantity != old.filled_quantity):
                 raise TradingError("Терминальное исполнение ордера изменилось.")

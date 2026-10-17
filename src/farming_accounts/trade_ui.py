@@ -47,7 +47,7 @@ def execution_step(data):
             return f'Открываем {lighter_side} Lighter', f'Nado {nado_side} подтверждён. Хеджируем фактически исполненное количество; ждём подтверждения Lighter.'
         if state == 'HEDGED':
             return title, f'Nado {nado_side} и Lighter {lighter_side} подтверждены. Идёт удержание до таймера. Funding двух площадок может различаться.'
-        return title, f'Закрываем {lighter_side} Lighter, затем {nado_side} Nado. Проверяем остатки обеих площадок. ' + cycle.get('message', '')
+        return title, f'Закрываем {nado_side} Nado лимитным maker-ордером. После подтверждения закрытого объёма уменьшаем {lighter_side} Lighter рыночным ордером. ' + cycle.get('message', '')
     if state == 'WAITING':
         return title, (execution.get('waiting_reason') or
             'Проверяем аккаунты, средства и рынок перед первой лимиткой Nado. '
@@ -67,7 +67,7 @@ def execution_step(data):
     if state == 'HEDGED':
         return title, 'Покупка Nado и short Lighter подтверждены. Удерживаем хедж до таймера и следим за ограничениями риска.'
     if state == 'CLOSING':
-        return title, ('Закрываем short на Lighter, затем продаём купленный spot на Nado лимитным ордером. '
+        return title, ('Продаём купленный spot на Nado лимитным ордером, затем закрываем соответствующий объём short на Lighter. '
                        'Ждём подтверждения обеих площадок. ' + cycle.get('message', ''))
     if state == 'RECOVERY':
         return title, ('Уточняем у биржи, принят ли ордер и сколько исполнено. Повторный ордер пока не отправляем. '
@@ -418,7 +418,8 @@ class TradingPanel:
         if uncertain:
             self.cycle_detail.configure(text='Текущие позиции и непокрытый остаток уточняются по биржам · осталось: ' + timer)
             pnl = None
-        self.pnl.configure(text=f"Оценка PnL: {pnl if pnl is not None else '—'} · без funding и курса USDT0/USDG")
+        fee_note = ' · комиссия Lighter ещё не учтена' if cycle.get('fees_complete') is False else ''
+        self.pnl.configure(text=f"Оценка PnL: {pnl if pnl is not None else '—'}{fee_note} · без funding и курса USDT0/USDG")
         latest = {}
         for order in self.data.get('orders', ()):
             latest[order['venue']] = order
@@ -432,7 +433,7 @@ class TradingPanel:
             number = ' · ID ' + order['exchange_id'] if order.get('exchange_id') else ''
             details.append(f"{'Nado' if venue == 'nado' else 'Lighter'}: {status_name} · {order['quantity']} {order['asset']} по {order['limit_price']} · исполнено {order.get('filled_quantity') or '0'}{number}")
             pricing = order.get('pricing')
-            if venue == 'nado' and order.get('action') == 'open_spot' and pricing:
+            if venue == 'nado' and order.get('action') in ('open_spot', 'close_spot') and pricing:
                 if pricing.get('price_mode') == 'closest_ask':
                     short = pricing.get('side', 'buy') == 'sell'
                     reference = pricing.get('reference_bid') if short else pricing['reference_ask']

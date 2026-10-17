@@ -190,7 +190,7 @@ the durable engine must only call lookup(), including after a process restart.
     def _temporary_read_error(error):
         import aiohttp
         return (isinstance(error, (TimeoutError, OSError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError))
-                or getattr(error, 'status', None) in (405, 408, 429)
+                or getattr(error, 'status', None) in (0, 405, 408, 429)
                 or isinstance(getattr(error, 'status', None), int) and 500 <= error.status < 600)
 
     def __init__(self, credentials: LighterCredentials, *, sdk_module=None, clock: Callable[[], float] = time.time,
@@ -212,7 +212,7 @@ the durable engine must only call lookup(), including after a process restart.
         self._observed_ids: set[int] = set()
         self._cooldown_until = 0.0
 
-    def _run(self, factory: Callable, *, writing: bool = False):
+    def _run(self, factory: Callable, *, writing: bool = False, operation='чтение API'):
         with self._lock:
             if self._closed:
                 raise TradingError("Соединение Lighter закрыто.")
@@ -229,7 +229,10 @@ the durable engine must only call lookup(), including after a process restart.
                     raise UnknownExecution("Статус отправки Lighter неизвестен. Повтор запрещён до сверки исполнения.") from None
                 if self._temporary_read_error(exc):
                     raise ReadUnavailable('Временно недоступны данные Lighter; повторяем чтение после восстановления связи.') from None
-                raise TradingError("Не удалось получить проверенные данные Lighter. Повторите чтение позднее.") from None
+                status = getattr(exc, 'status', None)
+                if type(status) is int and 400 <= status < 500:
+                    raise TradingError(f'Lighter отклонил {operation} (HTTP {status}). Проверьте совместимость параметров запроса с API.') from None
+                raise ReadUnavailable(f'Lighter: временно не удалось выполнить {operation}; повторяем чтение без повторной отправки ордера.') from None
 
     async def _ensure_client(self):
         if self._client is not None:
@@ -490,7 +493,7 @@ the durable engine must only call lookup(), including after a process restart.
 
     def lookup(self, intent: OrderIntent) -> OrderObservation | None:
         self._instrument(intent.instrument)
-        return self._run(lambda: self._lookup(intent))
+        return self._run(lambda: self._lookup(intent), operation='сверку исполнения ордера')
 
     async def _lookup(self, intent):
         data = _response(await self._client.order_api.account_orders(
@@ -549,7 +552,7 @@ the durable engine must only call lookup(), including after a process restart.
         for _ in range(20):
             kwargs = dict(sort_by="timestamp", limit=100, authorization=await self._token(),
                           account_index=self.credentials.account_index, market_id=intent.instrument.id,
-                          order_index=order.get("order_index"), sort_dir="asc", aggregate=False,
+                          order_index=order.get("order_index"), sort_dir="desc", aggregate=False,
                           _request_timeout=REQUEST_TIMEOUT)
             if cursor:
                 kwargs["cursor"] = cursor
@@ -572,11 +575,17 @@ the durable engine must only call lookup(), including after a process restart.
                     raise TradingError("Lighter не подтвердил роль ордера в исполнении.")
                 is_maker = trade["is_maker_ask"] if side == "ask" else not trade["is_maker_ask"]
                 fee_ticks = trade.get("maker_fee" if is_maker else "taker_fee")
-                if isinstance(fee_ticks, bool) or not isinstance(fee_ticks, int):
+                if fee_ticks is not None and (isinstance(fee_ticks, bool) or not isinstance(fee_ticks, int)):
                     raise TradingError("Lighter не подтвердил комиссию исполнения.")
                 total += size
                 quote_total += usd
-                fee += usd * Decimal(fee_ticks) / Decimal(1000000)
+                # RH omits optional per-trade fees. Quantity, price, identity
+                # and fill time remain provable; never invent a zero fee or
+                # block position management on optional accounting metadata.
+                if fee_ticks is None:
+                    fee = None
+                elif fee is not None:
+                    fee += usd * Decimal(fee_ticks) / Decimal(1000000)
                 timestamp = trade.get("timestamp")
                 if timestamp is not None:
                     if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp <= 0:

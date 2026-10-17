@@ -11,6 +11,14 @@ from test_app import ControlledExecutor
 
 
 class TradingDesktopTests(unittest.TestCase):
+    def test_closing_explains_nado_first_and_discloses_missing_fee_in_pnl(self):
+        self.panel.data = {'execution': {'state': 'CLOSING', 'running': False, 'cycle': {
+            'state': 'CLOSING', 'nado_kind': 'perp', 'direction': 1, 'fees_complete': False, 'pnl_quote': '1.2'}}}
+        self.panel.render()
+        self.assertIn('Nado лимитным maker', self.panel.message.cget('text'))
+        self.assertIn('После подтверждения', self.panel.message.cget('text'))
+        self.assertIn('комиссия Lighter ещё не учтена', self.panel.pnl.cget('text'))
+
     def test_closed_message_disappears_after_ten_seconds_and_poll_cannot_resurrect_it(self):
         self.panel.data = {'execution': {'state': 'CLOSED', 'running': False, 'cycle': {
             'id': 'done', 'state': 'CLOSED', 'updated_at': 50, 'hedged_at': 1, 'message': 'Обе стороны закрыты.'}}}

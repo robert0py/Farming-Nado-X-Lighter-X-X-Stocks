@@ -15,6 +15,14 @@ def intent():
 
 
 class JournalTests(unittest.TestCase):
+    def test_unknown_fee_stays_unknown_after_restart_without_losing_confirmed_fill(self):
+        item = intent(); self.journal.put_intent(item, 'open_spot')
+        observed = OrderObservation(item.client_id, 'FILLED', item.quantity, D(125), None, filled_at=500)
+        self.journal.observe(observed, observed_at=600)
+        self.journal.close(); self.journal = Journal(self.path)
+        self.assertEqual(self.journal.orders('cycle')[0][2], observed)
+        self.assertEqual(self.journal.completion_time('cycle'), 500)
+
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.path = Path(self.temp.name) / "state.sqlite3"

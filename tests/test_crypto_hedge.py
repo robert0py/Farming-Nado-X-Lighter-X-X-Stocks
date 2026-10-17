@@ -8,7 +8,7 @@ import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
-from farming_accounts.trading.domain import Book, Instrument, OrderIntent, Strategy, TradingError, UnknownExecution, maker_opening_price, maker_price_needs_refresh
+from farming_accounts.trading.domain import Book, Instrument, OrderIntent, OrderObservation, Strategy, TradingError, UnknownExecution, maker_opening_price, maker_price_needs_refresh
 from farming_accounts.trading.engine import Engine
 from farming_accounts.trading.journal import Journal
 from farming_accounts.trading.markets import matched_markets
@@ -70,6 +70,58 @@ class CryptoCatalogTests(unittest.TestCase):
 
 
 class CryptoEngineTests(unittest.TestCase):
+    def test_timer_starts_nado_maker_close_before_lighter_and_uses_saved_price_settings(self):
+        self.hedge()
+        self.engine.stop_new_cycles()
+        deadline = self.journal.active_cycle()['deadline']
+        self.clock.value = deadline - .001
+        self.engine.tick()
+        self.assertEqual(len(self.nado.requests), 1)
+        self.nado.responses.append('PENDING')
+        self.clock.value = deadline
+        self.engine.tick()
+        close = self.nado.requests[-1]
+        self.assertTrue(close.reduce_only and close.post_only)
+        self.assertEqual(close.side, 'sell')
+        self.assertEqual(close.limit_price, D('100.01'))
+        self.assertEqual(len(self.lighter.requests), 1)
+        self.assertEqual(self.engine.status()['state'], 'CLOSING')
+        self.engine.tick()
+        self.assertEqual(len(self.lighter.requests), 1)
+
+    def test_partial_nado_close_reduces_only_matching_lighter_quantity(self):
+        self.hedge()
+        self.nado.responses.append(D('.5'))
+        original = abs(self.lighter.positions[self.lighter.items[0].id])
+        self.engine.close_and_stop(); self.engine.tick()
+        self.engine.tick()
+        self.assertEqual(self.lighter.requests[-1].quantity, D('.5'))
+        self.assertTrue(self.lighter.requests[-1].reduce_only)
+        self.assertEqual(abs(self.lighter.positions[self.lighter.items[0].id]), original-D('.5'))
+
+    def test_recovered_fill_without_fee_restores_expired_deadline_and_closes_without_reopening(self):
+        self.lighter.responses.append('ACK')
+        self.engine.start(); self.engine.tick()
+        intent = self.lighter.requests[0]
+        filled_at = self.clock()
+        self.lighter.positions[intent.instrument.id] = -intent.quantity
+        self.lighter.lookup_results[intent.client_id] = OrderObservation(intent.client_id, 'FILLED', intent.quantity,
+            D(100), None, 'confirmed', filled_at=filled_at)
+        cycle = self.journal.active_cycle()
+        self.engine._transition(cycle, 'HALTED', 'Old incompatible history request')
+        self.journal.set('running', False)
+        self.clock.value += self.settings.hold_seconds + 100
+        self.engine = Engine(self.journal, self.nado, self.lighter, self.settings, clock=self.clock)
+        self.engine.close_and_stop(); self.engine.tick()
+        cycle = self.journal.active_cycle()
+        self.assertEqual(cycle['deadline'], filled_at + self.settings.hold_seconds)
+        self.assertFalse(cycle['fees_complete'])
+        self.assertTrue(self.nado.requests[-1].reduce_only)
+        self.assertEqual(len(self.lighter.requests), 1)
+        for _ in range(4): self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'CLOSED')
+        self.assertEqual(len(self.journal.history()), 1)
+
     def setUp(self):
         self.temp = TemporaryDirectory()
         self.path = Path(self.temp.name) / 'journal.sqlite3'

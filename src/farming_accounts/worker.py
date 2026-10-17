@@ -201,7 +201,7 @@ class Runtime:
                     if isinstance(pricing, dict):
                         orders[intent.venue]['pricing'] = {key: pricing[key] for key in (
                             'reference_midpoint', 'reference_timestamp', 'distance_percent', 'actual_distance_percent',
-                            'price_mode', 'reference_ask', 'price_tick') if key in pricing}
+                            'price_mode', 'reference_ask', 'reference_bid', 'side', 'price_tick') if key in pricing}
             return {'ok': True, 'version': __version__, 'worker': 'running', 'revision': config.get('revision', 0),
                     'credentials': public_credentials(config), 'verified': self.verified,
                     'pending_registration': self.vault.load().get('pending_registration', {}).get('venue'),
@@ -478,7 +478,10 @@ class Runtime:
         while not self.stopped.is_set():
             cycle = self.journal.active_cycle()
             active_execution = cycle and cycle.get('state') in ('OPENING_SPOT', 'OPENING_HEDGE', 'RECOVERY', 'CLOSING')
-            self.wakeup.wait(1 if active_execution else 10)
+            delay = 1 if active_execution else 10
+            if cycle and cycle.get('state') == 'HEDGED' and cycle.get('deadline') is not None:
+                delay = min(delay, max(0, cycle['deadline'] - time.time()))
+            self.wakeup.wait(delay)
             self.wakeup.clear()
             if self.stopped.is_set():
                 break

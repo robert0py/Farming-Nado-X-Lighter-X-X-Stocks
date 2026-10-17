@@ -140,6 +140,9 @@ class FakeSDK:
         return dict(code=self.post_code, tx_hash="tx-hash")
 
     async def trades(self, **kwargs):
+        if kwargs.get('sort_dir') != 'desc':
+            from lighter.exceptions import BadRequestException
+            raise BadRequestException(status=400, reason='invalid param')
         return dict(code=200, trades=self.trade_rows)
 
     async def close(self):
@@ -153,6 +156,18 @@ def credentials(**updates):
 
 
 class LighterAdapterTests(unittest.TestCase):
+    def test_confirmed_fill_without_optional_fee_still_has_real_quantity_and_timestamp(self):
+        self.sdk.orders = [self.order()]
+        trade = self.trade() | {'timestamp': 999}
+        trade.pop('taker_fee')
+        self.sdk.trade_rows = [trade]
+        observation = self.adapter.lookup(self.intent)
+        self.assertEqual(observation.status, 'FILLED')
+        self.assertEqual(observation.filled_quantity, self.intent.quantity)
+        self.assertIsNone(observation.fee)
+        self.assertEqual(observation.filled_at, 999)
+        self.assertFalse(self.sdk.posts)
+
     def setUp(self):
         self.sdk = FakeSDK()
         self.adapter = LighterVenue(credentials(), sdk_module=self.sdk, clock=lambda: self.sdk.now, session_factory=FakeSession)

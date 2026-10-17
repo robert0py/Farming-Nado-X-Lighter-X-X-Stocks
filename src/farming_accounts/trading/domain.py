@@ -78,7 +78,7 @@ class OrderObservation:
     status: str
     filled_quantity: Decimal
     average_price: Decimal | None = None
-    fee: Decimal = Decimal(0)
+    fee: Decimal | None = Decimal(0)
     exchange_id: str | None = None
     filled_at: float | None = None
 

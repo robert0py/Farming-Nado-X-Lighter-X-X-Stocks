@@ -388,19 +388,35 @@ class MakerTests(unittest.TestCase):
         self.assertIn('сверка', str(error.exception))
         self.assertNotIn('secret', str(error.exception))
 
-    def test_closing_maker_uses_short_risk_window(self):
+    def test_closing_maker_uses_configured_reprice_interval_instead_of_twenty_seconds(self):
         self.transport.base = D(1)
         self.journal.save_cycle({'id': 'cycle', 'state': 'CLOSING',
-                                 'spot_account_baseline': self.gateway.capture_position(self.intent.instrument)})
-        close = replace(self.intent, client_id='close-short-wait', side='sell', reduce_only=True, expiry=NOW + 90)
+                                 'spot_account_baseline': self.gateway.capture_position(self.intent.instrument),
+                                 'strategy': {'nado_maker_reprice_seconds': 60, 'nado_maker_distance_percent': '.1'}})
+        close = replace(self.intent, client_id='close-short-wait', side='sell', reduce_only=True, expiry=NOW + 900)
         self.journal.put_intent(close, 'close_spot')
         self.gateway.submit(close)
         self.gateway.clock = lambda: NOW + 19
         self.assertEqual(self.gateway.lookup(close).status, 'PENDING')
         self.assertEqual(self.cancels(), [])
         self.gateway.clock = lambda: NOW + 20
+        self.assertEqual(self.gateway.lookup(close).status, 'PENDING')
+        self.gateway.clock = lambda: NOW + 59
+        self.assertEqual(self.gateway.lookup(close).status, 'PENDING')
+        self.gateway.clock = lambda: NOW + 60
         self.assertEqual(self.gateway.lookup(close).status, 'CANCELLED')
         self.assertEqual(len(self.cancels()), 1)
+
+    def test_closing_maker_preserves_queue_when_price_still_matches_strategy(self):
+        self.transport.base = D(1)
+        self.journal.save_cycle({'id': 'cycle', 'state': 'CLOSING',
+            'spot_account_baseline': self.gateway.capture_position(self.intent.instrument),
+            'strategy': {'nado_maker_reprice_seconds': 60, 'nado_maker_price_mode': 'closest_ask'}})
+        close = replace(self.intent, client_id='same-close', side='sell', limit_price=D('104.01'), reduce_only=True, expiry=NOW+900)
+        self.journal.put_intent(close, 'close_spot'); self.gateway.submit(close)
+        self.gateway.clock = lambda: NOW + 200
+        self.assertEqual(self.gateway.lookup(close).status, 'PENDING')
+        self.assertFalse(self.cancels())
 
     def test_maker_spot_sale_omits_unsupported_reduce_flag_but_forbids_borrowing(self):
         self.transport.base = D(1)

@@ -666,24 +666,26 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.status()['state'], 'HALTED')
         self.assertEqual(self.engine.status()['cycle']['spot_quantity'], '10')
         self.assertEqual(self.nado.positions[1], D(10))
-        self.assertEqual(self.lighter.positions[101], D(0))
+        self.assertEqual(self.lighter.positions[101], D(-20))
         self.assertTrue(self.nado.requests[-1].reduce_only)
-        self.assertEqual(self.nado.requests[-1].expiry, int(self.clock()) + 90)
+        self.assertEqual(self.nado.requests[-1].expiry, int(self.clock()) + 900)
         for _ in range(4):
             self.engine.tick()
         self.assertEqual(len(self.nado.requests), 2)
 
-    def test_three_empty_maker_closes_halt_with_remaining_position_intact(self):
+    def test_repeated_empty_maker_closes_continue_and_keep_lighter_until_nado_fill(self):
         self.engine.strategy = replace(self.strategy, nado_post_only=True)
         self.hedge()
-        self.nado.responses.extend(['CANCELLED'] * 3)
+        self.nado.responses.extend(['CANCELLED'] * 20)
         self.engine.close_and_stop()
-        for _ in range(5):
+        for _ in range(20):
             self.engine.tick()
-        self.assertEqual(self.engine.status()['state'], 'HALTED')
+        self.assertEqual(self.engine.status()['state'], 'CLOSING')
         self.assertEqual(self.nado.positions[1], D(10))
-        self.assertEqual(self.lighter.positions[101], D(0))
-        self.assertEqual(len(self.nado.requests), 4)
+        self.assertEqual(self.lighter.positions[101], D(-20))
+        self.assertEqual(len(self.nado.requests), 21)
+        for _ in range(3): self.engine.tick()
+        self.assertEqual(self.engine.status()['state'], 'CLOSED')
 
     def test_significant_preexisting_spot_is_never_adopted_as_bot_inventory(self):
         self.engine.strategy = replace(self.strategy, preserve_spot_dust=True)
@@ -766,9 +768,11 @@ class EngineTests(unittest.TestCase):
         self.clock.value += self.strategy.hold_seconds
         self.lighter.responses.append(D(5))
         self.engine.tick()
-        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(len(self.nado.requests), 2)
+        self.assertEqual(len(self.journal.history()), 1)
         self.engine.tick()
-        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(len(self.nado.requests), 2)
+        self.assertEqual(len(self.journal.history()), 1)
         self.engine.tick()
         self.engine.tick()
         self.assertEqual(self.engine.status()["cycle"]["state"], "CLOSED")
@@ -786,15 +790,16 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(self.engine.status()["state"], "CLOSED")
         self.assertEqual(len(self.journal.history()), 1)
 
-    def test_close_and_stop_uses_reduce_only_and_short_first(self):
+    def test_close_and_stop_closes_nado_before_lighter_with_reduce_only(self):
         self.hedge()
         self.engine.close_and_stop()
         self.engine.tick()
-        self.assertEqual(self.lighter.requests[-1].side, "buy")
-        self.assertTrue(self.lighter.requests[-1].reduce_only)
-        self.assertEqual(len(self.nado.requests), 1)
+        self.assertEqual(self.nado.requests[-1].side, 'sell')
+        self.assertTrue(self.nado.requests[-1].reduce_only)
+        self.assertEqual(len(self.lighter.requests), 1)
         self.engine.tick()
-        self.assertEqual(self.nado.requests[-1].side, "sell")
+        self.assertEqual(self.lighter.requests[-1].side, 'buy')
+        self.assertTrue(self.lighter.requests[-1].reduce_only)
         self.engine.tick()
         self.assertEqual(self.engine.status()["state"], "CLOSED")
 
@@ -844,6 +849,7 @@ class EngineTests(unittest.TestCase):
         self.lighter.responses.append(UnknownExecution("fixture timeout"))
         self.clock.value += self.strategy.hold_seconds
         self.engine.tick()
+        self.engine.tick()
         intent = self.lighter.requests[-1]
         self.lighter.positions[intent.instrument.id] = D(0)
         self.lighter.lookup_results[intent.client_id] = OrderObservation(intent.client_id, "FILLED", D(20), D(100))
@@ -885,7 +891,8 @@ class EngineTests(unittest.TestCase):
         self.engine.tick()
         self.assertEqual(self.engine.status()["cycle"]["deadline"], intent.expiry + self.strategy.hold_seconds)
         self.assertEqual(self.engine.status()["state"], "CLOSING")
-        self.assertEqual(self.lighter.requests[-1].side, "buy")
+        self.assertEqual(self.nado.requests[-1].side, 'sell')
+        self.assertEqual(len(self.lighter.requests), 1)
 
     def test_lowercase_adapter_venue_matches_contract(self):
         self.nado.items = tuple(replace(i, venue="nado") for i in self.nado.items)
@@ -906,6 +913,7 @@ class EngineTests(unittest.TestCase):
         self.hedge()
         self.engine.close_and_stop()
         self.lighter.responses.append("REJECTED")
+        self.engine.tick()
         self.engine.tick()
         self.assertEqual(self.engine.status()["state"], "HALTED")
         self.engine.tick()
