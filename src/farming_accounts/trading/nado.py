@@ -24,6 +24,7 @@ from ..models import AccountError, nado_subaccount, wallet_address
 from ..transport import MAX_RESPONSE, NoRedirects
 from .domain import (Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable,
                      TradingError, UnknownExecution, maker_price_needs_refresh, CRYPTO_SYMBOLS)
+from .leverage import validate_leverage
 
 X18 = Decimal(10**18)
 VENUE = "nado"
@@ -709,6 +710,34 @@ class NadoGateway:
             return min(quote, _x18(_obj(healths[0]).get('health')))
         return quote
 
+    def check_leverage_capacity(self, instrument, quantity, price):
+        """Nado cross has no per-order leverage selector: cap gross exposure at cash/equity."""
+        if instrument.kind != 'perp':
+            return  # Spot retains spot_leverage=false and owned-quantity checks.
+        info = self.transport.query({'type': 'subaccount_info', 'subaccount': self.sender})
+        cash = self._account(info)[0]
+        healths = _list(info.get('healths'))
+        if len(healths) != 3:
+            raise TradingError('Nado не подтвердил собственное обеспечение для позиции 1×.')
+        equity = _x18(_obj(healths[2]).get('health'))
+        prices = {_integer(_obj(p).get('product_id')): _x18(_obj(p).get('oracle_price_x18'))
+                  for p in _list(info.get('perp_products'))}
+        gross = Decimal(0)
+        for row in _list(info.get('perp_balances')):
+            item = _obj(row)
+            amount = abs(_x18(_obj(item.get('balance')).get('amount')))
+            if not amount:
+                continue
+            mark = prices.get(_integer(item.get('product_id')))
+            if mark is None or mark <= 0:
+                raise TradingError('Nado не подтвердил стоимость существующей фьючерсной экспозиции для 1×.')
+            gross += amount * mark
+        mark = prices.get(instrument.id)
+        if mark is None or mark <= 0:
+            raise TradingError('Nado не подтвердил цену обеспечения нового фьючерса 1×.')
+        if gross + quantity * max(price, mark) > min(cash, equity):
+            raise TradingError('Nado: для 1× нужна полная стоимость новой и существующей фьючерсной экспозиции. Недостаточно собственных средств.')
+
     def open_orders(self, instrument):
         data = self.transport.query({"type": "subaccount_orders", "sender": self.sender,
                                      "product_id": instrument.id})
@@ -765,6 +794,9 @@ class NadoGateway:
 
     def _precheck(self, intent):
         self.verify()
+        if not intent.reduce_only and intent.leverage is not None:
+            validate_leverage(intent.leverage)
+            self.check_leverage_capacity(intent.instrument, intent.quantity, intent.limit_price)
         if intent.expiry <= self.clock() or not self.clock() * 1000 < intent.nonce >> 20 <= self.clock() * 1000 + 100000:
             raise TradingError("Nonce или срок отправки Nado истёк. Ордер не отправлен.")
         self._instrument(intent.instrument, closing=intent.reduce_only)

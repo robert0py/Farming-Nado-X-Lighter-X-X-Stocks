@@ -9,6 +9,15 @@ from farming_accounts.control import ControlError, ensure_local_worker, ACTIVE_W
 
 
 class WorkerUpdateTests(unittest.TestCase):
+    def test_leverage_execution_update_does_not_reuse_old_active_worker(self):
+        client = Mock()
+        client.request.return_value = {'version': '0.5.5', 'execution': {'state': 'HEDGED', 'running': True}}
+        with patch('farming_accounts.control.subprocess.Popen') as spawn:
+            with self.assertRaises(ControlError):
+                ensure_local_worker(client)
+            spawn.assert_not_called()
+        client.request.assert_called_once_with('/status')
+
     def test_accounting_gui_reuses_compatible_active_worker_without_restart(self):
         for previous in ACTIVE_WORKER_COMPATIBILITY.get(__version__, ()):
             with self.subTest(previous=previous):

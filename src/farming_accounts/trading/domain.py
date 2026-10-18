@@ -70,6 +70,7 @@ class OrderIntent:
     nonce: int
     expiry: int
     post_only: bool = False
+    leverage: int | None = None  # None preserves reconciliation of pre-policy intents.
 
 
 @dataclass(frozen=True)
@@ -116,8 +117,13 @@ class Strategy:
     nado_maker_reprice_seconds: int = 90
     nado_maker_price_mode: str = 'distance'
     alternate_crypto_direction: bool = False
+    nado_leverage: int = 1
+    lighter_leverage: int = 1
 
     def validate(self) -> None:
+        from .leverage import validate_leverage
+        validate_leverage(self.nado_leverage)
+        validate_leverage(self.lighter_leverage)
         if self.nado_maker_price_mode not in ('distance', 'closest_ask'):
             raise TradingError('Выберите режим цены Nado: ближайший maker или процентный отступ.')
         if any(not isinstance(value, bool) for value in (self.nado_post_only, self.preserve_spot_dust, self.alternate_crypto_direction)):

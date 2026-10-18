@@ -104,6 +104,7 @@ def strategy(value: dict, *, clock=time.time) -> Strategy:
         if not isinstance(proof, dict):
             raise TradingError('Некорректный формат необязательной отметки xPoints.')
         result = Strategy(assets=assets, points_verified_assets=tuple(proof.get('assets', ())),
+                          nado_leverage=value.get('nado_leverage', 1), lighter_leverage=value.get('lighter_leverage', 1),
                           alternate_crypto_direction=value.get('alternate_crypto_direction', False),
                           nado_maker_price_mode=value.get('nado_maker_price_mode', 'distance'),
                           nado_post_only=value.get('nado_post_only', False),

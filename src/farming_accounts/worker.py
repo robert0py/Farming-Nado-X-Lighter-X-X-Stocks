@@ -110,7 +110,7 @@ class Runtime:
             assets = tuple((config or self.config()).get('strategy', {}).get('assets', ()))
             return NadoGateway(value['owner'], value['subaccount'], value['private_key'], assets, journal=self.journal)
         from .trading.lighter import LighterCredentials, LighterVenue
-        return LighterVenue(LighterCredentials(**value))
+        return LighterVenue(LighterCredentials(**value), journal=self.journal)
 
     def discard_engine(self):
         for gateway in self.gateways:

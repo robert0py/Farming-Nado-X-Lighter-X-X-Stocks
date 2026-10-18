@@ -1,6 +1,6 @@
 """Robinhood Lighter execution through the pinned official Python SDK.
 
-Only order creation and its reconciliation are exposed. The SDK's broader
+Only order creation, 1x configuration and their reconciliation are exposed. The SDK's broader
 withdrawal/transfer powers are intentionally absent from this interface.
 """
 
@@ -19,6 +19,7 @@ from typing import Callable
 from urllib.parse import urlsplit
 
 from .domain import Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable, TradingError, UnknownExecution, CRYPTO_SYMBOLS
+from .leverage import lighter_fraction
 
 
 RH_URL = "https://api.rh.lighter.xyz"
@@ -194,8 +195,9 @@ the durable engine must only call lookup(), including after a process restart.
                 or isinstance(getattr(error, 'status', None), int) and 500 <= error.status < 600)
 
     def __init__(self, credentials: LighterCredentials, *, sdk_module=None, clock: Callable[[], float] = time.time,
-                 session_factory=None):
+                 session_factory=None, journal=None):
         self.credentials = credentials
+        self.journal = journal
         self._sdk = sdk_module
         self._session_factory = session_factory
         self._clock = clock
@@ -398,6 +400,83 @@ the durable engine must only call lookup(), including after a process restart.
             return _number((await self._account()).get("available_balance"))
         return self._run(operation)
 
+    @staticmethod
+    def _leverage_from(account, instrument):
+        rows = [_data(p) for p in _items(account.get('positions')) if _data(p).get('market_id') == instrument.id]
+        if not rows:
+            return None
+        if len(rows) != 1 or rows[0].get('symbol') != instrument.symbol:
+            raise TradingError('Lighter не подтвердил рынок для настройки плеча.')
+        row = rows[0]
+        fraction = _number(row.get('initial_margin_fraction'))
+        if not 0 < fraction <= 100 or type(row.get('margin_mode')) is not int or row['margin_mode'] not in (0, 1):
+            raise TradingError('Lighter не подтвердил плечо и режим обеспечения.')
+        # account returns PERCENT (100.00 means 1x), the signer takes BPS (10000).
+        return {'fraction': fraction * 100, 'margin_mode': row['margin_mode']}
+
+    def ensure_leverage(self, instrument, leverage):
+        """Set 1x only before a new hedge, with a durable intent and read-back.
+
+No signed payload is persisted. After an uncertain POST or restart, read the
+account setting; do not resend. Closing orders never call this method.
+"""
+        target = lighter_fraction(leverage)
+        self._instrument(instrument)
+        key = f'leverage:lighter:{self.credentials.account_index}:{instrument.id}'
+        async def operation():
+            if not self._verified:
+                raise TradingError('Сначала проверьте торговый API-ключ Lighter.')
+            account = await self._account()
+            current = self._leverage_from(account, instrument)
+            previous = self.journal.get(key) if self.journal is not None else None
+            if current == {'fraction': Decimal(target), 'margin_mode': 0}:
+                if previous and previous['state'] != 'CONFIRMED':
+                    self.journal.set(key, previous | {'state': 'CONFIRMED'})
+                return
+            if self._position_from(account, instrument) != 0:
+                raise TradingError('Lighter: плечо существующей позиции не меняется. Новое открытие 1× отложено до её закрытия.')
+            if previous:
+                if previous['state'] in ('PENDING', 'ACK'):
+                    raise ReadUnavailable('Ожидаем подтверждения настройки Lighter 1×. Ордера хеджа ещё не отправлены; повтор настройки не отправляем.')
+                if previous['state'] == 'REJECTED':
+                    raise TradingError('Lighter отклонил настройку 1× (код ' + str(previous['code']) + '). Новый хедж не открыт.')
+            if self.journal is None:
+                raise TradingError('Для настройки Lighter 1× нужен сохранённый торговый журнал.')
+            orders = _response(await self._client.order_api.account_active_orders(
+                authorization=await self._token(), account_index=self.credentials.account_index,
+                market_id=instrument.id, market_type='perp', _request_timeout=REQUEST_TIMEOUT))
+            if orders.get('next_cursor') or _items(orders.get('orders')):
+                raise TradingError('Lighter: перед настройкой 1× на рынке не должно быть активных ордеров.')
+            nonce = _response(await self._client.tx_api.next_nonce(
+                account_index=self.credentials.account_index, api_key_index=self.credentials.api_key_index,
+                _request_timeout=REQUEST_TIMEOUT)).get('nonce')
+            if type(nonce) is not int or not 0 <= nonce < 2**48:
+                raise TradingError('Lighter не подтвердил nonce настройки плеча.')
+            tx_type, payload, tx_hash, error = self._client.sign_update_leverage(
+                market_index=instrument.id, fraction=target, margin_mode=0,
+                nonce=nonce, api_key_index=self.credentials.api_key_index)
+            if error or tx_type != 20 or not payload or not isinstance(tx_hash, str) or not tx_hash:
+                raise TradingError('Signer Lighter не подготовил настройку 1×.')
+            intent = {'state': 'PENDING', 'market_id': instrument.id, 'fraction': target, 'margin_mode': 0,
+                      'nonce': nonce, 'api_key_index': self.credentials.api_key_index, 'tx_hash': tx_hash}
+            self.journal.set(key, intent)  # Must commit BEFORE the only send attempt.
+            response = _data(await self._client.tx_api.send_tx(
+                tx_type=tx_type, tx_info=payload, _request_timeout=REQUEST_TIMEOUT))
+            code = response.get('code')
+            if type(code) is not int:
+                raise ReadUnavailable('Lighter не подтвердил ответ настройки 1×. Проверяем фактическую настройку без повторной отправки.')
+            if code != 200:
+                self.journal.set(key, intent | {'state': 'REJECTED', 'code': code})
+                raise TradingError('Lighter отклонил настройку 1× (код ' + str(code) + '). Новый хедж не открыт.')
+            self.journal.set(key, intent | {'state': 'ACK'})
+            if self._leverage_from(await self._account(), instrument) != {'fraction': Decimal(target), 'margin_mode': 0}:
+                raise ReadUnavailable('Lighter принял настройку 1×; ждём её подтверждения перед первым ордером Nado.')
+            self.journal.set(key, intent | {'state': 'CONFIRMED'})
+        try:
+            return self._run(operation, writing=True, operation='настройку плеча 1×')
+        except UnknownExecution:
+            raise ReadUnavailable('Не получено подтверждение настройки Lighter 1×. Проверяем её без повторной отправки; ордера хеджа ещё не открывались.') from None
+
     def open_orders(self, instrument: Instrument) -> tuple[str, ...]:
         self._instrument(instrument)
         async def operation():
@@ -483,6 +562,12 @@ the durable engine must only call lookup(), including after a process restart.
             raise UnknownExecution("Ордер Lighter найден, но его исполнение не подтверждено. Повтор запрещён.")
         account = await self._account()
         position = self._position_from(account, intent.instrument)
+        if not intent.reduce_only and intent.leverage is not None:
+            target = lighter_fraction(intent.leverage)
+            if self._leverage_from(account, intent.instrument) != {'fraction': Decimal(target), 'margin_mode': 0}:
+                raise TradingError('На Lighter не подтверждено плечо 1×. Встречный ордер не отправлен; настройка могла измениться на сайте.')
+            if _number(account.get('available_balance')) < intent.quantity * intent.limit_price:
+                raise TradingError('Lighter: недостаточно полного обеспечения позиции 1×.')
         if intent.reduce_only and (position == 0 or (position > 0) != (intent.side == 'sell') or intent.quantity > abs(position)):
             raise TradingError("Закрывающий ордер Lighter превышает позицию или имеет неверную сторону.")
         if not intent.reduce_only and position != 0 and (position > 0) != (intent.side == 'buy'):

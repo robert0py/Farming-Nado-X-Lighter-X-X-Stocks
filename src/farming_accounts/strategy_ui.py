@@ -165,6 +165,8 @@ class StrategyDialog:
         self.mode_choice.bind('<<ComboboxSelected>>', lambda _: self.update_actions())
         grid = tk.Frame(inner, bg=PANEL)
         grid.pack(fill='x', before=first)
+        label(inner, 'Плечо: Nado 1× · Lighter 1× · размер позиции не умножается',
+              size=9, color=MUTED, anchor='w').pack(fill='x', pady=(2, 6), before=grid)
         self.advanced = tk.BooleanVar(dialog, value=False)
         self.advanced_check = tk.Checkbutton(inner, text='Настроить защиту вручную', variable=self.advanced,
                                              command=self.toggle_advanced, bg=PANEL, fg=INK,

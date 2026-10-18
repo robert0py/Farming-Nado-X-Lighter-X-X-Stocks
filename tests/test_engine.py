@@ -50,6 +50,9 @@ class GatewayFixture:
     def available(self):
         return self.money
 
+    def ensure_leverage(self, instrument, leverage):
+        assert leverage == 1
+
     def open_orders(self, instrument):
         return self.orders
 

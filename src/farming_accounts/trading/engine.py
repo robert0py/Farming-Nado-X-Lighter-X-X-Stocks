@@ -10,6 +10,7 @@ import uuid
 from .domain import (AccessVerificationError, Book, Instrument, OrderIntent, OrderObservation, PreSubmissionError, PreSubmissionReadUnavailable, ReadUnavailable, Strategy, TradingError,
                      TradingGateway, UnknownExecution, maker_opening_price, quantize)
 from .journal import Journal, encoded
+from .leverage import required_collateral
 
 
 class Engine:
@@ -184,6 +185,10 @@ class Engine:
                     if capacity is not None:
                         side = 'buy' if self._direction(pair[0]) > 0 else 'sell'
                         capacity(pair[0], side, target, self._opening_price(pair[0], books[0], self.strategy, side))
+                    unleveraged = getattr(self.nado, 'check_leverage_capacity', None)
+                    if unleveraged is not None:
+                        unleveraged(pair[0], target, self._opening_price(pair[0], books[0], self.strategy,
+                                     'buy' if self._direction(pair[0]) > 0 else 'sell'))
                     for instrument in pair:
                         checker = getattr(self._gateway(instrument.venue), "execution_ready", None)
                         if checker is not None:
@@ -308,6 +313,13 @@ class Engine:
                 if (self.nado.available() < self.strategy.notional_per_leg + self.strategy.margin_reserve or
                         self.lighter.available() < required_margin + self.strategy.margin_reserve):
                     raise TradingError("Недостаточно свободных средств для обеих экспозиций с заданным резервом.")
+                # Configure the second venue while both sides are still flat.
+                # A pending leverage write must never leave an unhedged Nado fill.
+                unleveraged = getattr(self.nado, 'check_leverage_capacity', None)
+                if unleveraged is not None:
+                    unleveraged(pair[0], target, self._opening_price(pair[0], books[0], self.strategy,
+                                 'buy' if direction > 0 else 'sell'))
+                self.lighter.ensure_leverage(pair[1], self.strategy.lighter_leverage)
                 cycle = {"id": uuid.uuid4().hex, "asset": asset, "state": "OPENING_SPOT",
                          'direction': direction, 'nado_kind': pair[0].kind,
                          "spot_id": pair[0].id, "perp_id": pair[1].id, "target_spot": str(target),
@@ -465,14 +477,16 @@ class Engine:
             raise ReadUnavailable("Рынок временно не принимает новые позиции. Продолжим проверку доступности.")
         if self._gateway(instrument.venue).open_orders(instrument):
             raise TradingError("На инструменте обнаружен активный ордер; повторное исполнение запрещено.")
-        if not reduce_only and self._gateway(instrument.venue).available() < quantity * limit + strategy.margin_reserve:
+        leverage = strategy.nado_leverage if instrument.venue.casefold() == 'nado' else strategy.lighter_leverage
+        if not reduce_only and self._gateway(instrument.venue).available() < required_collateral(quantity * limit, leverage) + strategy.margin_reserve:
             raise TradingError("Недостаточно средств с установленным резервом.")
         sequence = len(self.journal.orders(cycle["id"])) + 1
         expiry = int(self.clock()) + (max(900, strategy.nado_maker_reprice_seconds + 60) if maker else 90)
         receive_until = int(self.clock()) + 90
         intent = OrderIntent(uuid.uuid5(uuid.NAMESPACE_URL, f"{cycle['id']}:{sequence}:{instrument.venue}").hex,
                              cycle["id"], instrument.venue, instrument, side, quantity, limit, reduce_only,
-                             (receive_until * 1000 << 20) | sequence, expiry, post_only=maker)
+                             (receive_until * 1000 << 20) | sequence, expiry, post_only=maker,
+                             leverage=leverage if not reduce_only and 'lighter_leverage' in cycle['strategy'] else None)
         self.journal.put_intent(intent, action)
         if maker:
             midpoint = (book.bid + book.ask) / 2

@@ -24,6 +24,9 @@ def signer_self_check():
                 is_ask=True, order_type=1, time_in_force=0, reduce_only=False,
                 order_expiry=0, nonce=0, api_key_index=4)
             assert error is None and tx_type == 14 and payload and tx_hash
+            tx_type, payload, tx_hash, error = client.sign_update_leverage(
+                market_index=1, fraction=10000, margin_mode=0, nonce=0, api_key_index=4)
+            assert error is None and tx_type == 20 and payload and tx_hash
             native = client.signer.SignChangePubKey(ctypes.c_char_p(public.encode('utf-8')), 0, 0, 4, 1)
             decoded = {name: lighter.signer_client.decode_and_free(getattr(native, name))
                        for name in ('err', 'txInfo', 'txHash', 'messageToSign')}
