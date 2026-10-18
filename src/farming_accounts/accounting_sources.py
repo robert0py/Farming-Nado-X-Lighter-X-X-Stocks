@@ -97,9 +97,14 @@ def parse_lighter(raw, start, end, contracts=None):
             # Export rounds display values; sanity-check rather than treating them as more precise API fills.
             if abs(abs(value) - abs(quantity * price)) > max(Decimal('.02'), abs(value) * Decimal('.00001')):
                 raise AccountingError('Lighter вернул несогласованные размер, цену и стоимость сделки.')
+            pnl = number(row['Closed PnL'], optional=True)
+            # A pure opening cannot realize a closing PnL. The export explicitly
+            # marks it with a dash; missing closing/unspecified-side data stays unknown.
+            if row['Side'] in ('Open Long', 'Open Short') and row['Closed PnL'] in ('-', '—'):
+                pnl = Decimal(0)
             fill = Fill('Lighter RH', identity, 'Не предоставлен экспортом', timestamp, symbol, symbol, side,
                         abs(quantity), price, 'USDG', number(row['Fee'], optional=True),
-                        number(row['Closed PnL'], optional=True), text(row['Role']), text(row['Type']), multiplier)
+                        pnl, text(row['Role']), text(row['Type']), multiplier)
             if identity in seen:
                 raise AccountingError('CSV Lighter содержит повтор Trade ID. Отчёт не сформирован повторно с удвоенными суммами.')
             seen.add(identity)

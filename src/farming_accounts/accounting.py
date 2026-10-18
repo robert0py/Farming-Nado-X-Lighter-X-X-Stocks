@@ -37,8 +37,14 @@ NOTES = [
     'Ценовой результат обеих сторон минус четыре распределённые комиссии; котировки условно равны 1:1. '
     'Открытия до начала периода, незакрытые остатки и пары с неизвестной комиссией не входят в известный итог.',
     'Объём — сумма абсолютной торговой стоимости всех покупок и продаж за выбранный период по исходным исполнениям, '
-    'включая открытия, закрытия и сделки без пары. Комиссии не прибавляются к объёму: они вычитаются из результата '
-    'закрытых частей хеджа вместе с учётом фактических цен обеих сторон.',
+    'включая открытия, закрытия и сделки без пары. Комиссии не прибавляются к объёму.',
+    'Сводка: комиссии и реализованный PnL суммируются по всем исходным исполнениям обеих площадок за период, '
+    'включая сделки без пары. Общие затраты = комиссии − суммарный PnL: убыток увеличивает затраты, '
+    'прибыль уменьшает; отрицательные затраты означают чистую прибыль. Отсутствующие данные дают пустой итог.',
+    'Прочерк Closed PnL у Open Long/Open Short Lighter означает отсутствие закрытия, реализованный PnL такого '
+    'открытия равен нулю. Прочерк у закрытия остаётся неизвестным. Спотовый PnL Nado не подменяется нулём.',
+    'Количество закрытых хеджей — число полных закрытий суммарной сопоставленной позиции одного актива '
+    'внутри периода; частичные исполнения не считаются отдельными хеджами. Это оценка по истории, не ID циклов бота.',
 ]
 
 
@@ -205,10 +211,11 @@ def make_report(fills, start, end):
 
 
 def report_totals(report):
-    """Gross executed turnover and closed-pair costs have distinct scopes.
+    """All-period turnover, fees and venue-reported PnL use source fills once.
 
 Use the source-fill summary, never the split pairing rows. Recompute from this
 stable contract so a new desktop can also display an older worker's report.
+Legacy closed-pair estimates remain available separately in the export.
 """
     with localcontext() as context:
         context.prec = 80
@@ -219,16 +226,44 @@ stable contract so a new desktop can also display an older worker's report.
             amounts.setdefault((venue, currency), Decimal(0))
         volumes = [{'venue': venue, 'currency': currency, 'amount': str(amount)}
                    for (venue, currency), amount in sorted(amounts.items(), key=lambda item: (item[0][0] != 'Nado', item[0]))]
-        combined = (str(sum(amounts.values(), Decimal(0)))
-                    if all(currency in ('USDT0', 'USDG') for _, currency in amounts) else None)
+        compatible = all(currency in ('USDT0', 'USDG') for _, currency in amounts)
+        combined = str(sum(amounts.values(), Decimal(0))) if compatible else None
+        def complete_sum(value, unknown):
+            items = report['summary'].values()
+            if not compatible or any(item[unknown] for item in items):
+                return None
+            return sum((number(item[value]) for item in items), Decimal(0))
+        fees = complete_sum('fees_known', 'fees_unknown')
+        pnl = complete_sum('reported_pnl_known', 'pnl_unknown')
+        costs = fees - pnl if fees is not None and pnl is not None else None
         closed = report['closed_summary']
         known = closed['count'] - closed['unknown_net']
         net = number(closed['known_net_estimate_1_to_1']) if known else None
         return {'turnover_by_venue': volumes, 'total_turnover_estimate_1_to_1': combined,
+                'closed_hedge_count': closed_hedge_count(report['rows']),
+                'total_fees_estimate_1_to_1': None if fees is None else str(fees),
+                'total_pnl_estimate_1_to_1': None if pnl is None else str(pnl),
+                'total_costs_estimate_1_to_1': None if costs is None else str(costs),
                 'known_closed_parts': known, 'unknown_closed_parts': closed['unknown_net'],
                 'closed_net_estimate_1_to_1': None if net is None else str(net),
                 'spent_estimate_1_to_1': None if net is None else str(max(-net, Decimal(0))),
                 'earned_estimate_1_to_1': None if net is None else str(max(net, Decimal(0)))}
+
+
+def closed_hedge_count(rows):
+    """Count complete FIFO inventory round trips, rather than partial matches."""
+    balances, count = defaultdict(Decimal), 0
+    # Nado contributes once per paired allocation; Lighter is its opposite leg.
+    for row in rows:
+        if row['venue'] != 'Nado' or not row['pair']:
+            continue
+        before = balances[row['asset']]
+        quantity = number(row['underlying_quantity'])
+        after = before + (quantity if row['side'] == 'buy' else -quantity)
+        if before and (not after or (before > 0) != (after > 0)):
+            count += 1
+        balances[row['asset']] = after
+    return count
 
 
 def close_pairs(rows):
@@ -309,10 +344,13 @@ def report_bundle(report):
         totals = report_totals(report)
         total_rows = [{'metric': item['venue'] + ' turnover', 'amount': item['amount'], 'currency': item['currency'],
                        'scope': 'All executions in selected period'} for item in totals['turnover_by_venue']]
-        for metric in ('total_turnover_estimate_1_to_1', 'closed_net_estimate_1_to_1',
+        total_rows.append({'metric': 'closed_hedge_count', 'amount': totals['closed_hedge_count'],
+                           'currency': '', 'scope': 'Complete matched inventory round trips in selected period'})
+        for metric in ('total_turnover_estimate_1_to_1', 'total_fees_estimate_1_to_1',
+                       'total_pnl_estimate_1_to_1', 'total_costs_estimate_1_to_1', 'closed_net_estimate_1_to_1',
                        'spent_estimate_1_to_1', 'earned_estimate_1_to_1'):
             total_rows.append({'metric': metric, 'amount': totals[metric], 'currency': 'USD estimate 1:1',
-                               'scope': 'All executions in selected period' if metric.startswith('total_turnover')
+                               'scope': 'All executions in selected period; costs = fees - signed PnL' if metric.startswith('total_')
                                else 'Known closed hedge parts; fees included; funding excluded'})
         archive.writestr('Totals.csv', csv_bytes(total_rows, ('metric', 'amount', 'currency', 'scope')))
         columns = ('asset', 'entry_pair', 'exit_pair', 'opened_utc', 'closed_utc', 'underlying_quantity',

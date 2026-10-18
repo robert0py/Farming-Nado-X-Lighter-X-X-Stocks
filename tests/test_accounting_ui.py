@@ -97,7 +97,7 @@ class AccountingUITests(unittest.TestCase):
         self.assertFalse(self.panel.executor.tasks)
         self.assertIn('ДД.ММ.ГГГГ', self.panel.message.cget('text'))
 
-    def test_ready_rows_nado_then_lighter_and_summary_discloses_unknown_delay(self):
+    def test_ready_rows_nado_then_lighter_and_exactly_seven_summary_metrics(self):
         report = make_report([fill(), fill('Lighter RH', 'l1', NOW + 2, 'sell')], NOW - 10, NOW + 10)
         self.panel.ready(report)
         rows = [self.panel.table.item(i)['values'] for i in self.panel.table.get_children()]
@@ -105,28 +105,50 @@ class AccountingUITests(unittest.TestCase):
         summary = self.panel.summary.get('1.0', 'end')
         self.assertIn('USDT0', summary)
         self.assertIn('USDG', summary)
-        self.assertIn('Убыток от задержки: нет данных', summary)
+        self.assertEqual(len(summary.strip().splitlines()), 7)
+        self.assertEqual([line.split(':')[0].split(' ≈')[0] for line in summary.strip().splitlines()], [
+            'Количество закрытых хеджей', 'Объём Nado', 'Объём Lighter', 'Суммарный объём',
+            'Потрачено на комиссии', 'Суммарный PnL', 'Общие затраты'])
         self.assertLess(summary.index('Объём Nado:'), summary.index('Объём Lighter:'))
         self.assertLess(summary.index('Объём Lighter:'), summary.index('Суммарный объём'))
-        self.assertLess(summary.index('Суммарный объём'), summary.index('Результат после комиссий'))
         self.assertIn('100.00 USDT0', summary)
         self.assertIn('100.00 USDG', summary)
         self.assertIn('200.00 USD', summary)
         self.assertEqual(str(self.panel.zip_button.cget('state')), 'normal')
 
-    def test_closed_result_shows_spent_with_fees_after_venue_turnovers(self):
+    def test_summary_adds_reported_venue_pnl_and_fees_for_all_trades(self):
         from decimal import Decimal as D
-        report = make_report([fill(price=D(100), fee=D('.1')),
-            fill('Lighter RH', 'lo', NOW + 1, 'sell', price=D(101), fee=D('.2')),
-            fill(identity='nc', timestamp=NOW + 600, side='sell', price=D(110), fee=D('.3')),
-            fill('Lighter RH', 'lc', NOW + 601, 'buy', price=D(113), fee=D('.4'))], NOW - 10, NOW + 1000)
+        report = make_report([fill(price=D(100), fee=D('.1'), pnl=D(0)),
+            fill('Lighter RH', 'lo', NOW + 1, 'sell', price=D(101), fee=D('.2'), pnl=D(0)),
+            fill(identity='nc', timestamp=NOW + 600, side='sell', price=D(110), fee=D('.3'), pnl=D(10)),
+            fill('Lighter RH', 'lc', NOW + 601, 'buy', price=D(113), fee=D('.4'), pnl=D(-12))], NOW - 10, NOW + 1000)
         self.panel.ready(report)
         summary = self.panel.summary.get('1.0', 'end')
         self.assertIn('Объём Nado: 210.00 USDT0', summary)
         self.assertIn('Объём Lighter: 214.00 USDG', summary)
         self.assertIn('Суммарный объём ≈ 424.00 USD', summary)
-        self.assertIn('Потрачено ≈ 3 USD', summary)
-        self.assertLess(summary.index('Суммарный объём'), summary.index('Потрачено'))
+        self.assertEqual(summary.strip().splitlines(), [
+            'Количество закрытых хеджей: 1', 'Объём Nado: 210.00 USDT0',
+            'Объём Lighter: 214.00 USDG', 'Суммарный объём ≈ 424.00 USD',
+            'Потрачено на комиссии ≈ 1.00 USD', 'Суммарный PnL ≈ -2.00 USD', 'Общие затраты ≈ 3.00 USD'])
+
+    def test_empty_loading_and_failed_states_keep_only_seven_unavailable_values(self):
+        expected = self.panel.summary.get('1.0', 'end').strip().splitlines()
+        self.assertEqual(len(expected), 7)
+        self.assertTrue(all(line.endswith(': —') for line in expected))
+        self.panel.ready(make_report([fill()], NOW - 10, NOW + 10))
+        self.panel.load()
+        self.assertEqual(self.panel.summary.get('1.0', 'end').strip().splitlines(), expected)
+        self.panel.status_received({'state': 'error', 'message': 'API не ответил'})
+        self.assertEqual(self.panel.summary.get('1.0', 'end').strip().splitlines(), expected)
+        self.assertEqual(self.panel.message.cget('text'), 'API не ответил')
+
+    def test_unknown_pnl_is_not_presented_as_zero_or_complete_cost(self):
+        self.panel.ready(make_report([fill(pnl=None)], NOW - 10, NOW + 10))
+        summary = self.panel.summary.get('1.0', 'end')
+        self.assertIn('Потрачено на комиссии ≈ 0.03 USD', summary)
+        self.assertIn('Суммарный PnL ≈ — USD', summary)
+        self.assertIn('Общие затраты ≈ — USD', summary)
 
     def test_export_cancel_does_not_write_file(self):
         self.panel.ready(make_report([], NOW - 10, NOW + 10))

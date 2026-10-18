@@ -121,8 +121,7 @@ class AccountingPanel:
         self.zip_button.pack(side='right')
         self.csv_button = ttk.Button(bottom, text='CSV парами', command=lambda: self.save('csv'), state='disabled')
         self.csv_button.pack(side='right', padx=6)
-        self.set_summary('Здесь появятся реальные комиссии и результат из истории площадок.\n\n'
-                         'Отчёт содержит также ручные сделки выбранных аккаунтов. Ключи и подписи в файл не попадают.')
+        self.reset_summary()
         self.poll_id = self.root.after(100, self.poll)
 
     def set_summary(self, value):
@@ -130,6 +129,11 @@ class AccountingPanel:
         self.summary.delete('1.0', 'end')
         self.summary.insert('end', value)
         self.summary.configure(state='disabled')
+
+    def reset_summary(self):
+        self.set_summary('\n'.join(title + ': —' for title in (
+            'Количество закрытых хеджей', 'Объём Nado', 'Объём Lighter', 'Суммарный объём',
+            'Потрачено на комиссии', 'Суммарный PnL', 'Общие затраты')))
 
     def work(self, function, callback):
         self.pending = True
@@ -162,7 +166,7 @@ class AccountingPanel:
         self.previous.configure(state='disabled')
         self.following.configure(state='disabled')
         self.load_button.configure(state='disabled')
-        self.set_summary('Получаем историю за выбранный период…')
+        self.reset_summary()
         self.message.configure(text='История с подключённого сервера…' if remote else 'История сохранённых аккаунтов на этом компьютере…')
         self.work(lambda: self.service.request('/accounting/start', {'start': start, 'end': end}), self.started)
 
@@ -176,7 +180,7 @@ class AccountingPanel:
         self.message.configure(text=status['message'])
         if status['state'] in ('error', 'cancelled'):
             self.finish()
-            self.set_summary('Отчёт не сформирован. Неполные суммы не показаны.\n\n' + status['message'])
+            self.reset_summary()
         elif status['state'] == 'ready':
             self.message.configure(text='История загружена. Подготавливаем таблицу и сводку…')
             self.cancel_button.configure(state='disabled')
@@ -191,43 +195,18 @@ class AccountingPanel:
         self.csv_button.configure(state='normal')
         self.message.configure(text=f'Готово: {len(report["fills"])} исполнений · {report["pairs"]} предполагаемых пар · '
                                     f'без пары {report["unmatched_rows"]} строк. Даты — местные. ' + self.account_names(report))
-        closed = report['closed_summary']
         totals = report_totals(report)
         report['totals'] = totals
-        lines = [f'Закрытых частей хеджа: {closed["count"]}']
-        for item in totals['turnover_by_venue']:
-            venue = 'Lighter' if item['venue'] == 'Lighter RH' else item['venue']
-            lines.append('Объём ' + venue + ': ' + self.money(item['amount']) + ' ' + item['currency'])
-        lines.extend(['Суммарный объём ≈ ' + self.money(totals['total_turnover_estimate_1_to_1']) + ' USD',
-                      'Объём за период: покупки + продажи.', '',
-                      'Результат закрытых частей после комиссий ≈ ' + self.format(totals['closed_net_estimate_1_to_1']) + ' USD'
-                      if totals['known_closed_parts'] else 'Результат после комиссий: —'])
-        if totals['known_closed_parts']:
-            if Decimal(totals['closed_net_estimate_1_to_1']) < 0:
-                lines.append('Потрачено ≈ ' + self.format(totals['spent_estimate_1_to_1']) + ' USD')
-            else:
-                lines.append('Получено ≈ ' + self.format(totals['earned_estimate_1_to_1']) + ' USD')
-        lines.extend(['В результате учтены комиссии и разница цен обеих сторон.',
-                 f'Не рассчитано из-за комиссий: {closed["unknown_net"]}',
-                 'Оценка FIFO по предполагаемым парам, курс 1:1, без funding. Открытия до периода не включены.', ''])
-        fees_estimate = Decimal(0)
-        for item in report['summary'].values():
-            fees_estimate += Decimal(item['fees_known'])
-            lines.extend([item['venue'] + ' / ' + item['currency'],
-                          'Комиссии: ' + self.format(item['fees_known']),
-                          'PnL из API: ' + self.format(item['reported_pnl_known']),
-                          f'Комиссия не указана: {item["fees_unknown"]}',
-                          f'PnL не указан: {item["pnl_unknown"]}', ''])
-        if report['fills']:
-            lines.extend(['Комиссии всего ≈ ' + self.format(str(fees_estimate)) + ' USD',
-                          'Оценка по курсу USDT0/USDG = 1:1. Без неизвестных комиссий.', ''])
-        else:
-            lines.extend(['За выбранный период исполнений нет.', ''])
-        lines.extend(['Убыток от задержки: нет данных.',
-                      'В таблице: разница времени. Разница цен в CSV включает базис площадок.', '',
-                      'PnL — данные площадок, не общая прибыль кошелька. Funding и открытые позиции не включены.',
-                      'Без пары: ручные сделки, другой размер/время или нет исторического курса обёртки.',
-                      'Подробности и все строки — в ZIP.'])
+        def volume(venue):
+            return ' + '.join(self.money(item['amount']) + ' ' + item['currency']
+                              for item in totals['turnover_by_venue'] if item['venue'] == venue)
+        lines = [f'Количество закрытых хеджей: {totals["closed_hedge_count"]}',
+                 'Объём Nado: ' + volume('Nado'),
+                 'Объём Lighter: ' + volume('Lighter RH'),
+                 'Суммарный объём ≈ ' + self.money(totals['total_turnover_estimate_1_to_1']) + ' USD',
+                 'Потрачено на комиссии ≈ ' + self.money(totals['total_fees_estimate_1_to_1']) + ' USD',
+                 'Суммарный PnL ≈ ' + self.money(totals['total_pnl_estimate_1_to_1']) + ' USD',
+                 'Общие затраты ≈ ' + self.money(totals['total_costs_estimate_1_to_1']) + ' USD']
         self.set_summary('\n'.join(lines))
         self.show_page()
 

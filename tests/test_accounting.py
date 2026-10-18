@@ -116,6 +116,55 @@ class AccountingTests(unittest.TestCase):
         expected = report.pop('totals')
         self.assertEqual(report_totals(report), expected)
 
+    def test_all_period_fees_and_signed_pnl_include_unpaired_and_deduplicated_fills_once(self):
+        n = fill(quantity='3', fee=D('.3'), pnl=D(9))
+        report = self.report([n, n,
+            fill('Lighter RH', 'l1', side='sell', quantity='1', fee=D('.1'), pnl=D(-4)),
+            fill('Lighter RH', 'l2', side='sell', quantity='1', fee=D('.2'), pnl=D(-7)),
+            fill('Lighter RH', 'unpaired', NOW + 900, 'buy', fee=D('.4'), pnl=D(1))])
+        totals = report['totals']
+        self.assertEqual(D(totals['total_fees_estimate_1_to_1']), D(1))
+        self.assertEqual(D(totals['total_pnl_estimate_1_to_1']), D(-1))
+        self.assertEqual(D(totals['total_costs_estimate_1_to_1']), D(2))
+
+    def test_profit_offsets_fees_and_can_make_total_costs_negative(self):
+        totals = self.report([fill(fee=D('.1'), pnl=D(3)),
+                              fill('Lighter RH', 'l1', side='sell', fee=D('.2'), pnl=D(-1))])['totals']
+        self.assertEqual(D(totals['total_pnl_estimate_1_to_1']), D(2))
+        self.assertEqual(D(totals['total_costs_estimate_1_to_1']), D('-1.7'))
+
+    def test_unknown_fee_or_pnl_prevents_complete_total_without_hiding_other_known_metric(self):
+        for missing in ('fee', 'pnl'):
+            totals = self.report([fill(**{missing: None})])['totals']
+            self.assertIsNone(totals['total_costs_estimate_1_to_1'])
+            self.assertEqual(totals['total_fees_estimate_1_to_1'], None if missing == 'fee' else '0.03')
+            self.assertEqual(totals['total_pnl_estimate_1_to_1'], None if missing == 'pnl' else '2')
+        totals = self.report([fill(quote='EUR')])['totals']
+        for metric in ('fees', 'pnl', 'costs'):
+            self.assertIsNone(totals['total_' + metric + '_estimate_1_to_1'])
+
+    def test_no_trades_means_zero_fees_pnl_and_costs_not_missing(self):
+        totals = self.report([])['totals']
+        for metric in ('fees', 'pnl', 'costs'):
+            self.assertEqual(D(totals['total_' + metric + '_estimate_1_to_1']), D(0))
+
+    def test_partial_executions_count_as_one_hedge_only_when_fully_closed(self):
+        opened = [fill(quantity='2'), fill('Lighter RH', 'lo', NOW + 1, 'sell', quantity='2')]
+        first = [fill(identity='nc1', timestamp=NOW + 600, side='sell'),
+                 fill('Lighter RH', 'lc1', NOW + 601, 'buy')]
+        self.assertEqual(self.report(opened + first)['totals']['closed_hedge_count'], 0)
+        final = [fill(identity='nc2', timestamp=NOW + 700, side='sell'),
+                 fill('Lighter RH', 'lc2', NOW + 701, 'buy')]
+        report = self.report(opened + first + final)
+        self.assertEqual(report['closed_summary']['count'], 2)
+        self.assertEqual(report['totals']['closed_hedge_count'], 1)
+
+    def test_closed_hedge_count_handles_reversed_direction_and_different_assets(self):
+        report = self.report([fill(side='sell'), fill('Lighter RH', 'lo', NOW + 1, 'buy'),
+            fill(identity='nc', timestamp=NOW + 600, side='buy'), fill('Lighter RH', 'lc', NOW + 601, 'sell'),
+            fill(identity='eth', asset='ETH'), fill('Lighter RH', 'leth', NOW + 1, 'sell', asset='ETH')])
+        self.assertEqual(report['totals']['closed_hedge_count'], 1)
+
     def test_partial_round_trip_leaves_unclosed_size_out_of_profit_estimate(self):
         report = self.report([fill(quantity='2', price=D(100)),
             fill('Lighter RH', 'lo', NOW + 1, 'sell', quantity='2', price=D(102)),
@@ -226,6 +275,9 @@ class AccountingTests(unittest.TestCase):
             self.assertTrue({'Nado.csv', 'Lighter.csv', 'Hedge-report.csv', 'Summary.csv', 'Totals.csv', 'Report.json'} <= set(archive.namelist()))
             totals = list(csv.DictReader(io.StringIO(archive.read('Totals.csv').decode('utf-8-sig')), delimiter=';'))
             self.assertEqual(D(next(row['amount'] for row in totals if row['metric'] == 'total_turnover_estimate_1_to_1')), D(200))
+            for metric in ('total_fees_estimate_1_to_1', 'total_pnl_estimate_1_to_1', 'total_costs_estimate_1_to_1'):
+                self.assertEqual(next(row['amount'] for row in totals if row['metric'] == metric), report['totals'][metric])
+            self.assertEqual(json.loads(archive.read('Report.json'))['totals'], report['totals'])
             self.assertEqual(json.loads(archive.read('Report.json'))['rows'], report['rows'])
             for name in archive.namelist():
                 self.assertNotIn(b'private_key', archive.read(name))
@@ -329,10 +381,21 @@ class AccountingSourceTests(unittest.TestCase):
             self.assertEqual(f.side, expected)
             self.assertEqual(f.timestamp, NOW)
             self.assertEqual(f.fee, D(0))
-            self.assertIsNone(f.pnl)
+            self.assertEqual(f.pnl, D(0) if side.startswith('Open ') else None)
             self.assertEqual(f.order_id, 'Не предоставлен экспортом')
         f = parse_lighter(lighter_csv(pnl='-1.25', fee='-0.01'), NOW - 1, NOW + 1)[0]
         self.assertEqual((f.pnl, f.fee), (D('-1.25'), D('-.01')))
+
+    def test_lighter_missing_closing_pnl_is_unknown_but_explicit_open_dash_is_zero(self):
+        opened = parse_lighter(lighter_csv(), NOW - 1, NOW + 1)[0]
+        closed = parse_lighter(lighter_csv(side='Close Short', pnl='-1.5', identity='124'), NOW - 1, NOW + 1)[0]
+        report = make_report([opened, closed], NOW - 1, NOW + 1)
+        self.assertEqual(D(report['totals']['total_pnl_estimate_1_to_1']), D('-1.5'))
+        for side in ('Close Long', 'Close Short', 'Buy', 'Sell'):
+            f = parse_lighter(lighter_csv(side=side), NOW - 1, NOW + 1)[0]
+            self.assertIsNone(make_report([f], NOW - 1, NOW + 1)['totals']['total_pnl_estimate_1_to_1'])
+        f = parse_lighter(lighter_csv(pnl=''), NOW - 1, NOW + 1)[0]
+        self.assertIsNone(f.pnl)
 
     def test_lighter_unknown_schema_or_side_and_duplicate_trade_rejected(self):
         for raw in (b'bad,headers\n', lighter_csv('unknown'), lighter_csv() + lighter_csv().split(b'\n')[1] + b'\n'):
