@@ -37,7 +37,7 @@ jobs:
       - name: Test and build desktop application
         shell: pwsh
         run: ./scripts/build-windows.ps1
-      - name: Publish private desktop release
+      - name: Publish desktop release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -50,4 +50,4 @@ jobs:
           } else {
             gh release upload $releaseTag dist/Farming-Accounts.exe dist/SHA256SUMS.txt --clobber
           }
-          if ($LASTEXITCODE -ne 0) { throw 'Private desktop release failed' }
+          if ($LASTEXITCODE -ne 0) { throw 'Desktop release failed' }

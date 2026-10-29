@@ -8,6 +8,15 @@ from farming_accounts.vault import Vault, VaultError
 
 
 class VaultTests(unittest.TestCase):
+    def test_new_user_starts_without_trading_accounts_or_preloaded_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            vault = Vault(Path(directory))
+            self.assertEqual(vault.load(), {})
+            self.assertFalse(vault.path.exists())
+            token = vault.control_token()
+            self.assertEqual(vault.load(), {'control_token': token})
+            self.assertNotIn('trading', vault.load())
+
     def test_encrypted_roundtrip_and_stable_control_token(self):
         with tempfile.TemporaryDirectory() as directory:
             vault = Vault(Path(directory))

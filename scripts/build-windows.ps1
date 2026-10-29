@@ -7,6 +7,8 @@ $ErrorActionPreference = 'Stop'
 $projectDirectory = Split-Path -Parent $PSScriptRoot
 Push-Location -LiteralPath $projectDirectory
 try {
+    & $Python scripts/check-publication.py
+    if ($LASTEXITCODE -ne 0) { throw 'Private runtime files found in publication manifest' }
     & $Python -m unittest discover -s tests -q
     if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
     & $Python -m PyInstaller --noconfirm --clean --onefile --windowed --noupx `

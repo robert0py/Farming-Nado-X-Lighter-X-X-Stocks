@@ -19,3 +19,14 @@ accounts.json
 *.bin
 vault-*.tmp
 state/
+outputs/
+reports/
+*.csv
+*.zip
+*.pem
+*.pfx
+*.p12
+*.sqlite-wal
+*.sqlite-shm
+*.db-wal
+*.db-shm
